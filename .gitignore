@@ -1,0 +1,21 @@
+# Build outputs
+/agent-go-proxy
+*.exe
+*.test
+*.out
+
+# Runtime logs
+/log/
+*.log
+
+# Local environment and editor files
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+
+# Go workspace/cache artifacts
+/bin/
+/dist/
+coverage.out
