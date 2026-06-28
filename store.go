@@ -47,6 +47,7 @@ type ConversationSummary struct {
 	SessionID     string
 	AccountID     string
 	AccountName   string
+	Tags          string
 	StartedAt     time.Time
 	UpdatedAt     time.Time
 	FirstPrompt   string
@@ -56,6 +57,7 @@ type ConversationSummary struct {
 	InputTokens   int64
 	OutputTokens  int64
 	CachedTokens  int64
+	DurationMin   float64
 	Model         string
 	Agent         string
 	Status        string
@@ -91,6 +93,17 @@ type TraceRecord struct {
 	ReasoningTokens int
 	RequestBytes    int
 	ResponseBytes   int
+}
+
+type AccountAliasOption struct {
+	AccountID   string
+	DisplayName string
+}
+
+type FilterOptions struct {
+	Dates          []string
+	Agents         []string
+	AccountAliases []AccountAliasOption
 }
 
 func NewStore(dsn string) (*Store, error) {
@@ -154,6 +167,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			started_at DATETIME(6) NOT NULL,
 			updated_at DATETIME(6) NOT NULL,
 			first_prompt TEXT,
+			tags VARCHAR(255) NOT NULL DEFAULT '',
 			model VARCHAR(128) NOT NULL DEFAULT '',
 			agent VARCHAR(64) NOT NULL DEFAULT 'Codex',
 			status VARCHAR(24) NOT NULL DEFAULT 'LIVE',
@@ -214,6 +228,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "conversations", "account_id", "VARCHAR(128) NOT NULL DEFAULT '' AFTER session_id"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "conversations", "tags", "VARCHAR(255) NOT NULL DEFAULT '' AFTER first_prompt"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "traces", "account_id", "VARCHAR(128) NOT NULL DEFAULT '' AFTER session_id"); err != nil {
 		return err
 	}
@@ -253,7 +270,10 @@ func (s *Store) repairInjectedPrompts(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT c.id, t.request_body
 		FROM conversations c
 		JOIN traces t ON t.conversation_id=c.id AND t.sequence_no=1
-		WHERE c.first_prompt LIKE '<environment_context>%' OR c.first_prompt LIKE '<permissions instructions>%'`)
+		WHERE c.first_prompt LIKE '<environment_context>%'
+			OR c.first_prompt LIKE '<permissions instructions>%'
+			OR c.first_prompt LIKE '# AGENTS.md instructions%'
+			OR c.first_prompt LIKE '<skill>%'`)
 	if err != nil {
 		return err
 	}
@@ -302,7 +322,7 @@ func (s *Store) StartTrace(ctx context.Context, in StartTraceInput) (int64, erro
 		VALUES (?, ?, ?, ?, ?, ?, ?, 'LIVE', 0)
 		ON DUPLICATE KEY UPDATE updated_at=VALUES(updated_at), window_id=IF(window_id='', VALUES(window_id), window_id),
 			account_id=IF(account_id='', VALUES(account_id), account_id),
-			first_prompt=IF(first_prompt IS NULL OR first_prompt='' OR first_prompt='未捕获到用户 prompt。' OR first_prompt LIKE '<environment_context>%' OR first_prompt LIKE '<permissions instructions>%', VALUES(first_prompt), first_prompt),
+			first_prompt=IF(first_prompt IS NULL OR first_prompt='' OR first_prompt='未捕获到用户 prompt。' OR first_prompt LIKE '<environment_context>%' OR first_prompt LIKE '<permissions instructions>%' OR first_prompt LIKE '# AGENTS.md instructions%' OR first_prompt LIKE '<skill>%', VALUES(first_prompt), first_prompt),
 			model=IF(model='', VALUES(model), model), status='LIVE'`,
 		in.SessionID, in.AccountID, in.WindowID, now, now, in.FirstPrompt, in.Model)
 	if err != nil {
@@ -357,44 +377,56 @@ func (s *Store) FinishTrace(ctx context.Context, traceID int64, in FinishTraceIn
 	if err != nil {
 		return err
 	}
-	status := "OK"
 	errorInc := 0
 	if in.Error != "" || in.Status >= 400 {
-		status = "ERROR"
 		errorInc = 1
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE conversations SET
-		updated_at=?, status=?, error_count=error_count+?, total_tokens=total_tokens+?,
+		status=IF(EXISTS(SELECT 1 FROM traces WHERE conversation_id=? AND completed_at IS NULL), 'LIVE', IF(error_count+?>0, 'ERROR', 'OK')),
+		error_count=error_count+?, total_tokens=total_tokens+?,
 		last_status=?, last_duration_ms=?, last_request_id=(
 			SELECT JSON_UNQUOTE(JSON_EXTRACT(response_headers, '$."X-Oai-Request-Id"[0]')) FROM traces WHERE id=?
 		)
 		WHERE id=?`,
-		now, status, errorInc, in.Usage.TotalTokens, in.Status, in.DurationMS, traceID, conversationID)
+		conversationID, errorInc, errorInc, in.Usage.TotalTokens, in.Status, in.DurationMS, traceID, conversationID)
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func (s *Store) ListConversations(ctx context.Context, query, status string) ([]ConversationSummary, error) {
+func (s *Store) ListConversations(ctx context.Context, query, status, date, agent, accountID string) ([]ConversationSummary, error) {
 	where := "WHERE 1=1"
 	args := []any{}
 	if status != "" && status != "all" {
-		where += " AND IF(c.status='LIVE','LIVE','OK')=?"
+		where += " AND c.status=?"
 		args = append(args, status)
+	}
+	if date != "" && date != "all" {
+		where += " AND DATE(c.updated_at)=?"
+		args = append(args, date)
+	}
+	if agent != "" && agent != "all" {
+		where += " AND c.agent=?"
+		args = append(args, agent)
+	}
+	if accountID != "" && accountID != "all" {
+		where += " AND c.account_id=?"
+		args = append(args, accountID)
 	}
 	if query != "" {
 		where += " AND (c.session_id LIKE ? OR c.first_prompt LIKE ? OR c.model LIKE ? OR c.account_id LIKE ? OR a.display_name LIKE ?)"
 		like := "%" + query + "%"
 		args = append(args, like, like, like, like, like)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.session_id, c.account_id, COALESCE(a.display_name,''), c.started_at, c.updated_at, COALESCE(c.first_prompt,''), c.trace_count,
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.session_id, c.account_id, COALESCE(a.display_name,''), COALESCE(c.tags,''), c.started_at, c.updated_at, COALESCE(c.first_prompt,''), c.trace_count,
 		c.error_count, c.total_tokens, COALESCE(tok.input_tokens,0), COALESCE(tok.output_tokens,0), COALESCE(tok.cached_tokens,0),
-		c.model, c.agent, IF(c.status='LIVE','LIVE','OK'), c.last_status, c.last_duration_ms, c.last_request_id
+		TIMESTAMPDIFF(MICROSECOND, c.started_at, COALESCE(tok.completed_at, c.updated_at)) / 60000000,
+		c.model, c.agent, c.status, c.last_status, c.last_duration_ms, c.last_request_id
 		FROM conversations c
 		LEFT JOIN account_aliases a ON a.account_id=c.account_id
 		LEFT JOIN (
-			SELECT conversation_id, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(cached_tokens) cached_tokens
+			SELECT conversation_id, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(cached_tokens) cached_tokens, MAX(completed_at) completed_at
 			FROM traces GROUP BY conversation_id
 		) tok ON tok.conversation_id=c.id `+where+` ORDER BY c.updated_at DESC LIMIT 200`, args...)
 	if err != nil {
@@ -404,8 +436,8 @@ func (s *Store) ListConversations(ctx context.Context, query, status string) ([]
 	var out []ConversationSummary
 	for rows.Next() {
 		var item ConversationSummary
-		if err := rows.Scan(&item.ID, &item.SessionID, &item.AccountID, &item.AccountName, &item.StartedAt, &item.UpdatedAt, &item.FirstPrompt, &item.TraceCount,
-			&item.ErrorCount, &item.TotalTokens, &item.InputTokens, &item.OutputTokens, &item.CachedTokens,
+		if err := rows.Scan(&item.ID, &item.SessionID, &item.AccountID, &item.AccountName, &item.Tags, &item.StartedAt, &item.UpdatedAt, &item.FirstPrompt, &item.TraceCount,
+			&item.ErrorCount, &item.TotalTokens, &item.InputTokens, &item.OutputTokens, &item.CachedTokens, &item.DurationMin,
 			&item.Model, &item.Agent, &item.Status, &item.LastStatus, &item.LastDuration, &item.LastRequestID); err != nil {
 			return nil, err
 		}
@@ -414,19 +446,69 @@ func (s *Store) ListConversations(ctx context.Context, query, status string) ([]
 	return out, rows.Err()
 }
 
+func (s *Store) FilterOptions(ctx context.Context) (FilterOptions, error) {
+	var opts FilterOptions
+	dateRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT DATE_FORMAT(updated_at, '%Y-%m-%d') FROM conversations ORDER BY DATE(updated_at) DESC`)
+	if err != nil {
+		return opts, err
+	}
+	defer dateRows.Close()
+	for dateRows.Next() {
+		var value string
+		if err := dateRows.Scan(&value); err != nil {
+			return opts, err
+		}
+		opts.Dates = append(opts.Dates, value)
+	}
+	if err := dateRows.Err(); err != nil {
+		return opts, err
+	}
+
+	agentRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT agent FROM conversations WHERE agent<>'' ORDER BY agent ASC`)
+	if err != nil {
+		return opts, err
+	}
+	defer agentRows.Close()
+	for agentRows.Next() {
+		var value string
+		if err := agentRows.Scan(&value); err != nil {
+			return opts, err
+		}
+		opts.Agents = append(opts.Agents, value)
+	}
+	if err := agentRows.Err(); err != nil {
+		return opts, err
+	}
+
+	aliasRows, err := s.db.QueryContext(ctx, `SELECT account_id, display_name FROM account_aliases WHERE display_name<>'' ORDER BY display_name ASC`)
+	if err != nil {
+		return opts, err
+	}
+	defer aliasRows.Close()
+	for aliasRows.Next() {
+		var item AccountAliasOption
+		if err := aliasRows.Scan(&item.AccountID, &item.DisplayName); err != nil {
+			return opts, err
+		}
+		opts.AccountAliases = append(opts.AccountAliases, item)
+	}
+	return opts, aliasRows.Err()
+}
+
 func (s *Store) GetConversation(ctx context.Context, id int64) (ConversationSummary, []TraceRecord, error) {
 	var c ConversationSummary
-	err := s.db.QueryRowContext(ctx, `SELECT c.id, c.session_id, c.account_id, COALESCE(a.display_name,''), c.started_at, c.updated_at, COALESCE(c.first_prompt,''), c.trace_count,
+	err := s.db.QueryRowContext(ctx, `SELECT c.id, c.session_id, c.account_id, COALESCE(a.display_name,''), COALESCE(c.tags,''), c.started_at, c.updated_at, COALESCE(c.first_prompt,''), c.trace_count,
 		c.error_count, c.total_tokens, COALESCE(tok.input_tokens,0), COALESCE(tok.output_tokens,0), COALESCE(tok.cached_tokens,0),
-		c.model, c.agent, IF(c.status='LIVE','LIVE','OK'), c.last_status, c.last_duration_ms, c.last_request_id
+		TIMESTAMPDIFF(MICROSECOND, c.started_at, COALESCE(tok.completed_at, c.updated_at)) / 60000000,
+		c.model, c.agent, c.status, c.last_status, c.last_duration_ms, c.last_request_id
 		FROM conversations c
 		LEFT JOIN account_aliases a ON a.account_id=c.account_id
 		LEFT JOIN (
-			SELECT conversation_id, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(cached_tokens) cached_tokens
+			SELECT conversation_id, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(cached_tokens) cached_tokens, MAX(completed_at) completed_at
 			FROM traces GROUP BY conversation_id
 		) tok ON tok.conversation_id=c.id
-		WHERE c.id=?`, id).Scan(&c.ID, &c.SessionID, &c.AccountID, &c.AccountName, &c.StartedAt, &c.UpdatedAt, &c.FirstPrompt, &c.TraceCount,
-		&c.ErrorCount, &c.TotalTokens, &c.InputTokens, &c.OutputTokens, &c.CachedTokens,
+		WHERE c.id=?`, id).Scan(&c.ID, &c.SessionID, &c.AccountID, &c.AccountName, &c.Tags, &c.StartedAt, &c.UpdatedAt, &c.FirstPrompt, &c.TraceCount,
+		&c.ErrorCount, &c.TotalTokens, &c.InputTokens, &c.OutputTokens, &c.CachedTokens, &c.DurationMin,
 		&c.Model, &c.Agent, &c.Status, &c.LastStatus, &c.LastDuration, &c.LastRequestID)
 	if err != nil {
 		return c, nil, err
@@ -465,6 +547,15 @@ func (s *Store) SetAccountAlias(ctx context.Context, accountID, displayName stri
 		VALUES (?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE display_name=VALUES(display_name), updated_at=VALUES(updated_at)`,
 		accountID, displayName, now, now)
+	return err
+}
+
+func (s *Store) SetConversationTags(ctx context.Context, id int64, tags string) error {
+	tags = strings.TrimSpace(tags)
+	if len(tags) > 255 {
+		tags = tags[:255]
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE conversations SET tags=? WHERE id=?`, tags, id)
 	return err
 }
 

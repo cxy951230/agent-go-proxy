@@ -104,9 +104,12 @@ func main() {
 	router := chi.NewRouter()
 	router.Get("/", srv.handleIndex)
 	router.Get("/conversations/{id}", srv.handleConversationDetail)
+	router.Get("/favicon.ico", srv.handleFavicon)
+	router.Get("/assets/favicon.jpg", srv.handleFavicon)
 	router.Get("/api/dashboard", srv.handleAPIDashboard)
 	router.Get("/api/conversations", srv.handleAPIConversations)
 	router.Get("/api/conversations/{id}", srv.handleAPIConversationDetail)
+	router.Post("/api/conversations/{id}/tags", srv.handleAPIConversationTags)
 	router.Post("/api/accounts/{id}/alias", srv.handleAPIAccountAlias)
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))

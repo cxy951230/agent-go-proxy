@@ -9,6 +9,8 @@ func TestFirstUserPromptSkipsInjectedContext(t *testing.T) {
 	}{
 		{Role: "developer", Content: "internal"},
 		{Role: "user", Content: []any{map[string]any{"type": "input_text", "text": "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>"}}},
+		{Role: "user", Content: []any{map[string]any{"type": "input_text", "text": "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>internal</INSTRUCTIONS>"}}},
+		{Role: "user", Content: []any{map[string]any{"type": "input_text", "text": "<skill>\n<name>auto-rag</name>\n</skill>"}}},
 		{Role: "user", Content: []any{map[string]any{"type": "input_text", "text": "你好"}}},
 	}
 

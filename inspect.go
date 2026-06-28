@@ -108,12 +108,14 @@ func firstUserPrompt(input []struct {
 func isInjectedContext(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	prefixes := []string{
+		"# AGENTS.md instructions",
 		"<environment_context>",
 		"<permissions instructions>",
 		"<app-context>",
 		"<collaboration_mode>",
 		"<skills_instructions>",
 		"<plugins_instructions>",
+		"<skill>",
 	}
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(trimmed, prefix) {
