@@ -181,6 +181,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
+	recordedReqBody := truncateBase64Images(string(reqBody))
 
 	p.logs.Write(logEntry{
 		Timestamp:   time.Now().Format(time.RFC3339Nano),
@@ -189,7 +190,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Method:      r.Method,
 		Path:        r.URL.RequestURI(),
 		UpstreamURL: upstreamURL,
-		RequestBody: string(reqBody),
+		RequestBody: recordedReqBody,
 		RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
 	})
 
@@ -197,7 +198,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Method:       r.Method,
 		Path:         r.URL.RequestURI(),
 		UpstreamURL:  upstreamURL,
-		RequestBody:  string(reqBody),
+		RequestBody:  recordedReqBody,
 		RequestHdrs:  sanitizeHeader(cloneHeader(r.Header)),
 		RequestBytes: len(reqBody),
 	})
@@ -212,7 +213,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Path:        r.URL.RequestURI(),
 			UpstreamURL: upstreamURL,
 			Status:      http.StatusBadGateway,
-			RequestBody: string(reqBody),
+			RequestBody: recordedReqBody,
 			RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
 			Error:       err.Error(),
 		})
@@ -237,7 +238,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Path:        r.URL.RequestURI(),
 			UpstreamURL: upstreamURL,
 			Status:      http.StatusBadGateway,
-			RequestBody: string(reqBody),
+			RequestBody: recordedReqBody,
 			RequestHdrs: cloneHeader(r.Header),
 			Error:       err.Error(),
 		})
@@ -256,6 +257,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var respBody bytes.Buffer
 	copyErr := copyAndFlush(w, resp.Body, &respBody)
+	recordedRespBody := truncateBase64Images(respBody.String())
 
 	entry := logEntry{
 		Timestamp:    time.Now().Format(time.RFC3339Nano),
@@ -264,8 +266,8 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Path:         r.URL.RequestURI(),
 		UpstreamURL:  upstreamURL,
 		Status:       resp.StatusCode,
-		RequestBody:  string(reqBody),
-		ResponseBody: respBody.String(),
+		RequestBody:  recordedReqBody,
+		ResponseBody: recordedRespBody,
 		RequestHdrs:  sanitizeHeader(cloneHeader(r.Header)),
 		ResponseHdrs: sanitizeHeader(cloneHeader(resp.Header)),
 	}
@@ -277,7 +279,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	finishRecord := TraceFinishRecord{
 		Status:        resp.StatusCode,
 		DurationMS:    time.Since(start).Milliseconds(),
-		ResponseBody:  respBody.String(),
+		ResponseBody:  recordedRespBody,
 		ResponseHdrs:  sanitizeHeader(cloneHeader(resp.Header)),
 		ResponseBytes: respBody.Len(),
 	}

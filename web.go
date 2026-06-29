@@ -76,6 +76,11 @@ func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	subagentLinks, err := p.store.SubagentLinks(r.Context(), conversations)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	filterOptions, err := p.store.FilterOptions(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -95,6 +100,7 @@ func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"AccountID":         accountID,
 		"FilterOptions":     filterOptions,
 		"Conversations":     conversations,
+		"SubagentLinks":     subagentLinks,
 		"ConversationCount": conversationCount,
 		"TraceCount":        traceCount,
 		"InputTokens":       inputTokens,
@@ -141,6 +147,11 @@ func (p *proxyServer) handleAPIDashboard(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, nil, err)
 		return
 	}
+	subagentLinks, err := p.store.SubagentLinks(r.Context(), conversations)
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
 	filterOptions, err := p.store.FilterOptions(r.Context())
 	if err != nil {
 		writeJSON(w, nil, err)
@@ -154,6 +165,7 @@ func (p *proxyServer) handleAPIDashboard(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, map[string]any{
 		"now":                time.Now(),
 		"conversations":      conversations,
+		"subagent_links":     subagentLinks,
 		"conversation_count": conversationCount,
 		"trace_count":        traceCount,
 		"input_tokens":       inputTokens,
@@ -295,12 +307,12 @@ const indexHTML = `
     select,input,button{height:42px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:0 12px;font:inherit;color:var(--text)}
     button{cursor:pointer}.stats,.table{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05)}
     .stats{display:flex;gap:36px;padding:22px 26px;margin-top:16px}.stat-label{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.02em}.stat-value{font-size:28px;font-weight:600;margin-top:4px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-    .table{margin-top:18px;overflow-x:auto}table{width:100%;min-width:1280px;border-collapse:collapse;table-layout:fixed}th,td{padding:14px 14px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{font-size:12px;color:#606a7a;font-weight:600;letter-spacing:.04em;background:#fbfcfe}tr:last-child td{border-bottom:0}tbody tr.row-link{cursor:pointer}tbody tr.row-link:hover{background:#fafcff}
-    th:nth-child(1),td:nth-child(1){width:128px}th:nth-child(2),td:nth-child(2){width:285px}th:nth-child(3),td:nth-child(3){width:96px}th:nth-child(4),td:nth-child(4){width:90px}th:nth-child(5),td:nth-child(5){width:58px}th:nth-child(6),td:nth-child(6){width:170px}th:nth-child(7),td:nth-child(7){width:86px}th:nth-child(8),td:nth-child(8){width:90px}th:nth-child(9),td:nth-child(9){width:70px}th:nth-child(10),td:nth-child(10){width:74px}th:nth-child(11),td:nth-child(11){width:82px}
+    .table{margin-top:18px;overflow-x:auto}table{width:100%;min-width:1360px;border-collapse:collapse;table-layout:fixed}th,td{padding:14px 14px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{font-size:12px;color:#606a7a;font-weight:600;letter-spacing:.04em;background:#fbfcfe}tr:last-child td{border-bottom:0}tbody tr.row-link{cursor:pointer}tbody tr.row-link:hover{background:#fafcff}tbody tr.child-row{background:#fbf9ff}tbody tr.child-row:hover{background:#f7f3ff}
+    th:nth-child(1),td:nth-child(1){width:42px}th:nth-child(2),td:nth-child(2){width:128px}th:nth-child(3),td:nth-child(3){width:285px}th:nth-child(4),td:nth-child(4){width:96px}th:nth-child(5),td:nth-child(5){width:90px}th:nth-child(6),td:nth-child(6){width:58px}th:nth-child(7),td:nth-child(7){width:170px}th:nth-child(8),td:nth-child(8){width:86px}th:nth-child(9),td:nth-child(9){width:90px}th:nth-child(10),td:nth-child(10){width:70px}th:nth-child(11),td:nth-child(11){width:74px}th:nth-child(12),td:nth-child(12){width:82px}
     .prompt{font-size:14px;color:#242832}.sid{display:block;margin-top:4px;color:#8a93a3;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
     .account-btn,.tag-btn{height:auto;max-width:104px;padding:3px 9px;border-radius:6px;border:1px solid #b8e2df;background:#edfafa;color:#0f766e;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:none;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;font-weight:600}.account-btn:hover,.tag-btn:hover{background:#e2f7f4;border-color:#81cfc7;color:#0b5d56}.tag-btn{max-width:82px;border-color:#d8e0eb;background:#f7f9fc;color:#526074;font-family:inherit}
-    .pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600;white-space:nowrap}.model{color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}.agent{color:#2469e8;background:#edf4ff;border:1px solid #c6d9ff}.ok{color:var(--green);background:#ecfbf2;border:1px solid #a9e2bf}.live{color:#fff;background:#f5821f;border:1px solid #f5821f}.error{color:var(--red);background:#fff1f1;border:1px solid #f0b3b3}.token{color:var(--orange);background:#fff8ee;border:1px solid #ffd09a;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.token-stack{display:inline-grid;gap:2px;line-height:1.35;min-width:92px;text-align:right}
-    a{color:var(--blue);text-decoration:none}.action{display:inline-flex;align-items:center;justify-content:center;min-width:48px;height:30px;border:1px solid var(--line);padding:0 10px;border-radius:7px;background:#fff;font-weight:500;white-space:nowrap}.delete-btn{color:var(--red);border-color:#f0b3b3;background:#fff6f6}.delete-btn:hover{background:#fff1f1;border-color:#e07d7d}
+    .pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600;white-space:nowrap}.model{color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}.agent{color:#2469e8;background:#edf4ff;border:1px solid #c6d9ff}.ok{color:var(--green);background:#ecfbf2;border:1px solid #a9e2bf}.live{color:#fff;background:#f5821f;border:1px solid #f5821f}.error{color:var(--red);background:#fff1f1;border:1px solid #f0b3b3}.token{color:var(--orange);background:#fff8ee;border:1px solid #ffd09a;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.token-stack{display:inline-grid;gap:2px;line-height:1.35;min-width:92px;text-align:right}.tree-cell{padding-left:10px;padding-right:4px}.tree-toggle{width:26px;height:26px;padding:0;border-radius:6px;border:1px solid #d8e0eb;background:#fff;color:#667284;font-weight:800;line-height:1}.tree-toggle:hover{border-color:#b8c7dc;background:#f7f9fc}.child-mark{display:inline-block;color:#8a7ad8;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:700}
+    a{color:var(--blue);text-decoration:none}.small{font-size:12px;color:#8a93a3}.action{display:inline-flex;align-items:center;justify-content:center;min-width:48px;height:30px;border:1px solid var(--line);padding:0 10px;border-radius:7px;background:#fff;font-weight:500;white-space:nowrap}.delete-btn{color:var(--red);border-color:#f0b3b3;background:#fff6f6}.delete-btn:hover{background:#fff1f1;border-color:#e07d7d}
   </style>
 </head>
 <body>
@@ -337,10 +349,11 @@ const indexHTML = `
   </section>
   <section class="table">
     <table>
-      <thead><tr><th>时间</th><th>首条用户 PROMPT</th><th>账号</th><th>标签</th><th>TRACE</th><th>Token<br>输入/输出/缓存</th><th>模型</th><th>AGENT</th><th>耗时(分)</th><th>状态</th><th>操作</th></tr></thead>
+      <thead><tr><th></th><th>时间</th><th>首条用户 PROMPT</th><th>账号</th><th>标签</th><th>TRACE</th><th>Token<br>输入/输出/缓存</th><th>模型</th><th>AGENT</th><th>耗时(分)</th><th>状态</th><th>操作</th></tr></thead>
       <tbody id="conversation-rows">
       {{range .Conversations}}
         <tr class="row-link" data-href="/conversations/{{.ID}}">
+          <td class="tree-cell"></td>
           <td>{{fmtTime .UpdatedAt}}</td>
           <td><span class="prompt">{{short .FirstPrompt 80}}</span><span class="sid">{{.SessionID}}</span></td>
           <td><button class="account-btn" title="{{.AccountID}}" data-account-id="{{.AccountID}}" data-account-name="{{.AccountName}}">{{if .AccountName}}{{.AccountName}}{{else}}{{short .AccountID 12}}{{end}}</button></td>
@@ -354,13 +367,15 @@ const indexHTML = `
           <td><button class="action delete-btn" data-delete-id="{{.ID}}" data-session-id="{{.SessionID}}">删除</button></td>
         </tr>
       {{else}}
-        <tr><td colspan="11">暂无数据。发起一次 Codex 请求后这里会出现新会话。</td></tr>
+        <tr><td colspan="12">暂无数据。发起一次 Codex 请求后这里会出现新会话。</td></tr>
       {{end}}
       </tbody>
     </table>
   </section>
 </main>
 <script>
+const initialConversations = {{toJSON .Conversations}};
+const initialSubagentLinks = {{toJSON .SubagentLinks}};
 const fmtInt = n => Number(n || 0).toLocaleString('en-US');
 const fmtTime = v => {
   if (!v) return '';
@@ -371,6 +386,9 @@ const fmtTime = v => {
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const short = (v, n) => (v || '').length > n ? (v || '').slice(0, n) + '...' : (v || '');
 const accountLabel = item => item.AccountName || short(item.AccountID || 'unknown', 12);
+let latestConversations = initialConversations || [];
+let latestSubagentLinks = initialSubagentLinks || {};
+const expandedParents = new Set();
 const fmtMinutes = v => {
   v = Math.max(0, Number(v || 0));
   return v >= 10 ? Math.round(v).toString() : v.toFixed(1);
@@ -379,6 +397,73 @@ function statusClass(status){
   if (status === 'LIVE') return 'live';
   if (status === 'ERROR') return 'error';
   return 'ok';
+}
+function childSessionSet(links){
+  const out = new Set();
+  Object.values(links || {}).forEach(children => (children || []).forEach(id => out.add(id)));
+  return out;
+}
+function conversationRowHTML(item, opts = {}){
+  const children = opts.children || [];
+  const isChild = !!opts.isChild;
+  const missing = !!opts.missing;
+  const expanded = expandedParents.has(item.SessionID);
+  const tree = children.length
+    ? '<button class="tree-toggle" type="button" data-parent-session="' + esc(item.SessionID || '') + '" aria-expanded="' + (expanded ? 'true' : 'false') + '">' + (expanded ? '▾' : '▸') + '</button>'
+    : isChild ? '<span class="child-mark">└</span>' : '';
+  return '<tr class="' + (missing ? '' : 'row-link ') + (isChild ? 'child-row' : '') + '"' + (missing ? '' : ' data-href="/conversations/' + item.ID + '"') + '>' +
+    '<td class="tree-cell">' + tree + '</td>' +
+    '<td>' + fmtTime(item.UpdatedAt) + '</td>' +
+    '<td><span class="prompt">' + esc(short(item.FirstPrompt || '未捕获到用户 prompt。', 80)) + '</span><span class="sid">' + esc(item.SessionID) + '</span></td>' +
+    '<td><button class="account-btn" title="' + esc(item.AccountID || '') + '" data-account-id="' + esc(item.AccountID || '') + '" data-account-name="' + esc(item.AccountName || '') + '">' + esc(accountLabel(item)) + '</button></td>' +
+    '<td><button class="tag-btn" title="' + esc(item.Tags || '') + '" data-conversation-id="' + item.ID + '" data-tags="' + esc(item.Tags || '') + '">' + esc(item.Tags ? short(item.Tags, 10) : '+') + '</button></td>' +
+    '<td>' + (item.TraceCount || 0) + '</td>' +
+    '<td><span class="pill token token-stack"><span>' + fmtInt(item.InputTokens) + '</span><span>' + fmtInt(item.OutputTokens) + '</span><span>' + fmtInt(item.CachedTokens) + '</span></span></td>' +
+    '<td><span class="pill model">' + esc(item.Model || 'unknown') + '</span></td>' +
+    '<td><span class="pill agent">' + esc(item.Agent || 'Codex') + '</span></td>' +
+    '<td>' + fmtMinutes(item.DurationMin) + '</td>' +
+    '<td><span class="pill ' + statusClass(item.Status) + '">' + esc(item.Status || 'LIVE') + '</span></td>' +
+    '<td>' + (missing ? '<span class="small">等待入库</span>' : '<button class="action delete-btn" data-delete-id="' + item.ID + '" data-session-id="' + esc(item.SessionID || '') + '">删除</button>') + '</td>' +
+  '</tr>';
+}
+function missingSubagentRow(sessionID){
+  return {
+    ID: '',
+    SessionID: sessionID,
+    UpdatedAt: '',
+    FirstPrompt: 'Subagent 已启动，暂未捕获到会话请求。',
+    AccountID: '',
+    AccountName: '',
+    Tags: '',
+    TraceCount: 0,
+    InputTokens: 0,
+    OutputTokens: 0,
+    CachedTokens: 0,
+    Model: 'unknown',
+    Agent: 'Codex',
+    DurationMin: 0,
+    Status: 'LIVE'
+  };
+}
+function renderConversationRows(conversations, links){
+  latestConversations = conversations || [];
+  latestSubagentLinks = links || {};
+  const rows = document.getElementById('conversation-rows');
+  const bySession = new Map(latestConversations.map(item => [item.SessionID, item]));
+  const children = childSessionSet(latestSubagentLinks);
+  const html = [];
+  latestConversations.forEach(item => {
+    if (children.has(item.SessionID)) return;
+    const childIDs = latestSubagentLinks[item.SessionID] || [];
+    html.push(conversationRowHTML(item, {children: childIDs}));
+    if (expandedParents.has(item.SessionID)) {
+      childIDs.forEach(id => {
+        const child = bySession.get(id);
+        html.push(conversationRowHTML(child || missingSubagentRow(id), {isChild: true, missing: !child}));
+      });
+    }
+  });
+  rows.innerHTML = html.join('') || '<tr><td colspan="12">暂无数据。发起一次 Codex 请求后这里会出现新会话。</td></tr>';
 }
 function syncSelectOptions(select, allLabel, options, getValue, getLabel){
   if (!select) return;
@@ -431,7 +516,7 @@ async function deleteConversation(button){
   const conversationID = button.dataset.deleteId || '';
   if (!conversationID) return;
   const sessionID = button.dataset.sessionId || '';
-  const message = '确认删除这个会话吗？\\n\\n' + (sessionID ? ('Session: ' + sessionID + '\\n') : '') + '会话和所有 trace 都会被删除。';
+  const message = '确认删除这个会话吗？\\n\\n' + (sessionID ? ('Session: ' + sessionID + '\\n') : '') + '会话、所有 trace，以及它启动的 subagent 会话都会被删除。';
   if (!confirm(message)) return;
   const rsp = await fetch('/api/conversations/' + encodeURIComponent(conversationID), {method: 'DELETE'});
   if (!rsp.ok) {
@@ -441,6 +526,16 @@ async function deleteConversation(button){
   refreshDashboard().catch(() => {});
 }
 document.getElementById('conversation-rows').addEventListener('click', event => {
+  const treeButton = event.target.closest('.tree-toggle');
+  if (treeButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    const session = treeButton.dataset.parentSession || '';
+    if (expandedParents.has(session)) expandedParents.delete(session);
+    else expandedParents.add(session);
+    renderConversationRows(latestConversations, latestSubagentLinks);
+    return;
+  }
   const accountButton = event.target.closest('.account-btn');
   if (accountButton) {
     event.preventDefault();
@@ -476,22 +571,9 @@ async function refreshDashboard(){
   document.getElementById('stat-output-tokens').textContent = fmtInt(data.output_tokens);
   document.getElementById('stat-cached-tokens').textContent = fmtInt(data.cached_tokens);
   syncFilterOptions(data.filter_options);
-  const rows = document.getElementById('conversation-rows');
-  rows.innerHTML = (data.conversations || []).map(item =>
-    '<tr class="row-link" data-href="/conversations/' + item.ID + '">' +
-      '<td>' + fmtTime(item.UpdatedAt) + '</td>' +
-      '<td><span class="prompt">' + esc(short(item.FirstPrompt || '未捕获到用户 prompt。', 80)) + '</span><span class="sid">' + esc(item.SessionID) + '</span></td>' +
-      '<td><button class="account-btn" title="' + esc(item.AccountID || '') + '" data-account-id="' + esc(item.AccountID || '') + '" data-account-name="' + esc(item.AccountName || '') + '">' + esc(accountLabel(item)) + '</button></td>' +
-      '<td><button class="tag-btn" title="' + esc(item.Tags || '') + '" data-conversation-id="' + item.ID + '" data-tags="' + esc(item.Tags || '') + '">' + esc(item.Tags ? short(item.Tags, 10) : '+') + '</button></td>' +
-      '<td>' + (item.TraceCount || 0) + '</td>' +
-      '<td><span class="pill token token-stack"><span>' + fmtInt(item.InputTokens) + '</span><span>' + fmtInt(item.OutputTokens) + '</span><span>' + fmtInt(item.CachedTokens) + '</span></span></td>' +
-      '<td><span class="pill model">' + esc(item.Model || 'unknown') + '</span></td>' +
-      '<td><span class="pill agent">' + esc(item.Agent || 'Codex') + '</span></td>' +
-      '<td>' + fmtMinutes(item.DurationMin) + '</td>' +
-      '<td><span class="pill ' + statusClass(item.Status) + '">' + esc(item.Status || 'LIVE') + '</span></td>' +
-      '<td><button class="action delete-btn" data-delete-id="' + item.ID + '" data-session-id="' + esc(item.SessionID || '') + '">删除</button></td>' +
-    '</tr>').join('') || '<tr><td colspan="11">暂无数据。发起一次 Codex 请求后这里会出现新会话。</td></tr>';
+  renderConversationRows(data.conversations || [], data.subagent_links || {});
 }
+renderConversationRows(initialConversations || [], initialSubagentLinks || {});
 setInterval(() => refreshDashboard().catch(() => {}), 1000);
 </script>
 </body>
@@ -516,8 +598,8 @@ const detailHTML = `
     .bar,.notice,.turn{background:white;border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(21,35,60,.05);margin-top:16px}.bar{padding:14px 18px;display:flex;justify-content:space-between;color:#5f6978}.notice{padding:12px 14px;color:var(--orange);background:#fffaf0}
     .turn{padding:14px 18px}.turn-head{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:600}.meta{color:#8791a2;font-size:13px;font-weight:400;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.json-btn{margin-left:auto;border:1px solid var(--line);border-radius:7px;padding:4px 11px;color:#7e8796;background:#fff;font-size:13px}
     .grid{display:grid;grid-template-columns:1fr;gap:10px;margin-top:12px}.box{border-radius:7px;padding:14px 18px;border:1px solid}.req{background:#f3f7ff;border-color:#c7d7fb}.res{background:#f1fbf6;border-color:#abe6c8}.sse{background:#fffaf0;border-color:#ffe0a3}.err{background:#fff1f1;border-color:#f0b3b3}.tag{display:inline-block;padding:3px 9px;border-radius:5px;color:white;font-size:13px;font-weight:600;margin-bottom:10px}.req .tag{background:#3d78e5}.res .tag{background:#14a574}.sse .tag{background:#d9851f}.err .tag{background:#c94040}
-    .brief-grid{display:grid;grid-template-columns:1fr;gap:12px;margin-top:12px}.brief-box{border-radius:7px;padding:18px 22px;border:1px solid;font-size:15px;line-height:1.7}.brief-box.req{background:#f3f7ff;border-color:#b9cdfd}.brief-box.res{background:#ebfbf4;border-color:#88e6bd}.brief-text{white-space:pre-wrap;word-break:break-word;margin-top:12px}.brief-chip{display:inline-block;margin:0 6px 6px 0;padding:2px 8px;border-radius:999px;background:#fff;border:1px solid #cddaf2;color:#435169;font-size:13px;font-weight:600}.role-line{margin:0 0 14px}.role-name{display:inline-block;min-width:74px;color:#657083;font-weight:700}.tool-label{display:inline-block;color:#475569;background:#eef2f7;border:1px solid #d8e0eb;border-radius:5px;padding:1px 7px;font-size:12px;font-weight:700;margin-right:6px}.empty-text{color:#4f5b6b}
-    .ctx{margin-top:12px;border:1px solid #d9e2f1;border-radius:8px;background:#fbfdff;overflow:hidden}.ctx-tabs{display:flex;gap:6px;align-items:center;padding:8px;background:#f4f7fc;border-bottom:1px solid #d9e2f1;overflow-x:auto}.ctx-tab{border:1px solid transparent;background:transparent;color:#667284;border-radius:6px;padding:6px 10px;font-weight:700;font-size:13px;white-space:nowrap;cursor:pointer}.ctx-tab.active{background:#fff;color:#2f6fed;border-color:#c9d8f7;box-shadow:0 1px 2px rgba(21,35,60,.05)}.ctx-panel{display:none;padding:14px 16px}.ctx-panel.active{display:block}.ctx-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.ctx-stat{border:1px solid #dde6f2;border-radius:7px;background:#fff;padding:10px 12px}.ctx-stat-label{font-size:12px;color:#748094;font-weight:700}.ctx-stat-value{font-size:20px;font-weight:700;margin-top:2px;color:#20242c}.ctx-list{display:grid;gap:10px}.ctx-card{border:1px solid #dde6f2;border-radius:7px;background:#fff;padding:12px}.ctx-card-title{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-weight:800;color:#242a34}.ctx-card-sub{color:#7a8495;font-size:12px;margin-top:3px;word-break:break-all}.ctx-card-desc{margin-top:8px;color:#3d4654;white-space:pre-wrap}.ctx-param{display:inline-block;margin:8px 6px 0 0;padding:2px 7px;border-radius:5px;background:#f3f6fb;border:1px solid #dde6f2;color:#526074;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.ctx-pre{margin-top:8px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#344054;background:#f7f9fc;border:1px solid #e0e7f2;border-radius:6px;padding:10px}.ctx-kv{display:grid;grid-template-columns:150px 1fr;gap:8px;padding:7px 0;border-bottom:1px solid #edf1f7}.ctx-kv:last-child{border-bottom:0}.ctx-key{color:#687386;font-weight:700}.ctx-val{word-break:break-word}
+    .brief-grid{display:grid;grid-template-columns:1fr;gap:12px;margin-top:12px}.brief-box{border-radius:7px;padding:18px 22px;border:1px solid;font-size:15px;line-height:1.7}.brief-box.req{background:#f3f7ff;border-color:#b9cdfd}.brief-box.res{background:#ebfbf4;border-color:#88e6bd}.brief-box.subagent{background:#f7f3ff;border-color:#cbb8ff}.brief-box.subagent .tag{background:#7c3aed}.brief-text{white-space:pre-wrap;word-break:break-word;margin-top:12px}.brief-chip{display:inline-block;margin:0 6px 6px 0;padding:2px 8px;border-radius:999px;background:#fff;border:1px solid #cddaf2;color:#435169;font-size:13px;font-weight:600}.role-line{margin:0 0 14px}.role-name{display:inline-block;min-width:74px;color:#657083;font-weight:700}.tool-label{display:inline-block;color:#475569;background:#eef2f7;border:1px solid #d8e0eb;border-radius:5px;padding:1px 7px;font-size:12px;font-weight:700;margin-right:6px}.empty-text{color:#4f5b6b}
+    .ctx{margin-top:12px;border:1px solid #d9e2f1;border-radius:8px;background:#fbfdff;overflow:hidden}.ctx-tabs{display:flex;gap:6px;align-items:center;padding:8px;background:#f4f7fc;border-bottom:1px solid #d9e2f1;overflow-x:auto}.ctx-tab{border:1px solid transparent;background:transparent;color:#667284;border-radius:6px;padding:6px 10px;font-weight:700;font-size:13px;white-space:nowrap;cursor:pointer}.ctx-tab.active{background:#fff;color:#2f6fed;border-color:#c9d8f7;box-shadow:0 1px 2px rgba(21,35,60,.05)}.ctx-panel{display:none;padding:14px 16px}.ctx-panel.active{display:block}.ctx-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.ctx-stat{border:1px solid #dde6f2;border-radius:7px;background:#fff;padding:10px 12px}.ctx-stat-label{font-size:12px;color:#748094;font-weight:700}.ctx-stat-value{font-size:20px;font-weight:700;margin-top:2px;color:#20242c}.ctx-list{display:grid;gap:10px}.ctx-card{border:1px solid #dde6f2;border-radius:7px;background:#fff;padding:12px}.ctx-card.subagent-card{border-color:#d8c7ff;background:#fcfaff}.ctx-card-title{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-weight:800;color:#242a34}.ctx-card-sub{color:#7a8495;font-size:12px;margin-top:3px;word-break:break-all}.ctx-card-desc{margin-top:8px;color:#3d4654;white-space:pre-wrap}.ctx-param{display:inline-block;margin:8px 6px 0 0;padding:2px 7px;border-radius:5px;background:#f3f6fb;border:1px solid #dde6f2;color:#526074;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.ctx-pre{margin-top:8px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#344054;background:#f7f9fc;border:1px solid #e0e7f2;border-radius:6px;padding:10px}.ctx-kv{display:grid;grid-template-columns:150px 1fr;gap:8px;padding:7px 0;border-bottom:1px solid #edf1f7}.ctx-kv:last-child{border-bottom:0}.ctx-key{color:#687386;font-weight:700}.ctx-val{word-break:break-word}.subagent-detail{margin-top:8px}.subagent-kv{display:grid;grid-template-columns:92px 1fr;gap:4px 10px;margin-top:8px;font-size:13px}.subagent-kv div:nth-child(odd){color:#687386;font-weight:700}.subagent-task{margin-top:10px;padding:10px;border:1px solid #e1d8ff;border-radius:6px;background:#fff;white-space:pre-wrap;word-break:break-word}
     pre{margin:0;white-space:pre-wrap;word-break:break-word;max-height:520px;overflow:auto;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.small{font-size:13px;color:#6b7484}.stats{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}.pill{background:#f7f9fc;border:1px solid var(--line);border-radius:999px;padding:3px 9px;color:#5d6675;font-size:13px}
   </style>
 </head>
@@ -703,6 +785,174 @@ function mediaDetails(body){
   });
   return out;
 }
+function parseMaybeJSON(value){
+  let current = value;
+  for (let i = 0; i < 3; i++) {
+    if (typeof current !== 'string') return current;
+    const trimmed = current.trim();
+    if (!trimmed || !/^[\[{"]/.test(trimmed)) return current;
+    try { current = JSON.parse(trimmed); } catch (_) { return current; }
+  }
+  return current;
+}
+function extractBalancedObject(text, start){
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') depth++;
+    if (ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return '';
+}
+function taskFromSubagentMessage(message){
+  const text = String(message || '').trim();
+  const candidates = [];
+  let pos = 0;
+  while (true) {
+    const start = text.indexOf('{', pos);
+    if (start < 0) break;
+    const raw = extractBalancedObject(text, start);
+    if (!raw) break;
+    const parsed = parseJSON(raw);
+    if (parsed && typeof parsed === 'object' && (parsed.summary || parsed.action || parsed.target || parsed.page_location)) {
+      return parsed;
+    }
+    candidates.push(raw);
+    pos = start + Math.max(raw.length, 1);
+  }
+  return null;
+}
+function normalizeList(value){
+  if (!value) return '';
+  if (Array.isArray(value)) return value.filter(v => v !== undefined && v !== null && String(v).trim() !== '').join(' / ');
+  if (typeof value === 'object') return stringify(value);
+  return String(value);
+}
+function subagentTitle(agent, idx){
+  const task = agent.task || {};
+  return task.summary || agent.nickname || agent.agent_id || ('Subagent #' + (idx + 1));
+}
+function subagentRows(agent){
+  const task = agent.task || {};
+  const target = task.target || {};
+  const page = task.page_location || {};
+  return [
+    ['Agent', [agent.nickname, agent.agent_id].filter(Boolean).join(' · ')],
+    ['类型', agent.agent_type || ''],
+    ['Call ID', agent.call_id || ''],
+    ['Turn', agent.turn || ''],
+    ['页面', normalizeList(page.breadcrumb || page.menu_leaf || page)],
+    ['动作', task.action || ''],
+    ['目标', normalizeList(target.element || target.labels || target)],
+    ['锚点', normalizeList(task.search_anchors)],
+    ['范围', normalizeList([task.scope, task.source].filter(Boolean))],
+    ['上下文', agent.fork_context === undefined ? '' : 'fork_context=' + String(agent.fork_context)],
+  ].filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== '');
+}
+function renderSubagentDetail(agent, idx, compact){
+  const rows = subagentRows(agent);
+  const task = agent.task || null;
+  const fallbackMessage = !task && agent.message ? shortText(agent.message, compact ? 900 : 1600) : '';
+  return '<div class="' + (compact ? 'subagent-detail' : 'ctx-card subagent-card') + '">' +
+    (compact ? '' : '<div class="ctx-card-title">启动 Subagent #' + (idx + 1) + '<span class="brief-chip">' + esc(agent.nickname || 'worker') + '</span></div>') +
+    '<div class="subagent-kv">' + rows.map(([k, v]) => '<div>' + esc(k) + '</div><div>' + esc(v) + '</div>').join('') + '</div>' +
+    (task ? '<div class="subagent-task">' + esc(stringify(task)) + '</div>' : '') +
+    (fallbackMessage ? '<div class="subagent-task">' + esc(fallbackMessage) + '</div>' : '') +
+  '</div>';
+}
+function renderSubagentCards(subagents){
+  if (!subagents.length) return '<div class="empty-text">没有捕获到 spawn_agent 调用。</div>';
+  return '<div class="ctx-list">' + subagents.map((agent, idx) => renderSubagentDetail(agent, idx, false)).join('') + '</div>';
+}
+function mergeSubagentOutput(agent, output){
+  const parsed = parseMaybeJSON(output?.output ?? output);
+  const value = parsed && typeof parsed === 'object' ? parsed : {};
+  if (value.agent_id && !agent.agent_id) agent.agent_id = value.agent_id;
+  if (value.nickname && !agent.nickname) agent.nickname = value.nickname;
+}
+function collectSubagentItem(state, item, fallbackKey){
+  if (!item || typeof item !== 'object') return null;
+  if (item.type === 'function_call_output') {
+    const key = item.call_id || fallbackKey;
+    const agent = state.byCallID.get(key) || state.byKey.get(key);
+    if (agent) mergeSubagentOutput(agent, item);
+    return agent || null;
+  }
+  if (item.type !== 'function_call' || item.name !== 'spawn_agent') return null;
+  const key = item.call_id || item.id || fallbackKey || ('spawn-' + state.items.length);
+  let agent = state.byKey.get(key) || state.byCallID.get(item.call_id || '');
+  if (!agent) {
+    agent = {call_id: item.call_id || '', item_id: item.id || '', output_index: item.output_index, raw_arguments: '', turn: ''};
+    state.items.push(agent);
+  }
+  if (item.call_id) state.byCallID.set(item.call_id, agent);
+  if (item.id) state.byItemID.set(item.id, agent);
+  if (item.output_index !== undefined) state.byOutputIndex.set(String(item.output_index), agent);
+  state.byKey.set(key, agent);
+  if (item.arguments !== undefined && item.arguments !== '') applySubagentArguments(agent, item.arguments);
+  return agent;
+}
+function applySubagentArguments(agent, raw){
+  agent.raw_arguments = typeof raw === 'string' ? raw : stringify(raw);
+  const args = parseMaybeJSON(raw);
+  if (!args || typeof args !== 'object') return;
+  agent.agent_type = args.agent_type || agent.agent_type || '';
+  agent.fork_context = args.fork_context;
+  agent.message = args.message || agent.message || '';
+  agent.model = args.model || agent.model || '';
+  agent.reasoning_effort = args.reasoning_effort || agent.reasoning_effort || '';
+  agent.task = taskFromSubagentMessage(agent.message);
+}
+function findSubagentByEvent(state, data){
+  return state.byCallID.get(data?.call_id || '') ||
+    state.byItemID.get(data?.item_id || '') ||
+    state.byOutputIndex.get(String(data?.output_index ?? '')) ||
+    null;
+}
+function subagentsFromTrace(t){
+  const state = {items: [], byKey: new Map(), byCallID: new Map(), byItemID: new Map(), byOutputIndex: new Map()};
+  const body = parseJSON(t.ResponseBody);
+  if (Array.isArray(body?.output)) {
+    body.output.forEach((item, idx) => collectSubagentItem(state, item, 'body-' + idx));
+  }
+  sseEvents(t).forEach(ev => {
+    const name = ev.Event || ev.event || '';
+    const data = eventData(ev);
+    if (!data || typeof data !== 'object') return;
+    if (data.item) collectSubagentItem(state, data.item, name + '-' + (data.output_index ?? state.items.length));
+    if (name === 'response.function_call_arguments.done' || data.type === 'response.function_call_arguments.done') {
+      const agent = findSubagentByEvent(state, data);
+      if (!agent) return;
+      applySubagentArguments(agent, data.arguments);
+    }
+    if (Array.isArray(data?.response?.output)) {
+      data.response.output.forEach((item, idx) => collectSubagentItem(state, item, 'completed-' + idx));
+    }
+  });
+  return state.items.map(agent => ({...agent, turn: t.SequenceNo || ''})).filter(agent => agent.raw_arguments || agent.message || agent.agent_id);
+}
+function allSubagents(traces){
+  return (traces || []).flatMap(t => subagentsFromTrace(t));
+}
 function runtimeRows(body, t){
   const rows = [
     ['model', body?.model || t.Model || ''],
@@ -754,16 +1004,17 @@ function renderSystemInstructions(body){
   if (!text) return '<div class="empty-text">没有顶层 instructions。</div>';
   return '<div class="ctx-card"><div class="ctx-card-title">instructions<span class="brief-chip">' + esc(text.length.toLocaleString()) + ' chars</span></div><div class="ctx-pre">' + esc(shortText(text, 4000)) + '</div></div>';
 }
-function renderContextInspector(t, body){
+function renderContextInspector(t, body, traces){
   const messages = requestMessages(body);
   const tools = toolDetails(body);
   const mcpTools = tools.filter(tool => /mcp|resource|template/i.test(tool.name + ' ' + tool.description));
   const skills = skillDetails(messages);
   const sections = injectedSections(messages);
   const media = mediaDetails(body);
+  const subagents = allSubagents(traces || []);
   const tabs = [
     ['overview', '概览', '<div class="ctx-summary">' +
-      [['系统', body?.instructions ? String(body.instructions).length.toLocaleString() + ' chars' : '0'], ['消息', messages.length], ['Tools', tools.length], ['Skills', skills.length], ['MCP', mcpTools.length], ['上下文', sections.length], ['媒体', media.length]]
+      [['系统', body?.instructions ? String(body.instructions).length.toLocaleString() + ' chars' : '0'], ['消息', messages.length], ['Tools', tools.length], ['Skills', skills.length], ['MCP', mcpTools.length], ['上下文', sections.length], ['Subagents', subagents.length], ['媒体', media.length]]
         .map(([label, value]) => '<div class="ctx-stat"><div class="ctx-stat-label">' + esc(label) + '</div><div class="ctx-stat-value">' + esc(value) + '</div></div>').join('') +
       '</div>'],
     ['system', '系统', renderSystemInstructions(body)],
@@ -771,6 +1022,7 @@ function renderContextInspector(t, body){
     ['skills', 'Skills ' + skills.length, renderSkillCards(skills)],
     ['mcp', 'MCP ' + mcpTools.length, renderToolCards(mcpTools)],
     ['context', '上下文 ' + sections.length, renderSectionCards(sections)],
+    ['subagents', 'Subagents ' + subagents.length, renderSubagentCards(subagents)],
     ['runtime', '运行参数', renderKV(runtimeRows(body, t))],
     ['media', '媒体 ' + media.length, renderMediaCards(media)],
   ];
@@ -842,12 +1094,17 @@ function briefTraceHTML(t){
   const body = parseJSON(t.RequestBody);
   const errorBox = t.Error ? '<div class="box err"><span class="tag">错误</span><pre>' + esc(t.Error) + '</pre></div>' : '';
   const messages = requestMessages(body);
+  const subagents = subagentsFromTrace(t);
+  const subagentBoxes = subagents.map((agent, idx) =>
+    '<div class="brief-box subagent"><span class="tag">启动 Subagent</span><div class="brief-text"><strong>' + esc(subagentTitle(agent, idx)) + '</strong>' + renderSubagentDetail(agent, idx, true) + '</div></div>'
+  ).join('');
   return '<section class="turn">' +
     '<div class="turn-head">▸ Turn ' + (t.SequenceNo || 0) + ' <span class="meta">' + (t.Status || 0) + ' ' + esc(t.Path) + '</span><a class="json-btn" href="/api/conversations/' + conversationID + '">JSON</a></div>' +
     '<div class="brief-grid">' +
       errorBox +
       '<div class="brief-box req"><span class="tag">请求</span><div class="brief-text">' + renderRoleLines(messages) + '</div></div>' +
       '<div class="brief-box res"><span class="tag">响应</span><div class="brief-text">' + esc(responseText(t)) + '</div></div>' +
+      subagentBoxes +
     '</div>' +
   '</section>';
 }
@@ -886,7 +1143,7 @@ function renderTraces(traces){
   const context = document.getElementById('session-context');
   if (context) {
     const first = (traces || [])[0];
-    context.innerHTML = viewMode === 'brief' && first ? renderContextInspector(first, parseJSON(first.RequestBody)) : '';
+    context.innerHTML = viewMode === 'brief' && first ? renderContextInspector(first, parseJSON(first.RequestBody), traces || []) : '';
   }
   const renderer = viewMode === 'brief' ? briefTraceHTML : traceHTML;
   document.getElementById('trace-list').innerHTML = (traces || []).map(renderer).join('') || '<section class="turn">暂无 trace。</section>';

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -105,6 +106,8 @@ type FilterOptions struct {
 	Agents         []string
 	AccountAliases []AccountAliasOption
 }
+
+var subagentIDPattern = regexp.MustCompile(`\\*"agent_id\\*"\s*:\s*\\*"([^"\\]+)\\*"`)
 
 func NewStore(dsn string) (*Store, error) {
 	if err := ensureDatabase(dsn); err != nil {
@@ -446,6 +449,73 @@ func (s *Store) ListConversations(ctx context.Context, query, status, date, agen
 	return out, rows.Err()
 }
 
+func (s *Store) SubagentLinks(ctx context.Context, conversations []ConversationSummary) (map[string][]string, error) {
+	links := make(map[string][]string)
+	if len(conversations) == 0 {
+		return links, nil
+	}
+	parentSessionByID := make(map[int64]string, len(conversations))
+	placeholders := make([]string, 0, len(conversations))
+	args := make([]any, 0, len(conversations))
+	for _, c := range conversations {
+		parentSessionByID[c.ID] = c.SessionID
+		placeholders = append(placeholders, "?")
+		args = append(args, c.ID)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT conversation_id, COALESCE(request_body,''), COALESCE(response_body,''), COALESCE(sse_events, JSON_ARRAY())
+		FROM traces WHERE conversation_id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		var conversationID int64
+		var requestBody, responseBody, sseEvents string
+		if err := rows.Scan(&conversationID, &requestBody, &responseBody, &sseEvents); err != nil {
+			return nil, err
+		}
+		parentSession := parentSessionByID[conversationID]
+		if parentSession == "" {
+			continue
+		}
+		for _, childSession := range extractSubagentSessionIDs(requestBody, responseBody, sseEvents) {
+			if childSession == parentSession {
+				continue
+			}
+			key := parentSession + "\x00" + childSession
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			links[parentSession] = append(links[parentSession], childSession)
+		}
+	}
+	return links, rows.Err()
+}
+
+func extractSubagentSessionIDs(values ...string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, value := range values {
+		for _, match := range subagentIDPattern.FindAllStringSubmatch(value, -1) {
+			if len(match) < 2 {
+				continue
+			}
+			id := strings.TrimSpace(match[1])
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 func (s *Store) FilterOptions(ctx context.Context) (FilterOptions, error) {
 	var opts FilterOptions
 	dateRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT DATE_FORMAT(updated_at, '%Y-%m-%d') FROM conversations ORDER BY DATE(updated_at) DESC`)
@@ -560,18 +630,65 @@ func (s *Store) SetConversationTags(ctx context.Context, id int64, tags string) 
 }
 
 func (s *Store) DeleteConversation(ctx context.Context, id int64) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM conversations WHERE id=?`, id)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	affected, err := result.RowsAffected()
+	defer tx.Rollback()
+
+	var sessionID string
+	if err := tx.QueryRowContext(ctx, `SELECT session_id FROM conversations WHERE id=? FOR UPDATE`, id).Scan(&sessionID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		}
+		return err
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT COALESCE(request_body,''), COALESCE(response_body,''), COALESCE(sse_events, JSON_ARRAY())
+		FROM traces WHERE conversation_id=?`, id)
 	if err != nil {
 		return err
 	}
-	if affected == 0 {
+	childSet := make(map[string]struct{})
+	for rows.Next() {
+		var requestBody, responseBody, sseEvents string
+		if err := rows.Scan(&requestBody, &responseBody, &sseEvents); err != nil {
+			rows.Close()
+			return err
+		}
+		for _, childSession := range extractSubagentSessionIDs(requestBody, responseBody, sseEvents) {
+			if childSession != "" && childSession != sessionID {
+				childSet[childSession] = struct{}{}
+			}
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	sessionIDs := []string{sessionID}
+	for childSession := range childSet {
+		sessionIDs = append(sessionIDs, childSession)
+	}
+	placeholders := make([]string, 0, len(sessionIDs))
+	args := make([]any, 0, len(sessionIDs))
+	for _, value := range sessionIDs {
+		placeholders = append(placeholders, "?")
+		args = append(args, value)
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM conversations WHERE session_id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) Stats(ctx context.Context) (conversationCount, traceCount int, inputTokens, outputTokens, cachedTokens int64, err error) {
