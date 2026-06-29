@@ -1,7 +1,9 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"html/template"
 	"net/http"
 	"strconv"
@@ -191,6 +193,23 @@ func (p *proxyServer) handleAPIConversationTags(w http.ResponseWriter, r *http.R
 	writeJSON(w, map[string]any{"ok": true}, nil)
 }
 
+func (p *proxyServer) handleAPIConversationDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad conversation id", http.StatusBadRequest)
+		return
+	}
+	if err := p.store.DeleteConversation(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "conversation not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true}, nil)
+}
+
 func (p *proxyServer) handleAPIAccountAlias(w http.ResponseWriter, r *http.Request) {
 	accountID := strings.TrimSpace(chi.URLParam(r, "id"))
 	var payload struct {
@@ -281,7 +300,7 @@ const indexHTML = `
     .prompt{font-size:14px;color:#242832}.sid{display:block;margin-top:4px;color:#8a93a3;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
     .account-btn,.tag-btn{height:auto;max-width:104px;padding:3px 9px;border-radius:6px;border:1px solid #b8e2df;background:#edfafa;color:#0f766e;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:none;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;font-weight:600}.account-btn:hover,.tag-btn:hover{background:#e2f7f4;border-color:#81cfc7;color:#0b5d56}.tag-btn{max-width:82px;border-color:#d8e0eb;background:#f7f9fc;color:#526074;font-family:inherit}
     .pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600;white-space:nowrap}.model{color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}.agent{color:#2469e8;background:#edf4ff;border:1px solid #c6d9ff}.ok{color:var(--green);background:#ecfbf2;border:1px solid #a9e2bf}.live{color:#fff;background:#f5821f;border:1px solid #f5821f}.error{color:var(--red);background:#fff1f1;border:1px solid #f0b3b3}.token{color:var(--orange);background:#fff8ee;border:1px solid #ffd09a;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.token-stack{display:inline-grid;gap:2px;line-height:1.35;min-width:92px;text-align:right}
-    a{color:var(--blue);text-decoration:none}.action{display:inline-flex;align-items:center;justify-content:center;min-width:48px;height:30px;border:1px solid var(--line);padding:0 10px;border-radius:7px;background:#fff;font-weight:500;white-space:nowrap}
+    a{color:var(--blue);text-decoration:none}.action{display:inline-flex;align-items:center;justify-content:center;min-width:48px;height:30px;border:1px solid var(--line);padding:0 10px;border-radius:7px;background:#fff;font-weight:500;white-space:nowrap}.delete-btn{color:var(--red);border-color:#f0b3b3;background:#fff6f6}.delete-btn:hover{background:#fff1f1;border-color:#e07d7d}
   </style>
 </head>
 <body>
@@ -332,7 +351,7 @@ const indexHTML = `
           <td><span class="pill agent">{{.Agent}}</span></td>
           <td>{{fmtMinutes .DurationMin}}</td>
           <td><span class="pill {{statusClass .Status}}">{{.Status}}</span></td>
-          <td><a class="action" href="/conversations/{{.ID}}">详情</a></td>
+          <td><button class="action delete-btn" data-delete-id="{{.ID}}" data-session-id="{{.SessionID}}">删除</button></td>
         </tr>
       {{else}}
         <tr><td colspan="11">暂无数据。发起一次 Codex 请求后这里会出现新会话。</td></tr>
@@ -408,6 +427,19 @@ async function editTags(button){
   });
   if (rsp.ok) refreshDashboard().catch(() => {});
 }
+async function deleteConversation(button){
+  const conversationID = button.dataset.deleteId || '';
+  if (!conversationID) return;
+  const sessionID = button.dataset.sessionId || '';
+  const message = '确认删除这个会话吗？\\n\\n' + (sessionID ? ('Session: ' + sessionID + '\\n') : '') + '会话和所有 trace 都会被删除。';
+  if (!confirm(message)) return;
+  const rsp = await fetch('/api/conversations/' + encodeURIComponent(conversationID), {method: 'DELETE'});
+  if (!rsp.ok) {
+    alert('删除失败：' + await rsp.text());
+    return;
+  }
+  refreshDashboard().catch(() => {});
+}
 document.getElementById('conversation-rows').addEventListener('click', event => {
   const accountButton = event.target.closest('.account-btn');
   if (accountButton) {
@@ -419,6 +451,12 @@ document.getElementById('conversation-rows').addEventListener('click', event => 
   if (tagButton) {
     event.preventDefault();
     editTags(tagButton).catch(() => {});
+    return;
+  }
+  const deleteButton = event.target.closest('.delete-btn');
+  if (deleteButton) {
+    event.preventDefault();
+    deleteConversation(deleteButton).catch(err => alert('删除失败：' + err));
     return;
   }
   if (event.target.closest('a,button,input,select')) return;
@@ -451,7 +489,7 @@ async function refreshDashboard(){
       '<td><span class="pill agent">' + esc(item.Agent || 'Codex') + '</span></td>' +
       '<td>' + fmtMinutes(item.DurationMin) + '</td>' +
       '<td><span class="pill ' + statusClass(item.Status) + '">' + esc(item.Status || 'LIVE') + '</span></td>' +
-      '<td><a class="action" href="/conversations/' + item.ID + '">详情</a></td>' +
+      '<td><button class="action delete-btn" data-delete-id="' + item.ID + '" data-session-id="' + esc(item.SessionID || '') + '">删除</button></td>' +
     '</tr>').join('') || '<tr><td colspan="11">暂无数据。发起一次 Codex 请求后这里会出现新会话。</td></tr>';
 }
 setInterval(() => refreshDashboard().catch(() => {}), 1000);

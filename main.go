@@ -109,6 +109,7 @@ func main() {
 	router.Get("/api/dashboard", srv.handleAPIDashboard)
 	router.Get("/api/conversations", srv.handleAPIConversations)
 	router.Get("/api/conversations/{id}", srv.handleAPIConversationDetail)
+	router.Delete("/api/conversations/{id}", srv.handleAPIConversationDelete)
 	router.Post("/api/conversations/{id}/tags", srv.handleAPIConversationTags)
 	router.Post("/api/accounts/{id}/alias", srv.handleAPIAccountAlias)
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {

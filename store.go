@@ -559,6 +559,21 @@ func (s *Store) SetConversationTags(ctx context.Context, id int64, tags string) 
 	return err
 }
 
+func (s *Store) DeleteConversation(ctx context.Context, id int64) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM conversations WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Store) Stats(ctx context.Context) (conversationCount, traceCount int, inputTokens, outputTokens, cachedTokens int64, err error) {
 	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(trace_count),0) FROM conversations`).
 		Scan(&conversationCount, &traceCount)
