@@ -68,10 +68,11 @@ var baseTemplate = template.Must(template.New("base").Funcs(template.FuncMap{
 func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	month := strings.TrimSpace(r.URL.Query().Get("month"))
 	date := strings.TrimSpace(r.URL.Query().Get("date"))
 	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
 	accountID := strings.TrimSpace(r.URL.Query().Get("account_id"))
-	conversations, err := p.store.ListConversations(r.Context(), query, status, date, agent, accountID)
+	conversations, err := p.store.ListConversations(r.Context(), query, status, month, date, agent, accountID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -86,7 +87,7 @@ func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	conversationCount, traceCount, inputTokens, outputTokens, cachedTokens, err := p.store.Stats(r.Context())
+	conversationCount, traceCount, inputTokens, outputTokens, cachedTokens, err := p.store.Stats(r.Context(), query, status, month, date, agent, accountID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -95,6 +96,7 @@ func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"Now":               time.Now(),
 		"Query":             query,
 		"Status":            status,
+		"Month":             month,
 		"Date":              date,
 		"Agent":             agent,
 		"AccountID":         accountID,
@@ -137,12 +139,18 @@ func (p *proxyServer) handleConversationDetail(w http.ResponseWriter, r *http.Re
 }
 
 func (p *proxyServer) handleAPIConversations(w http.ResponseWriter, r *http.Request) {
-	conversations, err := p.store.ListConversations(r.Context(), r.URL.Query().Get("q"), r.URL.Query().Get("status"), r.URL.Query().Get("date"), r.URL.Query().Get("agent"), r.URL.Query().Get("account_id"))
+	conversations, err := p.store.ListConversations(r.Context(), r.URL.Query().Get("q"), r.URL.Query().Get("status"), r.URL.Query().Get("month"), r.URL.Query().Get("date"), r.URL.Query().Get("agent"), r.URL.Query().Get("account_id"))
 	writeJSON(w, conversations, err)
 }
 
 func (p *proxyServer) handleAPIDashboard(w http.ResponseWriter, r *http.Request) {
-	conversations, err := p.store.ListConversations(r.Context(), r.URL.Query().Get("q"), r.URL.Query().Get("status"), r.URL.Query().Get("date"), r.URL.Query().Get("agent"), r.URL.Query().Get("account_id"))
+	query := r.URL.Query().Get("q")
+	status := r.URL.Query().Get("status")
+	month := r.URL.Query().Get("month")
+	date := r.URL.Query().Get("date")
+	agent := r.URL.Query().Get("agent")
+	accountID := r.URL.Query().Get("account_id")
+	conversations, err := p.store.ListConversations(r.Context(), query, status, month, date, agent, accountID)
 	if err != nil {
 		writeJSON(w, nil, err)
 		return
@@ -157,7 +165,7 @@ func (p *proxyServer) handleAPIDashboard(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, nil, err)
 		return
 	}
-	conversationCount, traceCount, inputTokens, outputTokens, cachedTokens, err := p.store.Stats(r.Context())
+	conversationCount, traceCount, inputTokens, outputTokens, cachedTokens, err := p.store.Stats(r.Context(), query, status, month, date, agent, accountID)
 	if err != nil {
 		writeJSON(w, nil, err)
 		return
@@ -303,7 +311,7 @@ const indexHTML = `
     :root{--bg:#f6f7fb;--panel:#fff;--line:#dfe5ee;--text:#20242c;--muted:#6f7787;--blue:#2f6fed;--green:#139a55;--orange:#d46f1e;--red:#c94040;--purple:#6750d8}
     *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}
     .page{padding:22px 28px 56px}.top{display:flex;align-items:center;gap:16px}.top h1{font-size:18px;font-weight:600;margin:0;flex:1}.clock{color:#d95252;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-    .filters{display:grid;grid-template-columns:150px 150px 150px 190px 1fr auto;gap:12px;margin-top:16px}
+    .filters{display:grid;grid-template-columns:150px 150px 150px 150px 190px 1fr auto;gap:12px;margin-top:16px}
     select,input,button{height:42px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:0 12px;font:inherit;color:var(--text)}
     button{cursor:pointer}.stats,.table{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05)}
     .stats{display:flex;gap:36px;padding:22px 26px;margin-top:16px}.stat-label{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.02em}.stat-value{font-size:28px;font-weight:600;margin-top:4px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
@@ -319,6 +327,10 @@ const indexHTML = `
 <main class="page">
   <div class="top"><h1>对话日志</h1><div class="clock" id="clock">{{fmtTime .Now}}</div></div>
   <form class="filters" method="get">
+    <select name="month" id="month-filter">
+      <option value="all">全部月份</option>
+      {{range .FilterOptions.Months}}<option value="{{.}}" {{if eq $.Month .}}selected{{end}}>{{.}}</option>{{end}}
+    </select>
     <select name="date" id="date-filter">
       <option value="all">全部日期</option>
       {{range .FilterOptions.Dates}}<option value="{{.}}" {{if eq $.Date .}}selected{{end}}>{{.}}</option>{{end}}
@@ -482,6 +494,7 @@ function syncSelectOptions(select, allLabel, options, getValue, getLabel){
 }
 function syncFilterOptions(options){
   options = options || {};
+  syncSelectOptions(document.getElementById('month-filter'), '全部月份', options.Months || [], v => v, v => v);
   syncSelectOptions(document.getElementById('date-filter'), '全部日期', options.Dates || [], v => v, v => v);
   syncSelectOptions(document.getElementById('agent-filter'), '全部 Agent', options.Agents || [], v => v, v => v);
   syncSelectOptions(document.getElementById('account-filter'), '全部账号', options.AccountAliases || [], v => v.AccountID, v => v.DisplayName);
@@ -606,7 +619,7 @@ const detailHTML = `
 <body>
 <main class="page">
   <div class="head">
-    <div class="head-main"><a class="back" href="/">←</a><div><div class="title">Codex 详情</div><div class="sid">{{.Conversation.SessionID}}</div></div></div>
+    <div class="head-main"><a class="back" href="/">←</a><div><div class="title">{{.Conversation.Agent}} 详情</div><div class="sid">{{.Conversation.SessionID}}</div></div></div>
     <div class="mode-switch" role="tablist" aria-label="展示模式">
       <button type="button" class="mode-btn" data-mode="detail" role="tab" aria-selected="false">详细</button>
       <button type="button" class="mode-btn active" data-mode="brief" role="tab" aria-selected="true">简略</button>
@@ -653,6 +666,14 @@ function contentText(content){
     return stringify(part);
   }).filter(Boolean).join('\n');
 }
+// systemText 取顶层系统提示:Codex 用 instructions,Claude(Anthropic)用 system(可为字符串或内容块数组)。
+function systemText(body){
+  if (!body || typeof body !== 'object') return '';
+  if (body.instructions) return String(body.instructions);
+  if (typeof body.system === 'string') return body.system;
+  if (Array.isArray(body.system)) return contentText(body.system);
+  return '';
+}
 function requestMessages(body){
   if (!body || typeof body !== 'object') return [];
   const source = Array.isArray(body.input) ? body.input : Array.isArray(body.messages) ? body.messages : [];
@@ -677,7 +698,7 @@ function toolName(tool){
 }
 function toolDetails(body){
   return Array.isArray(body?.tools) ? body.tools.map(tool => {
-    const params = tool.parameters || tool.function?.parameters || {};
+    const params = tool.parameters || tool.input_schema || tool.function?.parameters || {};
     const properties = params && typeof params === 'object' && params.properties && typeof params.properties === 'object' ? params.properties : {};
     return {
       name: toolName(tool) || 'unknown',
@@ -773,13 +794,15 @@ function injectedSections(messages){
 }
 function mediaDetails(body){
   const out = [];
-  const source = Array.isArray(body?.input) ? body.input : [];
+  // Codex 在 input[],Claude 在 messages[];两者都扫
+  const source = Array.isArray(body?.input) ? body.input : Array.isArray(body?.messages) ? body.messages : [];
   source.forEach((item, idx) => {
     const content = Array.isArray(item?.content) ? item.content : [];
     content.forEach((part, partIdx) => {
       if (part && typeof part === 'object' && (part.type === 'input_image' || part.type === 'image')) {
-        const imageURL = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url || part.source?.url || '';
-        out.push({role: item.role || 'user', index: idx + 1, part: partIdx + 1, type: part.type, detail: part.detail || '', size: imageURL ? imageURL.length : 0});
+        // Codex: image_url 字符串/对象;Claude: source.data(base64)或 source.url
+        const imageURL = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url || part.source?.url || part.source?.data || '';
+        out.push({role: item.role || 'user', index: idx + 1, part: partIdx + 1, type: part.type, detail: part.detail || part.source?.media_type || '', size: imageURL ? imageURL.length : 0});
       }
     });
   });
@@ -1000,8 +1023,8 @@ function renderMediaCards(media){
   return '<div class="ctx-list">' + media.map(item => '<div class="ctx-card"><div class="ctx-card-title">' + esc(item.type) + '<span class="brief-chip">' + esc(item.role) + '</span></div><div class="ctx-card-desc">input #' + item.index + ', part #' + item.part + (item.detail ? ', detail ' + esc(item.detail) : '') + ', data ' + item.size.toLocaleString() + ' chars</div></div>').join('') + '</div>';
 }
 function renderSystemInstructions(body){
-  const text = String(body?.instructions || '').trim();
-  if (!text) return '<div class="empty-text">没有顶层 instructions。</div>';
+  const text = systemText(body).trim();
+  if (!text) return '<div class="empty-text">没有顶层系统提示。</div>';
   return '<div class="ctx-card"><div class="ctx-card-title">instructions<span class="brief-chip">' + esc(text.length.toLocaleString()) + ' chars</span></div><div class="ctx-pre">' + esc(shortText(text, 4000)) + '</div></div>';
 }
 function renderContextInspector(t, body, traces){
@@ -1014,7 +1037,7 @@ function renderContextInspector(t, body, traces){
   const subagents = allSubagents(traces || []);
   const tabs = [
     ['overview', '概览', '<div class="ctx-summary">' +
-      [['系统', body?.instructions ? String(body.instructions).length.toLocaleString() + ' chars' : '0'], ['消息', messages.length], ['Tools', tools.length], ['Skills', skills.length], ['MCP', mcpTools.length], ['上下文', sections.length], ['Subagents', subagents.length], ['媒体', media.length]]
+      [['系统', systemText(body) ? systemText(body).length.toLocaleString() + ' chars' : '0'], ['消息', messages.length], ['Tools', tools.length], ['Skills', skills.length], ['MCP', mcpTools.length], ['上下文', sections.length], ['Subagents', subagents.length], ['媒体', media.length]]
         .map(([label, value]) => '<div class="ctx-stat"><div class="ctx-stat-label">' + esc(label) + '</div><div class="ctx-stat-value">' + esc(value) + '</div></div>').join('') +
       '</div>'],
     ['system', '系统', renderSystemInstructions(body)],
@@ -1087,8 +1110,37 @@ function responseText(t){
       .map(data => data.item);
     blocks.push(...normalizeOutputItems(outputItems));
   }
+  if (!blocks.length) blocks.push(...claudeStreamBlocks(t));
   const text = blocks.filter(Boolean).join('\n\n').trim();
   return text || '响应体里没有 assistant 文本。';
+}
+// claudeStreamBlocks 把 Anthropic 流式 SSE 还原成文本:正文走 text_delta,
+// 思考走 thinking_delta,工具调用按 content_block_start 的 tool_use 名字标注。
+function claudeStreamBlocks(t){
+  const events = sseEvents(t);
+  const parts = {};
+  let order = [];
+  events.forEach(ev => {
+    const name = ev.Event || ev.event;
+    const d = eventData(ev);
+    if (!d) return;
+    const idx = typeof d.index === 'number' ? d.index : 0;
+    if (!(idx in parts)) { parts[idx] = {text: '', label: ''}; order.push(idx); }
+    if (name === 'content_block_start' && d.content_block) {
+      const cb = d.content_block;
+      if (cb.type === 'tool_use') parts[idx].label = '工具调用 ' + (cb.name || cb.id || '');
+      else if (cb.type === 'thinking') parts[idx].label = '[thinking]';
+    } else if (name === 'content_block_delta' && d.delta) {
+      if (d.delta.type === 'text_delta') parts[idx].text += d.delta.text || '';
+      else if (d.delta.type === 'thinking_delta') parts[idx].text += d.delta.thinking || '';
+      else if (d.delta.type === 'input_json_delta') parts[idx].text += d.delta.partial_json || '';
+    }
+  });
+  return order.map(i => {
+    const p = parts[i];
+    const body = (p.label ? p.label + '\n' : '') + p.text;
+    return body.trim();
+  }).filter(Boolean);
 }
 function briefTraceHTML(t){
   const body = parseJSON(t.RequestBody);
@@ -1142,7 +1194,9 @@ function renderTraces(traces){
   syncModeUI();
   const context = document.getElementById('session-context');
   if (context) {
-    const first = (traces || [])[0];
+    // 用请求体最大的 trace 作为上下文来源:Claude Code 首个请求常是几百字节的
+    // quota/warmup 探测(无 system/tools/messages),直接取 traces[0] 会全是 0。
+    const first = (traces || []).slice().sort((a, b) => String(b.RequestBody || '').length - String(a.RequestBody || '').length)[0];
     context.innerHTML = viewMode === 'brief' && first ? renderContextInspector(first, parseJSON(first.RequestBody), traces || []) : '';
   }
   const renderer = viewMode === 'brief' ? briefTraceHTML : traceHTML;

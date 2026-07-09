@@ -24,6 +24,7 @@ type StartTraceInput struct {
 	TurnID       string
 	FirstPrompt  string
 	Model        string
+	Agent        string
 	Method       string
 	Path         string
 	UpstreamURL  string
@@ -41,6 +42,7 @@ type FinishTraceInput struct {
 	SSEEvents     []sseEvent
 	Usage         usageStats
 	Error         string
+	Probe         bool
 }
 
 type ConversationSummary struct {
@@ -102,6 +104,7 @@ type AccountAliasOption struct {
 }
 
 type FilterOptions struct {
+	Months         []string
 	Dates          []string
 	Agents         []string
 	AccountAliases []AccountAliasOption
@@ -293,7 +296,7 @@ func (s *Store) repairInjectedPrompts(ctx context.Context) error {
 		if err := rows.Scan(&id, &body); err != nil {
 			return err
 		}
-		meta := requestMetaFromHeaders(nil, []byte(body))
+		meta := requestMetaFromHeaders(nil, []byte(body), providerCodex)
 		if meta.FirstPrompt != "" && meta.FirstPrompt != "未捕获到用户 prompt。" && !isInjectedContext(meta.FirstPrompt) {
 			repairs = append(repairs, repair{id: id, prompt: meta.FirstPrompt})
 		}
@@ -320,14 +323,18 @@ func (s *Store) StartTrace(ctx context.Context, in StartTraceInput) (int64, erro
 	}
 	defer tx.Rollback()
 
+	agent := in.Agent
+	if agent == "" {
+		agent = "Codex"
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO conversations
-		(session_id, account_id, window_id, started_at, updated_at, first_prompt, model, status, trace_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'LIVE', 0)
+		(session_id, account_id, window_id, started_at, updated_at, first_prompt, model, agent, status, trace_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LIVE', 0)
 		ON DUPLICATE KEY UPDATE updated_at=VALUES(updated_at), window_id=IF(window_id='', VALUES(window_id), window_id),
 			account_id=IF(account_id='', VALUES(account_id), account_id),
-			first_prompt=IF(first_prompt IS NULL OR first_prompt='' OR first_prompt='未捕获到用户 prompt。' OR first_prompt LIKE '<environment_context>%' OR first_prompt LIKE '<permissions instructions>%' OR first_prompt LIKE '# AGENTS.md instructions%' OR first_prompt LIKE '<skill>%', VALUES(first_prompt), first_prompt),
-			model=IF(model='', VALUES(model), model), status='LIVE'`,
-		in.SessionID, in.AccountID, in.WindowID, now, now, in.FirstPrompt, in.Model)
+			first_prompt=IF(first_prompt IS NULL OR first_prompt='' OR first_prompt='未捕获到用户 prompt。' OR first_prompt LIKE '<environment_context>%' OR first_prompt LIKE '<permissions instructions>%' OR first_prompt LIKE '# AGENTS.md instructions%' OR first_prompt LIKE '<skill>%' OR first_prompt LIKE '<system-reminder>%', VALUES(first_prompt), first_prompt),
+			model=IF(model='', VALUES(model), model), agent=VALUES(agent), status='LIVE'`,
+		in.SessionID, in.AccountID, in.WindowID, now, now, in.FirstPrompt, in.Model, agent)
 	if err != nil {
 		return 0, err
 	}
@@ -381,29 +388,41 @@ func (s *Store) FinishTrace(ctx context.Context, traceID int64, in FinishTraceIn
 		return err
 	}
 	errorInc := 0
-	if in.Error != "" || in.Status >= 400 {
+	// error_count 仅统计上游真实返回的错误(排除传输层瞬断与 quota 探测),留作参考信息。
+	if in.Status >= 400 && in.Error == "" && !in.Probe {
 		errorInc = 1
 	}
+	// 会话状态取「最后一轮(最大 sequence_no)已完成 trace」的结果:
+	// 无论代理层还是客户端层的重试,最终一轮成功即 OK,失败即 ERROR。
+	// 这样瞬时 502/探测失败被后续成功覆盖,而彻底失败(全程无成功)如实标 ERROR。
 	_, err = tx.ExecContext(ctx, `UPDATE conversations SET
-		status=IF(EXISTS(SELECT 1 FROM traces WHERE conversation_id=? AND completed_at IS NULL), 'LIVE', IF(error_count+?>0, 'ERROR', 'OK')),
+		status=IF(EXISTS(SELECT 1 FROM traces WHERE conversation_id=? AND completed_at IS NULL), 'LIVE',
+			IF(COALESCE((SELECT t2.status FROM traces t2 WHERE t2.conversation_id=? AND t2.completed_at IS NOT NULL ORDER BY t2.sequence_no DESC LIMIT 1), 0) >= 400, 'ERROR', 'OK')),
 		error_count=error_count+?, total_tokens=total_tokens+?,
-		last_status=?, last_duration_ms=?, last_request_id=(
-			SELECT JSON_UNQUOTE(JSON_EXTRACT(response_headers, '$."X-Oai-Request-Id"[0]')) FROM traces WHERE id=?
-		)
+		last_status=?, last_duration_ms=?, last_request_id=COALESCE((
+			SELECT COALESCE(
+				JSON_UNQUOTE(JSON_EXTRACT(response_headers, '$."X-Oai-Request-Id"[0]')),
+				JSON_UNQUOTE(JSON_EXTRACT(response_headers, '$."Request-Id"[0]'))
+			) FROM traces WHERE id=?
+		), last_request_id)
 		WHERE id=?`,
-		conversationID, errorInc, errorInc, in.Usage.TotalTokens, in.Status, in.DurationMS, traceID, conversationID)
+		conversationID, conversationID, errorInc, in.Usage.TotalTokens, in.Status, in.DurationMS, traceID, conversationID)
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func (s *Store) ListConversations(ctx context.Context, query, status, date, agent, accountID string) ([]ConversationSummary, error) {
+func conversationWhere(query, status, month, date, agent, accountID string) (string, []any) {
 	where := "WHERE 1=1"
 	args := []any{}
 	if status != "" && status != "all" {
 		where += " AND c.status=?"
 		args = append(args, status)
+	}
+	if month != "" && month != "all" {
+		where += " AND DATE_FORMAT(c.updated_at, '%Y-%m')=?"
+		args = append(args, month)
 	}
 	if date != "" && date != "all" {
 		where += " AND DATE(c.updated_at)=?"
@@ -422,6 +441,11 @@ func (s *Store) ListConversations(ctx context.Context, query, status, date, agen
 		like := "%" + query + "%"
 		args = append(args, like, like, like, like, like)
 	}
+	return where, args
+}
+
+func (s *Store) ListConversations(ctx context.Context, query, status, month, date, agent, accountID string) ([]ConversationSummary, error) {
+	where, args := conversationWhere(query, status, month, date, agent, accountID)
 	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.session_id, c.account_id, COALESCE(a.display_name,''), COALESCE(c.tags,''), c.started_at, c.updated_at, COALESCE(c.first_prompt,''), c.trace_count,
 		c.error_count, c.total_tokens, COALESCE(tok.input_tokens,0), COALESCE(tok.output_tokens,0), COALESCE(tok.cached_tokens,0),
 		TIMESTAMPDIFF(MICROSECOND, c.started_at, COALESCE(tok.completed_at, c.updated_at)) / 60000000,
@@ -518,6 +542,22 @@ func extractSubagentSessionIDs(values ...string) []string {
 
 func (s *Store) FilterOptions(ctx context.Context) (FilterOptions, error) {
 	var opts FilterOptions
+	monthRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT DATE_FORMAT(updated_at, '%Y-%m') FROM conversations ORDER BY DATE_FORMAT(updated_at, '%Y-%m') DESC`)
+	if err != nil {
+		return opts, err
+	}
+	defer monthRows.Close()
+	for monthRows.Next() {
+		var value string
+		if err := monthRows.Scan(&value); err != nil {
+			return opts, err
+		}
+		opts.Months = append(opts.Months, value)
+	}
+	if err := monthRows.Err(); err != nil {
+		return opts, err
+	}
+
 	dateRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT DATE_FORMAT(updated_at, '%Y-%m-%d') FROM conversations ORDER BY DATE(updated_at) DESC`)
 	if err != nil {
 		return opts, err
@@ -691,13 +731,21 @@ func (s *Store) DeleteConversation(ctx context.Context, id int64) error {
 	return tx.Commit()
 }
 
-func (s *Store) Stats(ctx context.Context) (conversationCount, traceCount int, inputTokens, outputTokens, cachedTokens int64, err error) {
-	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(trace_count),0) FROM conversations`).
+func (s *Store) Stats(ctx context.Context, query, status, month, date, agent, accountID string) (conversationCount, traceCount int, inputTokens, outputTokens, cachedTokens int64, err error) {
+	where, args := conversationWhere(query, status, month, date, agent, accountID)
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(c.trace_count),0)
+		FROM conversations c
+		LEFT JOIN account_aliases a ON a.account_id=c.account_id `+where, args...).
 		Scan(&conversationCount, &traceCount)
 	if err != nil {
 		return 0, 0, 0, 0, 0, err
 	}
-	err = s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cached_tokens),0) FROM traces`).
+
+	tokenArgs := append([]any{}, args...)
+	err = s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(t.input_tokens),0), COALESCE(SUM(t.output_tokens),0), COALESCE(SUM(t.cached_tokens),0)
+		FROM traces t
+		INNER JOIN conversations c ON c.id=t.conversation_id
+		LEFT JOIN account_aliases a ON a.account_id=c.account_id `+where, tokenArgs...).
 		Scan(&inputTokens, &outputTokens, &cachedTokens)
 	if err != nil {
 		return 0, 0, 0, 0, 0, err

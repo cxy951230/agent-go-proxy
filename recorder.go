@@ -9,6 +9,7 @@ import (
 )
 
 type TraceStartRecord struct {
+	Provider     string
 	Method       string
 	Path         string
 	UpstreamURL  string
@@ -18,6 +19,8 @@ type TraceStartRecord struct {
 }
 
 type TraceFinishRecord struct {
+	Provider      string
+	Probe         bool
 	Status        int
 	DurationMS    int64
 	ResponseBody  string
@@ -100,7 +103,7 @@ func (r *asyncRecorder) runStart(job recorderJob) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	meta := requestMetaFromHeaders(http.Header(job.start.RequestHdrs), []byte(job.start.RequestBody))
+	meta := requestMetaFromHeaders(http.Header(job.start.RequestHdrs), []byte(job.start.RequestBody), job.start.Provider)
 	traceID, err := r.store.StartTrace(ctx, StartTraceInput{
 		SessionID:    meta.SessionID,
 		AccountID:    meta.AccountID,
@@ -108,6 +111,7 @@ func (r *asyncRecorder) runStart(job recorderJob) {
 		TurnID:       meta.TurnID,
 		FirstPrompt:  meta.FirstPrompt,
 		Model:        meta.Model,
+		Agent:        agentLabel(job.start.Provider),
 		Method:       job.start.Method,
 		Path:         job.start.Path,
 		UpstreamURL:  job.start.UpstreamURL,
@@ -129,7 +133,11 @@ func (r *asyncRecorder) runFinish(job recorderJob) {
 		return
 	}
 	events := parseSSEEvents(job.finish.ResponseBody)
-	usage := extractUsageFromEvents(events)
+	usage := extractUsageFromEvents(events, job.finish.Provider)
+	// 非流式 Claude 响应没有 SSE 事件,usage 在 JSON 顶层,回退解析。
+	if job.finish.Provider == providerClaude && usage.TotalTokens == 0 {
+		usage = claudeUsageFromJSONBody(job.finish.ResponseBody)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := r.store.FinishTrace(ctx, traceID, FinishTraceInput{
@@ -141,6 +149,7 @@ func (r *asyncRecorder) runFinish(job recorderJob) {
 		SSEEvents:     events,
 		Usage:         usage,
 		Error:         job.finish.Error,
+		Probe:         job.finish.Probe,
 	}); err != nil {
 		log.Printf("store finish trace: %v", err)
 	}

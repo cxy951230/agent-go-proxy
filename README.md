@@ -33,6 +33,20 @@ For OpenAI Platform API key traffic:
 go run . -target https://api.openai.com
 ```
 
+Claude (Anthropic) traffic is supported at the same time and routed automatically by
+endpoint (`/v1/messages` → Claude, `/v1/responses` → Codex). Point Claude Code at the proxy
+with account login unchanged:
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
+```
+
+The Claude upstream defaults to `https://api.anthropic.com` and can be overridden:
+
+```sh
+go run . -claude-target https://api.anthropic.com   # or CLAUDE_BASE_URL
+```
+
 Logs are written as JSON Lines to `log/YYYY-MM-DD.log`.
 
 The dashboard is served by the same process:

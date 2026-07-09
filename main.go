@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"errors"
 	"flag"
@@ -33,10 +36,11 @@ var hopByHopHeaders = map[string]struct{}{
 }
 
 type config struct {
-	listenAddr string
-	target     *url.URL
-	logDir     string
-	dsn        string
+	listenAddr   string
+	target       *url.URL
+	claudeTarget *url.URL
+	logDir       string
+	dsn          string
 }
 
 type proxyServer struct {
@@ -49,7 +53,8 @@ type proxyServer struct {
 
 func main() {
 	listenAddr := flag.String("listen", "127.0.0.1:8080", "local listen address")
-	targetValue := flag.String("target", envOrDefault("UPSTREAM_BASE_URL", "https://chatgpt.com/backend-api/codex"), "upstream base URL")
+	targetValue := flag.String("target", envOrDefault("UPSTREAM_BASE_URL", "https://chatgpt.com/backend-api/codex"), "upstream base URL for Codex requests")
+	claudeTargetValue := flag.String("claude-target", envOrDefault("CLAUDE_BASE_URL", "https://api.anthropic.com"), "upstream base URL for Claude (Anthropic) requests")
 	logDir := flag.String("log-dir", "log", "directory for date-based JSONL logs")
 	dsn := flag.String("mysql-dsn", envOrDefault("MYSQL_DSN", "root:123456@tcp(127.0.0.1:3306)/agent_go_proxy?parseTime=true&charset=utf8mb4&loc=Local"), "MySQL DSN")
 	flag.Parse()
@@ -57,6 +62,11 @@ func main() {
 	target, err := url.Parse(*targetValue)
 	if err != nil || target.Scheme == "" || target.Host == "" {
 		log.Fatalf("invalid -target %q", *targetValue)
+	}
+
+	claudeTarget, err := url.Parse(*claudeTargetValue)
+	if err != nil || claudeTarget.Scheme == "" || claudeTarget.Host == "" {
+		log.Fatalf("invalid -claude-target %q", *claudeTargetValue)
 	}
 
 	if err := os.MkdirAll(*logDir, 0755); err != nil {
@@ -76,10 +86,11 @@ func main() {
 
 	srv := &proxyServer{
 		cfg: config{
-			listenAddr: *listenAddr,
-			target:     target,
-			logDir:     *logDir,
-			dsn:        *dsn,
+			listenAddr:   *listenAddr,
+			target:       target,
+			claudeTarget: claudeTarget,
+			logDir:       *logDir,
+			dsn:          *dsn,
 		},
 		client: &http.Client{
 			Transport: &http.Transport{
@@ -88,9 +99,11 @@ func main() {
 					Timeout:   30 * time.Second,
 					KeepAlive: 30 * time.Second,
 				}).DialContext,
-				ForceAttemptHTTP2:     true,
-				MaxIdleConns:          100,
-				IdleConnTimeout:       90 * time.Second,
+				ForceAttemptHTTP2: true,
+				MaxIdleConns:      100,
+				// 经本地代理(clash 等)时空闲隧道常被上游提前关闭,复用会得到 EOF。
+				// 缩短空闲超时,减少复用失效连接的概率(配合上层重试基本消除瞬时 502)。
+				IdleConnTimeout:       15 * time.Second,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
 			},
@@ -127,7 +140,8 @@ func main() {
 	errCh := make(chan error, 1)
 	go func() {
 		fmt.Printf("agent-go-proxy listening on http://%s\n", *listenAddr)
-		fmt.Printf("upstream target: %s\n", target.String())
+		fmt.Printf("codex upstream target: %s\n", target.String())
+		fmt.Printf("claude upstream target: %s\n", claudeTarget.String())
 		fmt.Printf("log dir: %s\n", *logDir)
 		fmt.Printf("dashboard: http://%s/\n", *listenAddr)
 		fmt.Printf("for Codex CLI: CODEX_HOME=/path/to/codex_home NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost codex\n")
@@ -162,8 +176,13 @@ func (p *proxyServer) handleProxyFallback(w http.ResponseWriter, r *http.Request
 
 func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	upstreamURL := buildUpstreamURL(p.cfg.target, r.URL)
-	fmt.Printf("-> %s %s upstream=%s\n", r.Method, r.URL.RequestURI(), upstreamURL)
+	provider := detectProvider(r)
+	upstreamTarget := p.cfg.target
+	if provider == providerClaude {
+		upstreamTarget = p.cfg.claudeTarget
+	}
+	upstreamURL := buildUpstreamURL(upstreamTarget, r.URL)
+	fmt.Printf("-> [%s] %s %s upstream=%s\n", provider, r.Method, r.URL.RequestURI(), upstreamURL)
 
 	reqBody, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -182,66 +201,73 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	recordedReqBody := truncateBase64Images(string(reqBody))
+	// Claude Code 的 quota/warmup 探测请求(max_tokens<=1,内容为 "quota"):
+	// 只转发给上游让 CC 读限流状态,不落库、不写日志,避免污染看板。
+	isProbe := provider == providerClaude && isClaudeQuotaProbe(reqBody)
 
-	p.logs.Write(logEntry{
-		Timestamp:   time.Now().Format(time.RFC3339Nano),
-		Phase:       "start",
-		DurationMS:  time.Since(start).Milliseconds(),
-		Method:      r.Method,
-		Path:        r.URL.RequestURI(),
-		UpstreamURL: upstreamURL,
-		RequestBody: recordedReqBody,
-		RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
-	})
-
-	traceHandle := p.recorder.Start(TraceStartRecord{
-		Method:       r.Method,
-		Path:         r.URL.RequestURI(),
-		UpstreamURL:  upstreamURL,
-		RequestBody:  recordedReqBody,
-		RequestHdrs:  sanitizeHeader(cloneHeader(r.Header)),
-		RequestBytes: len(reqBody),
-	})
-
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(reqBody))
-	if err != nil {
-		http.Error(w, "failed to create upstream request", http.StatusBadGateway)
+	var traceHandle *traceHandle
+	if !isProbe {
 		p.logs.Write(logEntry{
 			Timestamp:   time.Now().Format(time.RFC3339Nano),
+			Phase:       "start",
 			DurationMS:  time.Since(start).Milliseconds(),
 			Method:      r.Method,
 			Path:        r.URL.RequestURI(),
 			UpstreamURL: upstreamURL,
-			Status:      http.StatusBadGateway,
 			RequestBody: recordedReqBody,
 			RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
-			Error:       err.Error(),
 		})
-		fmt.Printf("<- %s %s status=%d error=%s\n", r.Method, r.URL.RequestURI(), http.StatusBadGateway, err.Error())
-		p.recorder.Finish(traceHandle, TraceFinishRecord{
-			Status:     http.StatusBadGateway,
-			DurationMS: time.Since(start).Milliseconds(),
-			Error:      err.Error(),
-		})
-		return
-	}
-	copyHeaders(upstreamReq.Header, r.Header)
-	upstreamReq.Host = p.cfg.target.Host
 
-	resp, err := p.client.Do(upstreamReq)
+		traceHandle = p.recorder.Start(TraceStartRecord{
+			Provider:     provider,
+			Method:       r.Method,
+			Path:         r.URL.RequestURI(),
+			UpstreamURL:  upstreamURL,
+			RequestBody:  recordedReqBody,
+			RequestHdrs:  sanitizeHeader(cloneHeader(r.Header)),
+			RequestBytes: len(reqBody),
+		})
+	}
+
+	// 请求体已缓存,响应写回前若上游传输层瞬时失败(常见于经本地代理复用了
+	// 失效的长连接导致 EOF),用全新连接重试若干次,避免把可恢复的抖动透传成 502。
+	const maxAttempts = 3
+	var resp *http.Response
+	for attempt := 1; ; attempt++ {
+		var upstreamReq *http.Request
+		upstreamReq, err = http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(reqBody))
+		if err != nil {
+			break // 构造请求失败,不可重试
+		}
+		copyHeaders(upstreamReq.Header, r.Header)
+		upstreamReq.Host = upstreamTarget.Host
+
+		resp, err = p.client.Do(upstreamReq)
+		if err == nil {
+			break
+		}
+		// 客户端已断开、已达上限则不再重试
+		if r.Context().Err() != nil || attempt >= maxAttempts {
+			break
+		}
+		fmt.Printf("!! upstream attempt %d/%d failed, retrying: %v\n", attempt, maxAttempts, err)
+		time.Sleep(time.Duration(attempt) * 150 * time.Millisecond)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
-		p.logs.Write(logEntry{
-			Timestamp:   time.Now().Format(time.RFC3339Nano),
-			DurationMS:  time.Since(start).Milliseconds(),
-			Method:      r.Method,
-			Path:        r.URL.RequestURI(),
-			UpstreamURL: upstreamURL,
-			Status:      http.StatusBadGateway,
-			RequestBody: recordedReqBody,
-			RequestHdrs: cloneHeader(r.Header),
-			Error:       err.Error(),
-		})
+		if !isProbe {
+			p.logs.Write(logEntry{
+				Timestamp:   time.Now().Format(time.RFC3339Nano),
+				DurationMS:  time.Since(start).Milliseconds(),
+				Method:      r.Method,
+				Path:        r.URL.RequestURI(),
+				UpstreamURL: upstreamURL,
+				Status:      http.StatusBadGateway,
+				RequestBody: recordedReqBody,
+				RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
+				Error:       err.Error(),
+			})
+		}
 		fmt.Printf("<- %s %s status=%d error=%s\n", r.Method, r.URL.RequestURI(), http.StatusBadGateway, err.Error())
 		p.recorder.Finish(traceHandle, TraceFinishRecord{
 			Status:     http.StatusBadGateway,
@@ -257,7 +283,10 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var respBody bytes.Buffer
 	copyErr := copyAndFlush(w, resp.Body, &respBody)
-	recordedRespBody := truncateBase64Images(respBody.String())
+	// 转发给客户端的是原始字节(可能 gzip),记录/解析前要按 Content-Encoding 解压,
+	// 否则 SSE 解析拿到的是压缩流,token 等全部解不出来。
+	decodedRespBody := decodeResponseBody(respBody.Bytes(), resp.Header.Get("Content-Encoding"))
+	recordedRespBody := truncateBase64Images(decodedRespBody)
 
 	entry := logEntry{
 		Timestamp:    time.Now().Format(time.RFC3339Nano),
@@ -274,9 +303,13 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if copyErr != nil && !errors.Is(copyErr, context.Canceled) {
 		entry.Error = copyErr.Error()
 	}
-	p.logs.Write(entry)
+	if !isProbe {
+		p.logs.Write(entry)
+	}
 
 	finishRecord := TraceFinishRecord{
+		Provider:      provider,
+		Probe:         isProbe,
 		Status:        resp.StatusCode,
 		DurationMS:    time.Since(start).Milliseconds(),
 		ResponseBody:  recordedRespBody,
@@ -361,6 +394,59 @@ func copyAndFlush(dst http.ResponseWriter, src io.Reader, logBuf *bytes.Buffer) 
 			return readErr
 		}
 	}
+}
+
+// decodeResponseBody 按响应的 Content-Encoding 解压,仅用于本地记录与解析。
+// 转发给客户端的仍是原始压缩字节,这里只解压副本。无法识别或解压失败时回退原文。
+func decodeResponseBody(raw []byte, encoding string) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "gzip", "x-gzip":
+		zr, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return string(raw)
+		}
+		defer zr.Close()
+		if out, err := io.ReadAll(zr); err == nil {
+			return string(out)
+		}
+	case "deflate":
+		// deflate 可能带 zlib 头,也可能是裸 flate,两种都试一下。
+		if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
+			defer zr.Close()
+			if out, err := io.ReadAll(zr); err == nil {
+				return string(out)
+			}
+		}
+		fr := flate.NewReader(bytes.NewReader(raw))
+		defer fr.Close()
+		if out, err := io.ReadAll(fr); err == nil {
+			return string(out)
+		}
+	}
+	// 空 / identity / 不支持的(br、zstd)直接回退原文
+	return string(raw)
+}
+
+// detectProvider 区分进来的是 Claude(Anthropic)还是 Codex(OpenAI)请求。
+// 以路径为主、请求头为辅，默认回落到 Codex 以兼容历史行为。
+func detectProvider(r *http.Request) string {
+	path := strings.ToLower(r.URL.Path)
+	switch {
+	case strings.Contains(path, "/messages"), strings.Contains(path, "/v1/complete"):
+		return providerClaude
+	case strings.Contains(path, "/responses"), strings.Contains(path, "/chat/completions"):
+		return providerCodex
+	}
+	if r.Header.Get("Anthropic-Version") != "" || r.Header.Get("X-Api-Key") != "" {
+		return providerClaude
+	}
+	if strings.Contains(strings.ToLower(r.Header.Get("User-Agent")), "claude") {
+		return providerClaude
+	}
+	return providerCodex
 }
 
 func envOrDefault(key, fallback string) string {

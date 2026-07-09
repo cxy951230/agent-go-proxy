@@ -2,7 +2,12 @@
 
 ## 项目目标
 
-`agent-go-proxy` 是本地 Codex CLI 请求代理，默认监听 `127.0.0.1:8080`，将 Codex 的 `/v1/*` 请求转发到 `https://chatgpt.com/backend-api/codex`，同时记录请求、响应和 SSE 过程，并提供本地 Web 页面查看、筛选和标注会话日志。
+`agent-go-proxy` 是本地 Agent CLI 请求代理，默认监听 `127.0.0.1:8080`，将 `/v1/*` 请求转发到对应上游，同时记录请求、响应和 SSE 过程，并提供本地 Web 页面查看、筛选和标注会话日志。
+
+同时支持 Codex 和 Claude 两种请求，按接口自动区分上游与解析方式（见「多 Provider 支持」）：
+
+- Codex：转发到 `https://chatgpt.com/backend-api/codex`（`-target` / `UPSTREAM_BASE_URL`）。
+- Claude：转发到 `https://api.anthropic.com`（`-claude-target` / `CLAUDE_BASE_URL`）。
 
 网页标题为 `AGENT-GO-PROXY`，favicon 使用本机 `/Users/chenxy/Desktop/331.jpg`。
 
@@ -29,6 +34,38 @@ no_proxy=127.0.0.1,localhost \
 - 请求体必须读取，因为要转发给上游，同时用于解析会话信息。
 - 响应体边读边写回 Codex，保证转发实时。
 - MySQL 入库、SSE 解析、token 统计全部走后台异步队列，不阻塞响应转发。
+
+## 多 Provider 支持
+
+代理同时接受 Codex 和 Claude 请求，靠 `detectProvider`（main.go）按请求区分，互不影响：
+
+- 判定优先级：路径含 `/messages` 或 `/v1/complete` → Claude；含 `/responses` 或 `/chat/completions` → Codex；再看请求头 `Anthropic-Version` / `X-Api-Key`、`User-Agent` 含 `claude`；都不命中默认回落 Codex。
+- 上游按 provider 选择：Claude 走 `-claude-target`，Codex 走 `-target`，`Host` 头同步改写为对应上游。
+- `conversations.agent` 落库为 `Claude` / `Codex`，首页 Agent 下拉与筛选据此区分。
+
+转发主干（流式透传、日志、入库队列）两边共用，只有「解析」按 provider 分流：
+
+- 请求元信息（inspect.go `requestMetaFromHeaders`）：
+  - Codex：沿用 `Session_id` / `Chatgpt-Account-Id` / `X-Codex-*` 头 + OpenAI `input[]`。
+  - Claude：无专用会话头，从 `metadata.user_id`（形如 `user_<hash>_account_<uuid>_session_<uuid>`）正则抽出 `session_`/`account_` 做会话聚合与账号；model 取 body `model`；首条 prompt 取 `messages[]` 第一条 user 文本，跳过 `<system-reminder>` 等注入上下文。
+  - 注：Claude 若无 `metadata.user_id`，会话 id 回落成 `unknown-时间戳`，此时每个请求各自成会话，后续可据日志再调。
+- Token 用量（inspect.go `extractUsageFromEvents`）：
+  - Codex：OpenAI `response.completed` 事件的 `usage`。
+  - Claude：Anthropic SSE，输入/缓存命中取 `message_start` 的 `message.usage`，输出取 `message_delta` 的 `usage.output_tokens`，`total = input + output`。
+- 详情简略视图（web.go）：
+  - 响应文本 `responseText` 在 OpenAI 解析无结果时回落 `claudeStreamBlocks`，按 `content_block_delta` 还原正文（text_delta）、思考（thinking_delta）、工具调用（content_block_start 的 tool_use + input_json_delta）。
+  - 系统提示 `systemText` 兼容 Codex `instructions` 与 Claude `system`（字符串或内容块数组）。
+  - 请求消息 `requestMessages` / `contentText` 已同时兼容 OpenAI `input[]` 与 Anthropic `messages[]`、tool_use/tool_result 内容块。
+
+解析按「错了也没关系、日志已留原文」的原则做，后续可据 `log/*.log` 与 `traces` 原始数据继续调整。
+
+### Claude CLI 接入
+
+把 Claude Code 的请求指向本代理即可（账号正常登录，仅改地址）：
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
+```
 
 ## 数据库
 

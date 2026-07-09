@@ -8,6 +8,19 @@ import (
 	"time"
 )
 
+const (
+	providerCodex  = "codex"
+	providerClaude = "claude"
+)
+
+// agentLabel 把内部 provider 标识映射成看板展示用的 Agent 名字。
+func agentLabel(provider string) string {
+	if provider == providerClaude {
+		return "Claude"
+	}
+	return "Codex"
+}
+
 type requestMeta struct {
 	SessionID   string
 	AccountID   string
@@ -33,11 +46,14 @@ type usageStats struct {
 	ReasoningTokens   int `json:"reasoning_tokens"`
 }
 
-func requestMetaFromHTTP(r *http.Request, body []byte) requestMeta {
-	return requestMetaFromHeaders(r.Header, body)
+func requestMetaFromHTTP(r *http.Request, body []byte, provider string) requestMeta {
+	return requestMetaFromHeaders(r.Header, body, provider)
 }
 
-func requestMetaFromHeaders(headers http.Header, body []byte) requestMeta {
+func requestMetaFromHeaders(headers http.Header, body []byte, provider string) requestMeta {
+	if provider == providerClaude {
+		return claudeRequestMeta(headers, body)
+	}
 	sessionID := firstHeader(headers, "Session_id")
 	accountID := firstHeader(headers, "Chatgpt-Account-Id")
 	windowID := firstHeader(headers, "X-Codex-Window-Id")
@@ -80,6 +96,104 @@ func requestMetaFromHeaders(headers http.Header, body []byte) requestMeta {
 	}
 }
 
+func claudeRequestMeta(headers http.Header, body []byte) requestMeta {
+	var parsed struct {
+		Model     string `json:"model"`
+		MaxTokens int    `json:"max_tokens"`
+		Messages  []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+		Metadata struct {
+			UserID string `json:"user_id"`
+		} `json:"metadata"`
+	}
+	_ = json.Unmarshal(body, &parsed)
+
+	sessionID := firstHeader(headers, "X-Session-Id")
+	accountID := ""
+	// Claude Code 把会话/账号塞进 metadata.user_id，且它是「字符串套 JSON」:
+	// {"device_id":"...","account_uuid":"...","session_id":"..."}
+	if uid := strings.TrimSpace(parsed.Metadata.UserID); uid != "" {
+		var inner struct {
+			AccountUUID string `json:"account_uuid"`
+			SessionID   string `json:"session_id"`
+			DeviceID    string `json:"device_id"`
+		}
+		if json.Unmarshal([]byte(uid), &inner) == nil {
+			if sessionID == "" {
+				sessionID = inner.SessionID
+			}
+			accountID = fallback(inner.AccountUUID, inner.DeviceID)
+		}
+	}
+
+	firstPrompt := firstUserPromptClaude(parsed.Messages)
+	// max_tokens<=1 是 Claude Code 启动时的 quota/warmup 探测(content 常为 "quota")，
+	// 不是真实对话，给占位串让后续真实请求覆盖掉。
+	if parsed.MaxTokens > 0 && parsed.MaxTokens <= 1 {
+		firstPrompt = "未捕获到用户 prompt。"
+	}
+
+	return requestMeta{
+		SessionID:   fallback(sessionID, "unknown-"+time.Now().Format("20060102150405.000000")),
+		AccountID:   accountID,
+		FirstPrompt: firstPrompt,
+		Model:       parsed.Model,
+	}
+}
+
+// isClaudeQuotaProbe 判断是否是 Claude Code 启动时的 quota/warmup 探测请求
+// (max_tokens<=1)。这类请求不是真实对话,其失败(如 429)不应算作会话错误。
+func isClaudeQuotaProbe(body []byte) bool {
+	var parsed struct {
+		MaxTokens int `json:"max_tokens"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return false
+	}
+	return parsed.MaxTokens > 0 && parsed.MaxTokens <= 1
+}
+
+func firstUserPromptClaude(messages []struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"`
+}) string {
+	for _, item := range messages {
+		if item.Role != "user" {
+			continue
+		}
+		if text := firstRealText(item.Content); text != "" {
+			return limitString(text, 240)
+		}
+	}
+	return "未捕获到用户 prompt。"
+}
+
+// firstRealText 从 Claude 消息内容里取第一段非注入上下文的纯文本。
+// 必须逐 block 判断:真实消息常是 [<system-reminder>, <system-reminder>, 真正的prompt]，
+// 若按整条拼接判断会因开头是 system-reminder 而被整条丢弃。
+func firstRealText(content any) string {
+	switch v := content.(type) {
+	case string:
+		if t := strings.TrimSpace(v); t != "" && !isInjectedContext(t) {
+			return t
+		}
+	case []any:
+		for _, part := range v {
+			m, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			text, _ := m["text"].(string)
+			if text = strings.TrimSpace(text); text != "" && !isInjectedContext(text) {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
 func firstHeader(h http.Header, key string) string {
 	values := h.Values(key)
 	if len(values) == 0 {
@@ -116,6 +230,13 @@ func isInjectedContext(text string) bool {
 		"<skills_instructions>",
 		"<plugins_instructions>",
 		"<skill>",
+		// Claude Code 注入的上下文
+		"<system-reminder>",
+		"<command-message>",
+		"<command-name>",
+		"<local-command-stdout>",
+		// Claude Code 辅助请求(会话标题生成等)的包裹标签,非真实用户 prompt
+		"<session>",
 	}
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(trimmed, prefix) {
@@ -190,11 +311,14 @@ func parseSSEEvents(body string) []sseEvent {
 	return events
 }
 
-func extractUsage(body string) usageStats {
-	return extractUsageFromEvents(parseSSEEvents(body))
+func extractUsage(body, provider string) usageStats {
+	return extractUsageFromEvents(parseSSEEvents(body), provider)
 }
 
-func extractUsageFromEvents(events []sseEvent) usageStats {
+func extractUsageFromEvents(events []sseEvent, provider string) usageStats {
+	if provider == providerClaude {
+		return claudeUsageFromEvents(events)
+	}
 	var out usageStats
 	for _, ev := range events {
 		if ev.Event != "response.completed" || len(ev.Data) == 0 {
@@ -223,6 +347,90 @@ func extractUsageFromEvents(events []sseEvent) usageStats {
 			out.ReasoningTokens = payload.Response.Usage.OutputDetails.ReasoningTokens
 		}
 	}
+	return out
+}
+
+// claudeUsage 是 Anthropic usage 对象的通用结构,message_start.message.usage
+// 与 message_delta.usage 共用同一套字段。
+type claudeUsage struct {
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	CacheReadTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationTokens int `json:"cache_creation_input_tokens"`
+	OutputDetails       struct {
+		ThinkingTokens int `json:"thinking_tokens"`
+	} `json:"output_tokens_details"`
+}
+
+// claudeUsageFromEvents 解析 Anthropic SSE 的 token 用量,并对齐 Codex 的语义:
+//   - Anthropic 把输入拆成 input_tokens(全新) / cache_creation(首次写缓存) / cache_read(命中缓存),
+//     三者都是被处理的输入,所以 input = 三者之和,与 Codex 的 input_tokens(含缓存)口径一致;
+//   - cached 取 cache_read(真正复用、便宜的那部分),与 Codex 的 cached_tokens 一致;
+//   - 输入侧字段在 message_start 已给全,最终 output 以 message_delta 为准。
+func claudeUsageFromEvents(events []sseEvent) usageStats {
+	var start, delta claudeUsage
+	for _, ev := range events {
+		if len(ev.Data) == 0 {
+			continue
+		}
+		switch ev.Event {
+		case "message_start":
+			var payload struct {
+				Message struct {
+					Usage claudeUsage `json:"usage"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(ev.Data, &payload) == nil {
+				start = payload.Message.Usage
+			}
+		case "message_delta":
+			var payload struct {
+				Usage claudeUsage `json:"usage"`
+			}
+			if json.Unmarshal(ev.Data, &payload) == nil {
+				delta = payload.Usage
+			}
+		}
+	}
+	// 输入侧优先用 delta(同样给全且为最终值),缺失则回退 start
+	pick := func(a, b int) int {
+		if a > 0 {
+			return a
+		}
+		return b
+	}
+	return usageFromClaude(claudeUsage{
+		InputTokens:         pick(delta.InputTokens, start.InputTokens),
+		OutputTokens:        pick(delta.OutputTokens, start.OutputTokens),
+		CacheCreationTokens: pick(delta.CacheCreationTokens, start.CacheCreationTokens),
+		CacheReadTokens:     pick(delta.CacheReadTokens, start.CacheReadTokens),
+		OutputDetails: struct {
+			ThinkingTokens int `json:"thinking_tokens"`
+		}{ThinkingTokens: pick(delta.OutputDetails.ThinkingTokens, start.OutputDetails.ThinkingTokens)},
+	})
+}
+
+// claudeUsageFromJSONBody 解析非流式响应:Claude Code 会发 stream=false 的辅助请求
+// (如会话标题、话题判定),usage 直接在响应 JSON 顶层,没有 SSE 事件。
+func claudeUsageFromJSONBody(body string) usageStats {
+	var payload struct {
+		Usage claudeUsage `json:"usage"`
+	}
+	if json.Unmarshal([]byte(body), &payload) != nil {
+		return usageStats{}
+	}
+	return usageFromClaude(payload.Usage)
+}
+
+// usageFromClaude 把 Anthropic 的 usage 折算成对齐 Codex 口径的统计:
+// input 含全部被处理输入(新增+写缓存+读缓存),cached 取读缓存命中。
+func usageFromClaude(u claudeUsage) usageStats {
+	var out usageStats
+	out.InputTokens = u.InputTokens + u.CacheCreationTokens + u.CacheReadTokens
+	out.CachedInputTokens = u.CacheReadTokens
+	out.OutputTokens = u.OutputTokens
+	out.ReasoningTokens = u.OutputDetails.ThinkingTokens
+	out.TotalTokens = out.InputTokens + out.OutputTokens
 	return out
 }
 
