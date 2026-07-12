@@ -78,7 +78,7 @@ Web 页面左侧有侧边栏菜单，两项：
 - `Dashboard`：原会话列表页（`/`）。
 - `路由`：第三方 API 配置页（`/routes`）。
 
-两页共用同一套侧边栏，当前页高亮。路由页是对 `api_routes` 表的增删改查：
+两页共用同一套侧边栏，当前页高亮。侧边栏支持收起/展开，状态保存在浏览器 `localStorage.sidebarCollapsed`，Dashboard 与路由页共享同一个折叠状态。路由页是对 `api_routes` 表的增删改查：
 
 - 每条配置字段：名称、Base URL、`API`（风格，openai / anthropic）、接口协议、Model、API Key、启用开关。
 - `API`（风格）与「接口协议」联动：openai → `Chat Completions API` / `Responses API`；anthropic → `Messages API` / `Chat Completions API`。前后端各存一份协议表（web.go `PROTOCOLS` 与 store.go `routeProtocols`），必须保持一致。
@@ -97,7 +97,9 @@ Web 页面左侧有侧边栏菜单，两项：
   - 认证头换成路由配置的 key（`applyRouteAuth`）：openai 风格用 `Authorization: Bearer`，anthropic 风格用 `x-api-key`（并补 `anthropic-version`）；客户端自带的 `Authorization`/`X-Api-Key`/`Chatgpt-Account-Id` 先剥掉。
   - 请求体的 `model` 改写为路由配置的 Model（`rewriteModel`，仅当配置了 Model；用 RawMessage map 只替换 model 键）。
   - 协议不匹配（请求协议 ≠ 路由协议，且无法适配）→ 本地直接返回 **421 Misdirected Request**，不打上游，仍记一次错误 trace/日志。
-- 记录/日志始终用**客户端原始请求**（`recordedReqBody`），转发用的 `forwardBody` 可能已改写 model 或转成 chat，两者分离。
+- 记录/日志的请求体仍保存**客户端原始请求**（`recordedReqBody`），转发用的 `forwardBody` 可能已改写 model 或转成 chat，两者分离。
+- 看板和 JSONL 日志里的 `model` 使用**实际出站模型**（`effectiveModel`）：路由配置有 Model 时取路由 Model；路由 Model 为空时回落转发体/原始请求体里的 model。这样 Codex CLI 本地配置仍可写 `gpt-5.6-sol`，但启用 qwen/kimi/deepseek/mimo 等第三方路由后，看板模型列显示实际请求的第三方模型。
+- 入库时 `TraceStartRecord.Model` 会覆盖 `requestMetaFromHeaders` 从原始请求体解析出的 model；`conversations.model` 后续请求有有效模型时会刷新为最新实际模型，避免同一 session 首次记录为 GPT 后一直不变。
 
 ## 协议适配层（adapter.go）
 
@@ -106,9 +108,16 @@ Web 页面左侧有侧边栏菜单，两项：
 - **请求 native → chat**（`adaptRequestToChat`）：
   - `anthropicMessagesToChat`：`system` → system 消息；`messages[]` 内容块展开（assistant `tool_use` → `tool_calls`，user `tool_result` → 独立 `role=tool` 消息，image → `image_url`）；`tools` → chat function tools；`tool_choice` 映射。
   - `openaiResponsesToChat`：`input[]` 里 developer/system → system、user → user、`function_call` → assistant `tool_calls`、`function_call_output` → `role=tool`；工具来自 `additional_tools` 条目（`namespace` 分组递归展开成 `组名__子工具` 前缀名，`custom` 归一成 function）。
+  - `additional_tools` 中的 `custom` 工具会转换成 Chat function wrapper，并通过 `adapterState` 记录原始 Responses 工具类型、名称和 namespace。第三方模型返回 tool call 后，再按 state 还原为 Responses `custom_tool_call` 或 `function_call`。
+  - Codex 自定义工具（例如 `exec`、`apply_patch`）必须带明确说明和固定 schema：Chat function 参数统一为 `{ "input": string }`。`exec` 的 `input` 是 Codex exec 接受的原始 JavaScript 源码；要执行 shell 命令时应写成 `await tools.exec_command({cmd: "..."})`。`apply_patch` 的 `input` 是以 `*** Begin Patch` 开头的原始 patch 文本。
 - **响应 chat → native**（`adaptChatResponseToNative`）：
   - 先 `parseChatResponse` 把三方的 chat 响应（SSE 或 JSON）解析出文本、tool_calls、finish_reason、usage。
   - 再按目标协议还原：`emitAnthropicSSE/JSON`（message_start/content_block/message_delta…）或 `emitResponsesSSE/JSON`（response.created/output_item/response.completed…）。usage 一并带上，供 recorder 正常统计。
+- **usage 兼容**：
+  - 流式 Chat Completions 请求会补 `stream_options: {"include_usage": true}`，方便 MiMo/OpenAI 兼容接口在流末返回 usage。
+  - 缓存 token 兼容 OpenAI/MiMo 的 `usage.prompt_tokens_details.cached_tokens`，也兼容 DeepSeek 的 `usage.prompt_cache_hit_tokens`。
+  - reasoning token 兼容 `usage.completion_tokens_details.reasoning_tokens`。
+  - 还原 Responses 时会写入 `input_tokens_details.cached_tokens` 与 `output_tokens_details.reasoning_tokens`，这样 recorder 和看板能正常统计缓存/推理 token。
 - **取舍**：响应是「读完上游再一次性转吐」，不是逐 token 增量流式；客户端拿到的仍是合法原生 SSE。输入 token 取三方返回的 `prompt_tokens`（三方不返回 usage 时为 0）。
 - 只在 2xx 且需适配时走转换;非 2xx 原样透传三方错误。
 
@@ -176,7 +185,13 @@ Codex 请求里会混入系统和运行上下文。
 
 ## 首页
 
-首页每秒轮询 `/api/dashboard` 异步刷新。
+首页初始只加载 10 条会话，向下滚动接近底部时按 `limit/offset` 继续请求 `/api/dashboard` 分页追加。自动刷新只刷新第一页，间隔 3 秒，用于更新最新记录和顶部统计，避免每次进入或轮询都渲染大量历史数据。
+
+后端列表查询使用 `ListConversationsPage`：
+
+- 默认 `limit=10`，最大 100，`offset` 小于 0 时按 0 处理。
+- 先在子查询中按筛选条件和 `updated_at DESC` 取当前页 conversations，再只聚合这一页对应的 traces token/完成时间，避免老逻辑先全量 `traces GROUP BY conversation_id` 再 join 导致首页变慢。
+- `/api/conversations` 也支持 `limit` / `offset` 参数；旧的 `ListConversations` 仍保留，内部走分页并默认取 200 条。
 
 筛选：
 
@@ -199,6 +214,7 @@ Codex 请求里会混入系统和运行上下文。
 - `耗时(分)` 表示会话开始到最新 trace 结束的分钟数；不足一分钟显示小数，列表里不带单位。
 - 三个 token 字段合并为一列 `Token 输入/输出/缓存`，竖向展示输入、输出、缓存三个值。
 - 行内还有账号、标签、Trace 数、模型、Agent、状态和删除按钮；进入详情靠点击表格行空白区域。
+- 列表底部显示加载状态：`向下滚动加载更多`、`加载中...` 或 `已加载全部记录`。
 - 删除按钮会先弹出确认框，确认后删除会话；`traces` 依赖外键级联一起删除。
 
 ## 详情页
@@ -245,7 +261,7 @@ JSON Lines 日志写入，**按模型分文件**：
 log/YYYY-MM-DD-{model}.log
 ```
 
-- 模型名取客户端原始请求体的 `model`；不同模型写到不同日志文件。
+- 默认模式下模型名取客户端原始请求体的 `model`；启用第三方路由后取实际出站模型（`effectiveModel`），不同模型写到不同日志文件。
 - 模型名里的 `/`、`:` 等非法字符会清洗成 `_`（`sanitizeModelForFile`），空模型归 `unknown`。
 
 当前按用户要求暂不脱敏，请求头和请求体会完整保存。
