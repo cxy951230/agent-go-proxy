@@ -382,7 +382,7 @@ func (s *Store) StartTrace(ctx context.Context, in StartTraceInput) (int64, erro
 		ON DUPLICATE KEY UPDATE updated_at=VALUES(updated_at), window_id=IF(window_id='', VALUES(window_id), window_id),
 			account_id=IF(account_id='', VALUES(account_id), account_id),
 			first_prompt=IF(first_prompt IS NULL OR first_prompt='' OR first_prompt='未捕获到用户 prompt。' OR first_prompt LIKE '<environment_context>%' OR first_prompt LIKE '<permissions instructions>%' OR first_prompt LIKE '# AGENTS.md instructions%' OR first_prompt LIKE '<skill>%' OR first_prompt LIKE '<system-reminder>%', VALUES(first_prompt), first_prompt),
-			model=IF(model='', VALUES(model), model), agent=VALUES(agent), status='LIVE'`,
+			model=IF(VALUES(model)<>'', VALUES(model), model), agent=VALUES(agent), status='LIVE'`,
 		in.SessionID, in.AccountID, in.WindowID, now, now, in.FirstPrompt, in.Model, agent)
 	if err != nil {
 		return 0, err

@@ -13,6 +13,7 @@ type TraceStartRecord struct {
 	Method       string
 	Path         string
 	UpstreamURL  string
+	Model        string
 	RequestBody  string
 	RequestHdrs  map[string][]string
 	RequestBytes int
@@ -104,6 +105,9 @@ func (r *asyncRecorder) runStart(job recorderJob) {
 	defer cancel()
 
 	meta := requestMetaFromHeaders(http.Header(job.start.RequestHdrs), []byte(job.start.RequestBody), job.start.Provider)
+	if job.start.Model != "" {
+		meta.Model = job.start.Model
+	}
 	traceID, err := r.store.StartTrace(ctx, StartTraceInput{
 		SessionID:    meta.SessionID,
 		AccountID:    meta.AccountID,

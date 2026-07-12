@@ -210,6 +210,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	recordedReqBody := truncateBase64Images(string(reqBody))
 	logModel := modelFromBody(reqBody)
+	effectiveModel := logModel
 	clientStream := clientWantsStream(reqBody)
 	// Claude Code 的 quota/warmup 探测请求(max_tokens<=1,内容为 "quota"):
 	// 只转发给上游让 CC 读限流状态,不落库、不写日志,避免污染看板。
@@ -242,6 +243,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			upstreamURL = buildRouteUpstreamURL(route.BaseURL, reqProtocol, r.URL.RawQuery)
 			upstreamHost = base.Host
 			forwardBody = rewriteModel(reqBody, route.Model)
+			effectiveModel = effectiveRequestModel(forwardBody, route.Model, logModel)
 		case route.Protocol == "chat_completions" && (reqProtocol == "messages" || reqProtocol == "responses"):
 			// 适配层:三方只支持 chat 时,请求转 chat 发出去,响应再转回原生协议
 			chatBody, state, cerr := adaptRequestToChat(reqProtocol, reqBody)
@@ -251,6 +253,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				upstreamURL = buildRouteUpstreamURL(route.BaseURL, "chat_completions", r.URL.RawQuery)
 				upstreamHost = base.Host
 				forwardBody = rewriteModel(chatBody, route.Model)
+				effectiveModel = effectiveRequestModel(forwardBody, route.Model, logModel)
 				adaptTarget = reqProtocol
 				adaptState = state
 			}
@@ -269,7 +272,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Method:      r.Method,
 			Path:        r.URL.RequestURI(),
 			UpstreamURL: upstreamURL,
-			Model:       logModel,
+			Model:       effectiveModel,
 			RequestBody: recordedReqBody,
 			RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
 		})
@@ -279,6 +282,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Method:       r.Method,
 			Path:         r.URL.RequestURI(),
 			UpstreamURL:  upstreamURL,
+			Model:        effectiveModel,
 			RequestBody:  recordedReqBody,
 			RequestHdrs:  sanitizeHeader(cloneHeader(r.Header)),
 			RequestBytes: len(reqBody),
@@ -296,7 +300,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Method:      r.Method,
 				Path:        r.URL.RequestURI(),
 				UpstreamURL: upstreamURL,
-				Model:       logModel,
+				Model:       effectiveModel,
 				Status:      http.StatusMisdirectedRequest,
 				RequestBody: recordedReqBody,
 				RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
@@ -350,7 +354,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Method:      r.Method,
 				Path:        r.URL.RequestURI(),
 				UpstreamURL: upstreamURL,
-				Model:       logModel,
+				Model:       effectiveModel,
 				Status:      http.StatusBadGateway,
 				RequestBody: recordedReqBody,
 				RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
@@ -374,7 +378,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 适配路径:读完上游 chat 响应,转换回原生协议(SSE/JSON)后一次性回写。
 		rawUp, readErr := io.ReadAll(resp.Body)
 		chatDecoded := decodeResponseBody(rawUp, resp.Header.Get("Content-Encoding"))
-		native := adaptChatResponseToNative(adaptTarget, chatDecoded, clientStream, logModel, adaptState)
+		native := adaptChatResponseToNative(adaptTarget, chatDecoded, clientStream, effectiveModel, adaptState)
 		if clientStream {
 			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")
@@ -410,7 +414,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Method:       r.Method,
 		Path:         r.URL.RequestURI(),
 		UpstreamURL:  upstreamURL,
-		Model:        logModel,
+		Model:        effectiveModel,
 		Status:       resp.StatusCode,
 		RequestBody:  recordedReqBody,
 		ResponseBody: recordedRespBody,
@@ -599,6 +603,16 @@ func rewriteModel(body []byte, model string) []byte {
 		return body
 	}
 	return out
+}
+
+func effectiveRequestModel(body []byte, routeModel, fallbackModel string) string {
+	if model := strings.TrimSpace(routeModel); model != "" {
+		return model
+	}
+	if model := modelFromBody(body); model != "" {
+		return model
+	}
+	return fallbackModel
 }
 
 // applyRouteAuth 用路由配置的凭证替换客户端自带的认证头,按 API 风格设置。
