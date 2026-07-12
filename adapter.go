@@ -18,15 +18,26 @@ import (
 
 // ---------------- 请求: native → chat ----------------
 
+type adapterState struct {
+	Tools map[string]responseToolSpec
+}
+
+type responseToolSpec struct {
+	Type      string
+	Name      string
+	Namespace string
+}
+
 // adaptRequestToChat 把 messages / responses 请求体转换成 Chat Completions 请求体。
-func adaptRequestToChat(reqProtocol string, body []byte) ([]byte, error) {
+func adaptRequestToChat(reqProtocol string, body []byte) ([]byte, *adapterState, error) {
 	switch reqProtocol {
 	case "messages":
-		return anthropicMessagesToChat(body)
+		out, err := anthropicMessagesToChat(body)
+		return out, nil, err
 	case "responses":
 		return openaiResponsesToChat(body)
 	}
-	return body, nil
+	return body, nil, nil
 }
 
 func anthropicMessagesToChat(body []byte) ([]byte, error) {
@@ -41,7 +52,7 @@ func anthropicMessagesToChat(body []byte) ([]byte, error) {
 			Role    string          `json:"role"`
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
-		Tools      []struct {
+		Tools []struct {
 			Name        string          `json:"name"`
 			Description string          `json:"description"`
 			InputSchema json.RawMessage `json:"input_schema"`
@@ -232,7 +243,7 @@ func anthropicToolChoiceToChat(raw json.RawMessage) any {
 	return nil
 }
 
-func openaiResponsesToChat(body []byte) ([]byte, error) {
+func openaiResponsesToChat(body []byte) ([]byte, *adapterState, error) {
 	var src struct {
 		Model           string          `json:"model"`
 		Stream          bool            `json:"stream"`
@@ -243,9 +254,13 @@ func openaiResponsesToChat(body []byte) ([]byte, error) {
 		Temperature     *float64        `json:"temperature"`
 	}
 	if err := json.Unmarshal(body, &src); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	state := &adapterState{Tools: map[string]responseToolSpec{}}
 	chat := map[string]any{"model": src.Model, "stream": src.Stream}
+	if src.Stream {
+		chat["stream_options"] = map[string]any{"include_usage": true}
+	}
 	if src.MaxOutputTokens > 0 {
 		chat["max_tokens"] = src.MaxOutputTokens
 	}
@@ -256,7 +271,7 @@ func openaiResponsesToChat(body []byte) ([]byte, error) {
 	if src.Instructions != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": src.Instructions})
 	}
-	toolDefs := responsesToolsToChat(src.Tools)
+	toolDefs := responsesToolsToChat(src.Tools, state)
 
 	var input []map[string]any
 	_ = json.Unmarshal(src.Input, &input)
@@ -264,12 +279,22 @@ func openaiResponsesToChat(body []byte) ([]byte, error) {
 		switch item["type"] {
 		case "additional_tools":
 			if raw, err := json.Marshal(item["tools"]); err == nil {
-				toolDefs = append(toolDefs, responsesToolsToChat(raw)...)
+				toolDefs = append(toolDefs, responsesToolsToChat(raw, state)...)
 			}
-		case "function_call":
+		case "custom_tool_call":
+			name := asStr(item["name"])
 			msgs = append(msgs, map[string]any{"role": "assistant", "content": nil,
 				"tool_calls": []any{map[string]any{"id": asStr(item["call_id"]), "type": "function",
-					"function": map[string]any{"name": asStr(item["name"]), "arguments": asStr(item["arguments"])}}}})
+					"function": map[string]any{"name": chatToolName("", name), "arguments": mustJSON(map[string]any{"input": asStr(item["input"])})}}}})
+		case "custom_tool_call_output":
+			msgs = append(msgs, map[string]any{"role": "tool",
+				"tool_call_id": asStr(item["call_id"]), "content": asStr(item["output"])})
+		case "function_call":
+			name := asStr(item["name"])
+			namespace := asStr(item["namespace"])
+			msgs = append(msgs, map[string]any{"role": "assistant", "content": nil,
+				"tool_calls": []any{map[string]any{"id": asStr(item["call_id"]), "type": "function",
+					"function": map[string]any{"name": chatToolName(namespace, name), "arguments": asStr(item["arguments"])}}}})
 		case "function_call_output":
 			msgs = append(msgs, map[string]any{"role": "tool",
 				"tool_call_id": asStr(item["call_id"]), "content": asStr(item["output"])})
@@ -290,12 +315,13 @@ func openaiResponsesToChat(body []byte) ([]byte, error) {
 	if len(toolDefs) > 0 {
 		chat["tools"] = toolDefs
 	}
-	return json.Marshal(chat)
+	out, err := json.Marshal(chat)
+	return out, state, err
 }
 
 // responsesToolsToChat 把 Responses 的 tools 数组转成 Chat 的 function tools。
 // namespace 分组会递归展开成带 "组名__" 前缀的函数名;custom 类型也归一成 function。
-func responsesToolsToChat(raw json.RawMessage) []map[string]any {
+func responsesToolsToChat(raw json.RawMessage, state *adapterState) []map[string]any {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -306,6 +332,7 @@ func responsesToolsToChat(raw json.RawMessage) []map[string]any {
 	var out []map[string]any
 	var add func(prefix string, t map[string]any)
 	add = func(prefix string, t map[string]any) {
+		toolType := asStr(t["type"])
 		if t["type"] == "namespace" {
 			if subs, ok := t["tools"].([]any); ok {
 				for _, s := range subs {
@@ -316,18 +343,77 @@ func responsesToolsToChat(raw json.RawMessage) []map[string]any {
 			}
 			return
 		}
+		originalName := asStr(t["name"])
+		if originalName == "" && toolType == "web_search" {
+			originalName = "web_search"
+		}
+		chatName := prefix + originalName
 		params := t["parameters"]
-		if params == nil {
+		description := asStr(t["description"])
+		if toolType == "custom" {
+			params = customToolParameters(originalName)
+			description = customToolDescription(originalName, description)
+		} else if params == nil {
 			params = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
+		if state != nil {
+			state.Tools[chatName] = responseToolSpec{
+				Type:      toolType,
+				Name:      originalName,
+				Namespace: strings.TrimSuffix(prefix, "__"),
+			}
+		}
 		out = append(out, map[string]any{"type": "function", "function": map[string]any{
-			"name": prefix + asStr(t["name"]), "description": asStr(t["description"]), "parameters": params,
+			"name": chatName, "description": description, "parameters": params,
 		}})
 	}
 	for _, t := range arr {
 		add("", t)
 	}
 	return out
+}
+
+func chatToolName(namespace, name string) string {
+	if namespace == "" {
+		return name
+	}
+	return namespace + "__" + name
+}
+
+func customToolParameters(name string) map[string]any {
+	inputDescription := "Raw freeform tool input. Do not wrap it in markdown."
+	switch name {
+	case "exec":
+		inputDescription = "Raw JavaScript source for Codex exec. Do not pass a shell command directly. Use await tools.exec_command({cmd: \"...\"}) for shell commands. Do not wrap the JavaScript in markdown fences."
+	case "apply_patch":
+		inputDescription = "Raw apply_patch patch text beginning with *** Begin Patch. Do not wrap it in JSON or markdown fences."
+	}
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"input": map[string]any{"type": "string", "description": inputDescription},
+		},
+		"required":             []string{"input"},
+		"additionalProperties": false,
+	}
+}
+
+func customToolDescription(name, original string) string {
+	var b strings.Builder
+	b.WriteString("Adapter wrapper for Codex custom/freeform tool `")
+	b.WriteString(name)
+	b.WriteString("`. Call this Chat function with exactly one JSON field `input`, then the proxy will restore it to a Codex `custom_tool_call`.\n")
+	switch name {
+	case "exec":
+		b.WriteString("The `input` value must be raw JavaScript source accepted by Codex exec. To run shell commands, write JavaScript such as `await tools.exec_command({cmd: \"ls\", yield_time_ms: 10000})`; do not send `{cmd: ...}` as the final tool arguments and do not use markdown fences.\n")
+	case "apply_patch":
+		b.WriteString("The `input` value must be the raw patch text, starting with `*** Begin Patch` and ending with `*** End Patch`.\n")
+	}
+	if strings.TrimSpace(original) != "" {
+		b.WriteString("\nOriginal Codex tool instructions:\n")
+		b.WriteString(original)
+	}
+	return b.String()
 }
 
 func responsesContentText(v any) string {
@@ -357,9 +443,11 @@ type chatToolCall struct {
 }
 
 type chatUsage struct {
-	Input  int
-	Output int
-	Total  int
+	Input     int
+	Output    int
+	Total     int
+	Cached    int
+	Reasoning int
 }
 
 func (u chatUsage) total() int {
@@ -377,7 +465,7 @@ type chatCompletion struct {
 }
 
 // adaptChatResponseToNative 把第三方 Chat 响应(SSE 或 JSON)转换回原生协议文本。
-func adaptChatResponseToNative(target, chatBody string, stream bool, model string) string {
+func adaptChatResponseToNative(target, chatBody string, stream bool, model string, state *adapterState) string {
 	c := parseChatResponse(chatBody)
 	switch target {
 	case "messages":
@@ -387,9 +475,9 @@ func adaptChatResponseToNative(target, chatBody string, stream bool, model strin
 		return emitAnthropicJSON(c, model)
 	case "responses":
 		if stream {
-			return emitResponsesSSE(c, model)
+			return emitResponsesSSE(c, model, state)
 		}
-		return emitResponsesJSON(c, model)
+		return emitResponsesJSON(c, model, state)
 	}
 	return chatBody
 }
@@ -432,16 +520,29 @@ func parseChatSSE(s string) chatCompletion {
 				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
 			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-				TotalTokens      int `json:"total_tokens"`
+				PromptTokens         int `json:"prompt_tokens"`
+				CompletionTokens     int `json:"completion_tokens"`
+				TotalTokens          int `json:"total_tokens"`
+				PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+				PromptTokensDetails  struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
+				CompletionTokensDetails struct {
+					ReasoningTokens int `json:"reasoning_tokens"`
+				} `json:"completion_tokens_details"`
 			} `json:"usage"`
 		}
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
 		}
 		if chunk.Usage != nil {
-			c.Usage = chatUsage{chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens, chunk.Usage.TotalTokens}
+			c.Usage = chatUsage{
+				Input:     chunk.Usage.PromptTokens,
+				Output:    chunk.Usage.CompletionTokens,
+				Total:     chunk.Usage.TotalTokens,
+				Cached:    fallbackInt(chunk.Usage.PromptTokensDetails.CachedTokens, chunk.Usage.PromptCacheHitTokens),
+				Reasoning: chunk.Usage.CompletionTokensDetails.ReasoningTokens,
+			}
 		}
 		for _, ch := range chunk.Choices {
 			c.Text += ch.Delta.Content
@@ -488,15 +589,28 @@ func parseChatJSON(body string) chatCompletion {
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
+			PromptTokens         int `json:"prompt_tokens"`
+			CompletionTokens     int `json:"completion_tokens"`
+			TotalTokens          int `json:"total_tokens"`
+			PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+			PromptTokensDetails  struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(body), &r) != nil {
 		return c
 	}
-	c.Usage = chatUsage{r.Usage.PromptTokens, r.Usage.CompletionTokens, r.Usage.TotalTokens}
+	c.Usage = chatUsage{
+		Input:     r.Usage.PromptTokens,
+		Output:    r.Usage.CompletionTokens,
+		Total:     r.Usage.TotalTokens,
+		Cached:    fallbackInt(r.Usage.PromptTokensDetails.CachedTokens, r.Usage.PromptCacheHitTokens),
+		Reasoning: r.Usage.CompletionTokensDetails.ReasoningTokens,
+	}
 	if len(r.Choices) > 0 {
 		c.Text = r.Choices[0].Message.Content
 		c.FinishReason = r.Choices[0].FinishReason
@@ -570,7 +684,7 @@ func anthropicStopReason(c chatCompletion) string {
 
 // ---- OpenAI Responses 输出 ----
 
-func emitResponsesSSE(c chatCompletion, model string) string {
+func emitResponsesSSE(c chatCompletion, model string, state *adapterState) string {
 	var b strings.Builder
 	respID := "resp_" + randID()
 	output := []any{}
@@ -597,15 +711,34 @@ func emitResponsesSSE(c chatCompletion, model string) string {
 		outIdx++
 	}
 	for _, tc := range c.ToolCalls {
+		spec := responseSpecForTool(state, tc.Name)
+		if spec.Type == "custom" {
+			itemID := "ctc_" + randID()
+			callID := toolID(tc.ID)
+			input := customToolInput(tc.Arguments)
+			addedItem := map[string]any{"id": itemID, "type": "custom_tool_call", "status": "in_progress", "call_id": callID, "name": spec.Name, "input": ""}
+			b.WriteString(sse("response.output_item.added", map[string]any{"type": "response.output_item.added",
+				"output_index": outIdx, "item": addedItem}))
+			doneItem := map[string]any{"id": itemID, "type": "custom_tool_call", "status": "completed", "call_id": callID, "name": spec.Name, "input": input}
+			b.WriteString(sse("response.output_item.done", map[string]any{"type": "response.output_item.done",
+				"output_index": outIdx, "item": doneItem}))
+			output = append(output, doneItem)
+			outIdx++
+			continue
+		}
 		itemID := "fc_" + randID()
 		callID := toolID(tc.ID)
+		name := spec.Name
+		if name == "" {
+			name = tc.Name
+		}
 		b.WriteString(sse("response.output_item.added", map[string]any{"type": "response.output_item.added",
-			"output_index": outIdx, "item": map[string]any{"id": itemID, "type": "function_call", "status": "in_progress", "call_id": callID, "name": tc.Name, "arguments": ""}}))
+			"output_index": outIdx, "item": responseFunctionCallItem(itemID, callID, name, spec.Namespace, "", "in_progress")}))
 		b.WriteString(sse("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta",
 			"item_id": itemID, "output_index": outIdx, "delta": tc.Arguments}))
 		b.WriteString(sse("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done",
 			"item_id": itemID, "output_index": outIdx, "arguments": tc.Arguments}))
-		doneItem := map[string]any{"id": itemID, "type": "function_call", "status": "completed", "call_id": callID, "name": tc.Name, "arguments": tc.Arguments}
+		doneItem := responseFunctionCallItem(itemID, callID, name, spec.Namespace, tc.Arguments, "completed")
 		b.WriteString(sse("response.output_item.done", map[string]any{"type": "response.output_item.done",
 			"output_index": outIdx, "item": doneItem}))
 		output = append(output, doneItem)
@@ -613,23 +746,92 @@ func emitResponsesSSE(c chatCompletion, model string) string {
 	}
 	b.WriteString(sse("response.completed", map[string]any{"type": "response.completed",
 		"response": map[string]any{"id": respID, "object": "response", "status": "completed", "model": model, "output": output,
-			"usage": map[string]any{"input_tokens": c.Usage.Input, "output_tokens": c.Usage.Output, "total_tokens": c.Usage.total()}}}))
+			"usage": responsesUsage(c.Usage)}}))
 	return b.String()
 }
 
-func emitResponsesJSON(c chatCompletion, model string) string {
+func emitResponsesJSON(c chatCompletion, model string, state *adapterState) string {
 	output := []any{}
 	if c.Text != "" {
 		output = append(output, map[string]any{"type": "message", "role": "assistant", "status": "completed",
 			"content": []any{map[string]any{"type": "output_text", "text": c.Text}}})
 	}
 	for _, tc := range c.ToolCalls {
-		output = append(output, map[string]any{"type": "function_call", "status": "completed",
-			"call_id": toolID(tc.ID), "name": tc.Name, "arguments": tc.Arguments})
+		spec := responseSpecForTool(state, tc.Name)
+		if spec.Type == "custom" {
+			output = append(output, map[string]any{"type": "custom_tool_call", "status": "completed",
+				"call_id": toolID(tc.ID), "name": spec.Name, "input": customToolInput(tc.Arguments)})
+			continue
+		}
+		name := spec.Name
+		if name == "" {
+			name = tc.Name
+		}
+		output = append(output, responseFunctionCallItem("", toolID(tc.ID), name, spec.Namespace, tc.Arguments, "completed"))
 	}
 	return mustJSON(map[string]any{"id": "resp_" + randID(), "object": "response", "status": "completed",
 		"model": model, "output": output,
-		"usage": map[string]any{"input_tokens": c.Usage.Input, "output_tokens": c.Usage.Output, "total_tokens": c.Usage.total()}})
+		"usage": responsesUsage(c.Usage)})
+}
+
+func responsesUsage(u chatUsage) map[string]any {
+	return map[string]any{
+		"input_tokens":  u.Input,
+		"output_tokens": u.Output,
+		"total_tokens":  u.total(),
+		"input_tokens_details": map[string]any{
+			"cached_tokens": u.Cached,
+		},
+		"output_tokens_details": map[string]any{
+			"reasoning_tokens": u.Reasoning,
+		},
+	}
+}
+
+func responseSpecForTool(state *adapterState, chatName string) responseToolSpec {
+	if state != nil {
+		if spec, ok := state.Tools[chatName]; ok {
+			if spec.Name == "" {
+				spec.Name = chatName
+			}
+			return spec
+		}
+	}
+	if namespace, name, ok := strings.Cut(chatName, "__"); ok {
+		return responseToolSpec{Type: "function", Name: name, Namespace: namespace}
+	}
+	return responseToolSpec{Type: "function", Name: chatName}
+}
+
+func responseFunctionCallItem(itemID, callID, name, namespace, arguments, status string) map[string]any {
+	item := map[string]any{"type": "function_call", "status": status, "call_id": callID, "name": name, "arguments": arguments}
+	if itemID != "" {
+		item["id"] = itemID
+	}
+	if namespace != "" {
+		item["namespace"] = namespace
+	}
+	return item
+}
+
+func customToolInput(arguments string) string {
+	trimmed := strings.TrimSpace(arguments)
+	if trimmed == "" {
+		return ""
+	}
+	var text string
+	if json.Unmarshal([]byte(trimmed), &text) == nil {
+		return text
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(trimmed), &obj) == nil {
+		for _, key := range []string{"input", "cmd", "code", "source", "javascript", "js", "patch"} {
+			if value, ok := obj[key]; ok {
+				return asStr(value)
+			}
+		}
+	}
+	return arguments
 }
 
 // ---------------- 小工具 ----------------
@@ -656,6 +858,13 @@ func asStr(v any) string {
 		return string(raw)
 	}
 	return ""
+}
+
+func fallbackInt(v, alt int) int {
+	if v != 0 {
+		return v
+	}
+	return alt
 }
 
 var idCounter uint64

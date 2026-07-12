@@ -220,6 +220,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 转发用的 body 可能被路由的 model 改写;记录/日志仍用客户端原始请求。
 	forwardBody := reqBody
 	adaptTarget := "" // 非空表示需把上游 chat 响应转回该原生协议(messages/responses)
+	var adaptState *adapterState
 	routeStyle := "openai"
 	if provider == providerClaude {
 		routeStyle = "anthropic"
@@ -243,7 +244,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			forwardBody = rewriteModel(reqBody, route.Model)
 		case route.Protocol == "chat_completions" && (reqProtocol == "messages" || reqProtocol == "responses"):
 			// 适配层:三方只支持 chat 时,请求转 chat 发出去,响应再转回原生协议
-			chatBody, cerr := adaptRequestToChat(reqProtocol, reqBody)
+			chatBody, state, cerr := adaptRequestToChat(reqProtocol, reqBody)
 			if cerr != nil {
 				routeMismatch = "请求转换为 Chat 失败: " + cerr.Error()
 			} else {
@@ -251,6 +252,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				upstreamHost = base.Host
 				forwardBody = rewriteModel(chatBody, route.Model)
 				adaptTarget = reqProtocol
+				adaptState = state
 			}
 		default:
 			routeMismatch = fmt.Sprintf("请求接口协议(%s)与启用路由(%s)不匹配", fallback(reqProtocol, "unknown"), route.Protocol)
@@ -372,7 +374,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 适配路径:读完上游 chat 响应,转换回原生协议(SSE/JSON)后一次性回写。
 		rawUp, readErr := io.ReadAll(resp.Body)
 		chatDecoded := decodeResponseBody(rawUp, resp.Header.Get("Content-Encoding"))
-		native := adaptChatResponseToNative(adaptTarget, chatDecoded, clientStream, logModel)
+		native := adaptChatResponseToNative(adaptTarget, chatDecoded, clientStream, logModel, adaptState)
 		if clientStream {
 			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")

@@ -72,10 +72,15 @@ func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	date := strings.TrimSpace(r.URL.Query().Get("date"))
 	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
 	accountID := strings.TrimSpace(r.URL.Query().Get("account_id"))
-	conversations, err := p.store.ListConversations(r.Context(), query, status, month, date, agent, accountID)
+	const pageSize = 10
+	conversations, err := p.store.ListConversationsPage(r.Context(), query, status, month, date, agent, accountID, pageSize+1, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	hasMore := len(conversations) > pageSize
+	if hasMore {
+		conversations = conversations[:pageSize]
 	}
 	subagentLinks, err := p.store.SubagentLinks(r.Context(), conversations)
 	if err != nil {
@@ -103,6 +108,7 @@ func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"FilterOptions":     filterOptions,
 		"Conversations":     conversations,
 		"SubagentLinks":     subagentLinks,
+		"HasMore":           hasMore,
 		"ConversationCount": conversationCount,
 		"TraceCount":        traceCount,
 		"InputTokens":       inputTokens,
@@ -139,7 +145,8 @@ func (p *proxyServer) handleConversationDetail(w http.ResponseWriter, r *http.Re
 }
 
 func (p *proxyServer) handleAPIConversations(w http.ResponseWriter, r *http.Request) {
-	conversations, err := p.store.ListConversations(r.Context(), r.URL.Query().Get("q"), r.URL.Query().Get("status"), r.URL.Query().Get("month"), r.URL.Query().Get("date"), r.URL.Query().Get("agent"), r.URL.Query().Get("account_id"))
+	limit, offset := paginationParams(r)
+	conversations, err := p.store.ListConversationsPage(r.Context(), r.URL.Query().Get("q"), r.URL.Query().Get("status"), r.URL.Query().Get("month"), r.URL.Query().Get("date"), r.URL.Query().Get("agent"), r.URL.Query().Get("account_id"), limit, offset)
 	writeJSON(w, conversations, err)
 }
 
@@ -150,10 +157,15 @@ func (p *proxyServer) handleAPIDashboard(w http.ResponseWriter, r *http.Request)
 	date := r.URL.Query().Get("date")
 	agent := r.URL.Query().Get("agent")
 	accountID := r.URL.Query().Get("account_id")
-	conversations, err := p.store.ListConversations(r.Context(), query, status, month, date, agent, accountID)
+	limit, offset := paginationParams(r)
+	conversations, err := p.store.ListConversationsPage(r.Context(), query, status, month, date, agent, accountID, limit+1, offset)
 	if err != nil {
 		writeJSON(w, nil, err)
 		return
+	}
+	hasMore := len(conversations) > limit
+	if hasMore {
+		conversations = conversations[:limit]
 	}
 	subagentLinks, err := p.store.SubagentLinks(r.Context(), conversations)
 	if err != nil {
@@ -174,6 +186,9 @@ func (p *proxyServer) handleAPIDashboard(w http.ResponseWriter, r *http.Request)
 		"now":                time.Now(),
 		"conversations":      conversations,
 		"subagent_links":     subagentLinks,
+		"limit":              limit,
+		"offset":             offset,
+		"has_more":           hasMore,
 		"conversation_count": conversationCount,
 		"trace_count":        traceCount,
 		"input_tokens":       inputTokens,
@@ -211,6 +226,20 @@ func (p *proxyServer) handleAPIConversationTags(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true}, nil)
+}
+
+func paginationParams(r *http.Request) (limit, offset int) {
+	limit = 10
+	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 {
+		limit = v
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if v, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && v > 0 {
+		offset = v
+	}
+	return limit, offset
 }
 
 func (p *proxyServer) handleAPIConversationDelete(w http.ResponseWriter, r *http.Request) {
@@ -393,8 +422,10 @@ const indexHTML = `
     :root{--bg:#f6f7fb;--panel:#fff;--line:#dfe5ee;--text:#20242c;--muted:#6f7787;--blue:#2f6fed;--green:#139a55;--orange:#d46f1e;--red:#c94040;--purple:#6750d8}
     *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}
     .app{display:flex;min-height:100vh}
-    .sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;align-self:flex-start;height:100vh}
-    .sidebar .brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;padding:6px 10px 18px}
+    .sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;align-self:flex-start;height:100vh;transition:width .16s ease,padding .16s ease}
+    .sidebar .brand-row{display:flex;align-items:center;gap:8px;padding:6px 2px 18px 10px}.sidebar .brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;flex:1;white-space:nowrap;overflow:hidden}
+    .sidebar-toggle{width:30px;height:30px;padding:0;border-radius:7px;border:1px solid var(--line);background:#fff;color:#667284;font-weight:800}
+    .app.sidebar-collapsed .sidebar{width:58px;padding-left:10px;padding-right:10px}.app.sidebar-collapsed .brand{display:none}.app.sidebar-collapsed .nav-item{padding:10px 0;text-align:center;font-size:0}.app.sidebar-collapsed .nav-item::first-letter{font-size:15px}.app.sidebar-collapsed .sidebar-toggle{transform:rotate(180deg)}
     .nav-item{display:block;padding:10px 12px;border-radius:8px;color:var(--text);font-weight:500;margin-bottom:4px}
     .nav-item:hover{background:#eef2fa}
     .nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}
@@ -408,13 +439,13 @@ const indexHTML = `
     .prompt{font-size:14px;color:#242832}.sid{display:block;margin-top:4px;color:#8a93a3;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
     .account-btn,.tag-btn{height:auto;max-width:104px;padding:3px 9px;border-radius:6px;border:1px solid #b8e2df;background:#edfafa;color:#0f766e;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:none;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;font-weight:600}.account-btn:hover,.tag-btn:hover{background:#e2f7f4;border-color:#81cfc7;color:#0b5d56}.tag-btn{max-width:82px;border-color:#d8e0eb;background:#f7f9fc;color:#526074;font-family:inherit}
     .pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600;white-space:nowrap}.model{color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}.agent{color:#2469e8;background:#edf4ff;border:1px solid #c6d9ff}.ok{color:var(--green);background:#ecfbf2;border:1px solid #a9e2bf}.live{color:#fff;background:#f5821f;border:1px solid #f5821f}.error{color:var(--red);background:#fff1f1;border:1px solid #f0b3b3}.token{color:var(--orange);background:#fff8ee;border:1px solid #ffd09a;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.token-stack{display:inline-grid;gap:2px;line-height:1.35;min-width:92px;text-align:right}.tree-cell{padding-left:10px;padding-right:4px}.tree-toggle{width:26px;height:26px;padding:0;border-radius:6px;border:1px solid #d8e0eb;background:#fff;color:#667284;font-weight:800;line-height:1}.tree-toggle:hover{border-color:#b8c7dc;background:#f7f9fc}.child-mark{display:inline-block;color:#8a7ad8;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:700}
-    a{color:var(--blue);text-decoration:none}.small{font-size:12px;color:#8a93a3}.action{display:inline-flex;align-items:center;justify-content:center;min-width:48px;height:30px;border:1px solid var(--line);padding:0 10px;border-radius:7px;background:#fff;font-weight:500;white-space:nowrap}.delete-btn{color:var(--red);border-color:#f0b3b3;background:#fff6f6}.delete-btn:hover{background:#fff1f1;border-color:#e07d7d}
+    a{color:var(--blue);text-decoration:none}.small{font-size:12px;color:#8a93a3}.action{display:inline-flex;align-items:center;justify-content:center;min-width:48px;height:30px;border:1px solid var(--line);padding:0 10px;border-radius:7px;background:#fff;font-weight:500;white-space:nowrap}.delete-btn{color:var(--red);border-color:#f0b3b3;background:#fff6f6}.delete-btn:hover{background:#fff1f1;border-color:#e07d7d}.load-status{padding:12px 16px;text-align:center;color:#7b8494;border-top:1px solid var(--line);background:#fbfcfe}
   </style>
 </head>
 <body>
 <div class="app">
   <aside class="sidebar">
-    <div class="brand">AGENT-GO-PROXY</div>
+    <div class="brand-row"><div class="brand">AGENT-GO-PROXY</div><button class="sidebar-toggle" id="sidebar-toggle" type="button" title="收起/展开侧栏">‹</button></div>
     <nav>
       <a class="nav-item active" href="/">Dashboard</a>
       <a class="nav-item" href="/routes">路由</a>
@@ -479,12 +510,23 @@ const indexHTML = `
       {{end}}
       </tbody>
     </table>
+    <div class="load-status" id="load-status">{{if .HasMore}}向下滚动加载更多{{else}}已加载全部记录{{end}}</div>
   </section>
   </main>
 </div>
 <script>
 const initialConversations = {{toJSON .Conversations}};
 const initialSubagentLinks = {{toJSON .SubagentLinks}};
+const pageSize = 10;
+let nextOffset = (initialConversations || []).length;
+let hasMore = {{if .HasMore}}true{{else}}false{{end}};
+let loadingMore = false;
+const appEl = document.querySelector('.app');
+if (localStorage.getItem('sidebarCollapsed') === '1') appEl.classList.add('sidebar-collapsed');
+document.getElementById('sidebar-toggle').addEventListener('click', () => {
+  appEl.classList.toggle('sidebar-collapsed');
+  localStorage.setItem('sidebarCollapsed', appEl.classList.contains('sidebar-collapsed') ? '1' : '0');
+});
 const fmtInt = n => Number(n || 0).toLocaleString('en-US');
 const fmtTime = v => {
   if (!v) return '';
@@ -573,6 +615,12 @@ function renderConversationRows(conversations, links){
     }
   });
   rows.innerHTML = html.join('') || '<tr><td colspan="12">暂无数据。发起一次 Codex 请求后这里会出现新会话。</td></tr>';
+  updateLoadStatus();
+}
+function updateLoadStatus(){
+  const el = document.getElementById('load-status');
+  if (!el) return;
+  el.textContent = loadingMore ? '加载中...' : (hasMore ? '向下滚动加载更多' : '已加载全部记录');
 }
 function syncSelectOptions(select, allLabel, options, getValue, getLabel){
   if (!select) return;
@@ -669,8 +717,22 @@ document.getElementById('conversation-rows').addEventListener('click', event => 
   if (row) location.href = row.dataset.href;
 });
 async function refreshDashboard(){
+  await fetchDashboardPage({offset: 0, replace: true});
+}
+function dashboardQuery(offset){
   const form = document.querySelector('.filters');
   const qs = new URLSearchParams(new FormData(form));
+  qs.set('limit', pageSize);
+  qs.set('offset', offset);
+  return qs;
+}
+function mergeFirstPage(firstPage){
+  const firstIDs = new Set((firstPage || []).map(item => item.ID));
+  const rest = latestConversations.filter(item => !firstIDs.has(item.ID));
+  return (firstPage || []).concat(rest);
+}
+async function fetchDashboardPage({offset, replace}){
+  const qs = dashboardQuery(offset);
   const rsp = await fetch('/api/dashboard?' + qs.toString(), {cache:'no-store'});
   if (!rsp.ok) return;
   const data = await rsp.json();
@@ -681,10 +743,39 @@ async function refreshDashboard(){
   document.getElementById('stat-output-tokens').textContent = fmtInt(data.output_tokens);
   document.getElementById('stat-cached-tokens').textContent = fmtInt(data.cached_tokens);
   syncFilterOptions(data.filter_options);
-  renderConversationRows(data.conversations || [], data.subagent_links || {});
+  const page = data.conversations || [];
+  hasMore = !!data.has_more;
+  if (replace) {
+    latestConversations = mergeFirstPage(page);
+    nextOffset = Math.max(pageSize, latestConversations.length);
+    renderConversationRows(latestConversations, Object.assign({}, latestSubagentLinks, data.subagent_links || {}));
+  } else {
+    const seen = new Set(latestConversations.map(item => item.ID));
+    const fresh = page.filter(item => !seen.has(item.ID));
+    latestConversations = latestConversations.concat(fresh);
+    latestSubagentLinks = Object.assign({}, latestSubagentLinks, data.subagent_links || {});
+    nextOffset += page.length;
+    renderConversationRows(latestConversations, latestSubagentLinks);
+  }
+}
+async function loadMore(){
+  if (!hasMore || loadingMore) return;
+  loadingMore = true;
+  updateLoadStatus();
+  try {
+    await fetchDashboardPage({offset: nextOffset, replace: false});
+  } finally {
+    loadingMore = false;
+    updateLoadStatus();
+  }
 }
 renderConversationRows(initialConversations || [], initialSubagentLinks || {});
-setInterval(() => refreshDashboard().catch(() => {}), 1000);
+window.addEventListener('scroll', () => {
+  if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 260) {
+    loadMore().catch(() => {});
+  }
+});
+setInterval(() => refreshDashboard().catch(() => {}), 3000);
 </script>
 </body>
 </html>
@@ -1391,8 +1482,10 @@ const routesHTML = `
     :root{--bg:#f6f7fb;--panel:#fff;--line:#dfe5ee;--text:#20242c;--muted:#6f7787;--blue:#2f6fed;--green:#139a55;--orange:#d46f1e;--red:#c94040;--purple:#6750d8}
     *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}
     .app{display:flex;min-height:100vh}
-    .sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;align-self:flex-start;height:100vh}
-    .sidebar .brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;padding:6px 10px 18px}
+    .sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;align-self:flex-start;height:100vh;transition:width .16s ease,padding .16s ease}
+    .sidebar .brand-row{display:flex;align-items:center;gap:8px;padding:6px 2px 18px 10px}.sidebar .brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;flex:1;white-space:nowrap;overflow:hidden}
+    .sidebar-toggle{width:30px;height:30px;padding:0;border-radius:7px;border:1px solid var(--line);background:#fff;color:#667284;font-weight:800}
+    .app.sidebar-collapsed .sidebar{width:58px;padding-left:10px;padding-right:10px}.app.sidebar-collapsed .brand{display:none}.app.sidebar-collapsed .nav-item{padding:10px 0;text-align:center;font-size:0}.app.sidebar-collapsed .nav-item::first-letter{font-size:15px}.app.sidebar-collapsed .sidebar-toggle{transform:rotate(180deg)}
     .nav-item{display:block;padding:10px 12px;border-radius:8px;color:var(--text);font-weight:500;margin-bottom:4px}
     .nav-item:hover{background:#eef2fa}
     .nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}
@@ -1433,7 +1526,7 @@ const routesHTML = `
 <body>
 <div class="app">
   <aside class="sidebar">
-    <div class="brand">AGENT-GO-PROXY</div>
+    <div class="brand-row"><div class="brand">AGENT-GO-PROXY</div><button class="sidebar-toggle" id="sidebar-toggle" type="button" title="收起/展开侧栏">‹</button></div>
     <nav>
       <a class="nav-item" href="/">Dashboard</a>
       <a class="nav-item active" href="/routes">路由</a>
@@ -1471,6 +1564,12 @@ const routesHTML = `
 </div>
 
 <script>
+const appEl = document.querySelector('.app');
+if (localStorage.getItem('sidebarCollapsed') === '1') appEl.classList.add('sidebar-collapsed');
+document.getElementById('sidebar-toggle').addEventListener('click', () => {
+  appEl.classList.toggle('sidebar-collapsed');
+  localStorage.setItem('sidebarCollapsed', appEl.classList.contains('sidebar-collapsed') ? '1' : '0');
+});
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const maskKey = k => {
   k = String(k || '');

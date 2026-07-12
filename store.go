@@ -494,17 +494,38 @@ func conversationWhere(query, status, month, date, agent, accountID string) (str
 }
 
 func (s *Store) ListConversations(ctx context.Context, query, status, month, date, agent, accountID string) ([]ConversationSummary, error) {
+	return s.ListConversationsPage(ctx, query, status, month, date, agent, accountID, 200, 0)
+}
+
+func (s *Store) ListConversationsPage(ctx context.Context, query, status, month, date, agent, accountID string, limit, offset int) ([]ConversationSummary, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
 	where, args := conversationWhere(query, status, month, date, agent, accountID)
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.session_id, c.account_id, COALESCE(a.display_name,''), COALESCE(c.tags,''), c.started_at, c.updated_at, COALESCE(c.first_prompt,''), c.trace_count,
-		c.error_count, c.total_tokens, COALESCE(tok.input_tokens,0), COALESCE(tok.output_tokens,0), COALESCE(tok.cached_tokens,0),
-		TIMESTAMPDIFF(MICROSECOND, c.started_at, COALESCE(tok.completed_at, c.updated_at)) / 60000000,
-		c.model, c.agent, c.status, c.last_status, c.last_duration_ms, c.last_request_id
-		FROM conversations c
-		LEFT JOIN account_aliases a ON a.account_id=c.account_id
-		LEFT JOIN (
-			SELECT conversation_id, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(cached_tokens) cached_tokens, MAX(completed_at) completed_at
-			FROM traces GROUP BY conversation_id
-		) tok ON tok.conversation_id=c.id `+where+` ORDER BY c.updated_at DESC LIMIT 200`, args...)
+	args = append(args, limit, offset)
+	rows, err := s.db.QueryContext(ctx, `SELECT pc.id, pc.session_id, pc.account_id, pc.account_name, pc.tags, pc.started_at, pc.updated_at, pc.first_prompt, pc.trace_count,
+		pc.error_count, pc.total_tokens, COALESCE(SUM(t.input_tokens),0), COALESCE(SUM(t.output_tokens),0), COALESCE(SUM(t.cached_tokens),0),
+		TIMESTAMPDIFF(MICROSECOND, pc.started_at, COALESCE(MAX(t.completed_at), pc.updated_at)) / 60000000,
+		pc.model, pc.agent, pc.status, pc.last_status, pc.last_duration_ms, pc.last_request_id
+		FROM (
+			SELECT c.id, c.session_id, c.account_id, COALESCE(a.display_name,'') account_name, COALESCE(c.tags,'') tags, c.started_at, c.updated_at,
+				COALESCE(c.first_prompt,'') first_prompt, c.trace_count, c.error_count, c.total_tokens, c.model, c.agent, c.status, c.last_status,
+				c.last_duration_ms, c.last_request_id
+			FROM conversations c
+			LEFT JOIN account_aliases a ON a.account_id=c.account_id
+			`+where+`
+			ORDER BY c.updated_at DESC LIMIT ? OFFSET ?
+		) pc
+		LEFT JOIN traces t ON t.conversation_id=pc.id
+		GROUP BY pc.id, pc.session_id, pc.account_id, pc.account_name, pc.tags, pc.started_at, pc.updated_at, pc.first_prompt, pc.trace_count,
+			pc.error_count, pc.total_tokens, pc.model, pc.agent, pc.status, pc.last_status, pc.last_duration_ms, pc.last_request_id
+		ORDER BY pc.updated_at DESC`, args...)
 	if err != nil {
 		return nil, err
 	}
