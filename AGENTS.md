@@ -54,8 +54,12 @@ no_proxy=127.0.0.1,localhost \
   - Claude：Anthropic SSE，输入/缓存命中取 `message_start` 的 `message.usage`，输出取 `message_delta` 的 `usage.output_tokens`，`total = input + output`。
 - 详情简略视图（web.go）：
   - 响应文本 `responseText` 在 OpenAI 解析无结果时回落 `claudeStreamBlocks`，按 `content_block_delta` 还原正文（text_delta）、思考（thinking_delta）、工具调用（content_block_start 的 tool_use + input_json_delta）。
-  - 系统提示 `systemText` 兼容 Codex `instructions` 与 Claude `system`（字符串或内容块数组）。
-  - 请求消息 `requestMessages` / `contentText` 已同时兼容 OpenAI `input[]` 与 Anthropic `messages[]`、tool_use/tool_result 内容块。
+  - 系统提示 `systemText` 兼容：老 Codex 顶层 `instructions`、Claude 顶层 `system`（字符串或内容块数组）、**新版 Codex** 放在 `input[]` 里 `role=developer` 的消息（排除注入上下文块）。
+  - 请求消息 `requestMessages` / `contentText` 已同时兼容 OpenAI `input[]` 与 Anthropic `messages[]`、`input_text`/`output_text`、tool_use/tool_result 内容块。
+  - 工具 `toolDetails` / `collectRawTools` 兼容：老格式顶层 `tools`、**新版 Codex** `input[]` 里 `type=additional_tools` 的条目（`namespace` 分组展开成带前缀名的子工具）。
+  - 运行参数 `runtimeRows` 展示 model / tool_choice / reasoning / text / include / prompt_cache_key / **client_metadata**（新版 Codex）等。
+
+新版 Codex（GPT-5.x + 新版 CLI）请求格式变化：系统提示从顶层 `instructions` 挪到 `input` 的 developer 消息；工具从顶层 `tools` 挪到 `input` 的 `additional_tools` 条目并按 `namespace` 分组；新增 `exec` 编排工具与 `client_metadata` 字段。Responses API 传输协议本身（input/output/SSE 事件）未变。
 
 解析按「错了也没关系、日志已留原文」的原则做，后续可据 `log/*.log` 与 `traces` 原始数据继续调整。
 
@@ -66,6 +70,47 @@ no_proxy=127.0.0.1,localhost \
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
 ```
+
+## 左侧菜单与路由页
+
+Web 页面左侧有侧边栏菜单，两项：
+
+- `Dashboard`：原会话列表页（`/`）。
+- `路由`：第三方 API 配置页（`/routes`）。
+
+两页共用同一套侧边栏，当前页高亮。路由页是对 `api_routes` 表的增删改查：
+
+- 每条配置字段：名称、Base URL、`API`（风格，openai / anthropic）、接口协议、Model、API Key、启用开关。
+- `API`（风格）与「接口协议」联动：openai → `Chat Completions API` / `Responses API`；anthropic → `Messages API` / `Chat Completions API`。前后端各存一份协议表（web.go `PROTOCOLS` 与 store.go `routeProtocols`），必须保持一致。
+- API Key 列表里打码显示，编辑时回填完整值（本地工具，暂不脱敏）。
+- 启用开关（ON/OFF）点击直接切换、无二次确认，`ToggleAPIRoute` 只改 `enabled` 不动 `updated_at`（避免列表按 `updated_at` 排序时启用项跳到最前）。
+- **互斥粒度：每种 `api_style` 至多一条启用**（openai 一条、anthropic 一条可同时 ON）。开启一条时只关掉同风格的其它启用项。
+
+## 路由与第三方 API 转发
+
+`ServeHTTP`（main.go）在转发前按请求风格挑选启用的路由：
+
+- 风格映射：`provider=codex → openai`，`provider=claude → anthropic`。用 `EnabledAPIRouteForStyle(style)` 取该风格当前启用的那条。
+- **默认模式**（该风格无启用路由）：行为不变，按 provider 转发到官方上游（`-target` / `-claude-target`）。
+- **路由模式**（有启用路由）：
+  - 上游改为路由的 Base URL，按协议拼 endpoint（`buildRouteUpstreamURL`：`/chat/completions`、`/responses`、`/messages`）。
+  - 认证头换成路由配置的 key（`applyRouteAuth`）：openai 风格用 `Authorization: Bearer`，anthropic 风格用 `x-api-key`（并补 `anthropic-version`）；客户端自带的 `Authorization`/`X-Api-Key`/`Chatgpt-Account-Id` 先剥掉。
+  - 请求体的 `model` 改写为路由配置的 Model（`rewriteModel`，仅当配置了 Model；用 RawMessage map 只替换 model 键）。
+  - 协议不匹配（请求协议 ≠ 路由协议，且无法适配）→ 本地直接返回 **421 Misdirected Request**，不打上游，仍记一次错误 trace/日志。
+- 记录/日志始终用**客户端原始请求**（`recordedReqBody`），转发用的 `forwardBody` 可能已改写 model 或转成 chat，两者分离。
+
+## 协议适配层（adapter.go）
+
+当启用路由的协议是 `chat_completions`，但请求本身是 `messages`（Claude）或 `responses`（Codex）时，进入适配器——让只支持 Chat Completions 的三方模型也能被 Codex/Claude 使用：
+
+- **请求 native → chat**（`adaptRequestToChat`）：
+  - `anthropicMessagesToChat`：`system` → system 消息；`messages[]` 内容块展开（assistant `tool_use` → `tool_calls`，user `tool_result` → 独立 `role=tool` 消息，image → `image_url`）；`tools` → chat function tools；`tool_choice` 映射。
+  - `openaiResponsesToChat`：`input[]` 里 developer/system → system、user → user、`function_call` → assistant `tool_calls`、`function_call_output` → `role=tool`；工具来自 `additional_tools` 条目（`namespace` 分组递归展开成 `组名__子工具` 前缀名，`custom` 归一成 function）。
+- **响应 chat → native**（`adaptChatResponseToNative`）：
+  - 先 `parseChatResponse` 把三方的 chat 响应（SSE 或 JSON）解析出文本、tool_calls、finish_reason、usage。
+  - 再按目标协议还原：`emitAnthropicSSE/JSON`（message_start/content_block/message_delta…）或 `emitResponsesSSE/JSON`（response.created/output_item/response.completed…）。usage 一并带上，供 recorder 正常统计。
+- **取舍**：响应是「读完上游再一次性转吐」，不是逐 token 增量流式；客户端拿到的仍是合法原生 SSE。输入 token 取三方返回的 `prompt_tokens`（三方不返回 usage 时为 0）。
+- 只在 2xx 且需适配时走转换;非 2xx 原样透传三方错误。
 
 ## 数据库
 
@@ -82,6 +127,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
 - `conversations`：会话聚合，按 `session_id` 唯一。字段包括 `account_id`、`window_id`、`started_at`、`updated_at`、`first_prompt`、`tags`、`model`、`agent`、`status`、`trace_count`、`error_count`、`total_tokens`、`last_status`、`last_duration_ms`、`last_request_id`。
 - `traces`：每次 `/v1/responses` 请求记录，保存请求/响应 headers、body、SSE events、token、状态、耗时和完成时间。
 - `account_aliases`：`Chatgpt-Account-Id` 到自定义账号名的映射。
+- `api_routes`：路由页配置的第三方 API 供应商。字段 `name`、`base_url`、`model`、`api_style`（openai/anthropic）、`protocol`（chat_completions/responses/messages）、`api_key`、`enabled`。旧库通过 `ensureColumn` 补 `api_style`/`protocol`/`enabled` 三列。
 
 迁移会确保历史数据补齐 `account_id`、`tags` 等字段，并尝试修复旧数据里误保存为注入上下文的 `first_prompt`。
 
@@ -193,11 +239,14 @@ Codex 请求里会混入系统和运行上下文。
 
 ## 日志
 
-JSON Lines 日志写入：
+JSON Lines 日志写入，**按模型分文件**：
 
 ```text
-log/YYYY-MM-DD.log
+log/YYYY-MM-DD-{model}.log
 ```
+
+- 模型名取客户端原始请求体的 `model`；不同模型写到不同日志文件。
+- 模型名里的 `/`、`:` 等非法字符会清洗成 `_`（`sanitizeModelForFile`），空模型归 `unknown`。
 
 当前按用户要求暂不脱敏，请求头和请求体会完整保存。
 
@@ -213,6 +262,12 @@ log/YYYY-MM-DD.log
 - `DELETE /api/conversations/{id}`：删除会话及其 trace。
 - `POST /api/conversations/{id}/tags`：保存会话标签。
 - `POST /api/accounts/{id}/alias`：保存账号别名。
+- `GET /routes`：第三方 API 配置页。
+- `GET /api/routes`：路由配置列表 JSON。
+- `POST /api/routes`：新建路由配置。
+- `PUT /api/routes/{id}`：更新路由配置。
+- `POST /api/routes/{id}/toggle`：切换启用状态（按 `api_style` 互斥）。
+- `DELETE /api/routes/{id}`：删除路由配置。
 - `GET /healthz`：健康检查。
 
 ## 当前技术栈

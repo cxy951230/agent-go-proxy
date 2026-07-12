@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -116,10 +117,16 @@ func main() {
 
 	router := chi.NewRouter()
 	router.Get("/", srv.handleIndex)
+	router.Get("/routes", srv.handleRoutes)
 	router.Get("/conversations/{id}", srv.handleConversationDetail)
 	router.Get("/favicon.ico", srv.handleFavicon)
 	router.Get("/assets/favicon.jpg", srv.handleFavicon)
 	router.Get("/api/dashboard", srv.handleAPIDashboard)
+	router.Get("/api/routes", srv.handleAPIRoutesList)
+	router.Post("/api/routes", srv.handleAPIRouteCreate)
+	router.Put("/api/routes/{id}", srv.handleAPIRouteUpdate)
+	router.Post("/api/routes/{id}/toggle", srv.handleAPIRouteToggle)
+	router.Delete("/api/routes/{id}", srv.handleAPIRouteDelete)
 	router.Get("/api/conversations", srv.handleAPIConversations)
 	router.Get("/api/conversations/{id}", srv.handleAPIConversationDetail)
 	router.Delete("/api/conversations/{id}", srv.handleAPIConversationDelete)
@@ -177,12 +184,13 @@ func (p *proxyServer) handleProxyFallback(w http.ResponseWriter, r *http.Request
 func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	provider := detectProvider(r)
+	// 默认(原生)模式:按 provider 选官方上游,URL 由请求路径推导。
 	upstreamTarget := p.cfg.target
 	if provider == providerClaude {
 		upstreamTarget = p.cfg.claudeTarget
 	}
 	upstreamURL := buildUpstreamURL(upstreamTarget, r.URL)
-	fmt.Printf("-> [%s] %s %s upstream=%s\n", provider, r.Method, r.URL.RequestURI(), upstreamURL)
+	upstreamHost := upstreamTarget.Host
 
 	reqBody, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -201,9 +209,54 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	recordedReqBody := truncateBase64Images(string(reqBody))
+	logModel := modelFromBody(reqBody)
+	clientStream := clientWantsStream(reqBody)
 	// Claude Code 的 quota/warmup 探测请求(max_tokens<=1,内容为 "quota"):
 	// 只转发给上游让 CC 读限流状态,不落库、不写日志,避免污染看板。
 	isProbe := provider == providerClaude && isClaudeQuotaProbe(reqBody)
+
+	// 若配置了启用的路由,改走该第三方接口(默认模式下 routeOK=false,保持原生转发)。
+	// 路由按请求风格选取:Codex(openai) / Claude(anthropic) 各自用同风格里启用的那条。
+	// 转发用的 body 可能被路由的 model 改写;记录/日志仍用客户端原始请求。
+	forwardBody := reqBody
+	adaptTarget := "" // 非空表示需把上游 chat 响应转回该原生协议(messages/responses)
+	routeStyle := "openai"
+	if provider == providerClaude {
+		routeStyle = "anthropic"
+	}
+	route, routeOK, rerr := p.store.EnabledAPIRouteForStyle(r.Context(), routeStyle)
+	if rerr != nil {
+		log.Printf("load enabled route: %v", rerr)
+		routeOK = false
+	}
+	var routeMismatch string
+	if routeOK {
+		reqProtocol := detectProtocol(r.URL.Path)
+		base, perr := url.Parse(route.BaseURL)
+		switch {
+		case perr != nil || base.Scheme == "" || base.Host == "":
+			routeMismatch = "启用路由的 Base URL 无效"
+		case reqProtocol == route.Protocol:
+			// 协议一致,直接透传到该 endpoint
+			upstreamURL = buildRouteUpstreamURL(route.BaseURL, reqProtocol, r.URL.RawQuery)
+			upstreamHost = base.Host
+			forwardBody = rewriteModel(reqBody, route.Model)
+		case route.Protocol == "chat_completions" && (reqProtocol == "messages" || reqProtocol == "responses"):
+			// 适配层:三方只支持 chat 时,请求转 chat 发出去,响应再转回原生协议
+			chatBody, cerr := adaptRequestToChat(reqProtocol, reqBody)
+			if cerr != nil {
+				routeMismatch = "请求转换为 Chat 失败: " + cerr.Error()
+			} else {
+				upstreamURL = buildRouteUpstreamURL(route.BaseURL, "chat_completions", r.URL.RawQuery)
+				upstreamHost = base.Host
+				forwardBody = rewriteModel(chatBody, route.Model)
+				adaptTarget = reqProtocol
+			}
+		default:
+			routeMismatch = fmt.Sprintf("请求接口协议(%s)与启用路由(%s)不匹配", fallback(reqProtocol, "unknown"), route.Protocol)
+		}
+	}
+	fmt.Printf("-> [%s] %s %s upstream=%s adapt=%s\n", provider, r.Method, r.URL.RequestURI(), upstreamURL, fallback(adaptTarget, "none"))
 
 	var traceHandle *traceHandle
 	if !isProbe {
@@ -214,6 +267,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Method:      r.Method,
 			Path:        r.URL.RequestURI(),
 			UpstreamURL: upstreamURL,
+			Model:       logModel,
 			RequestBody: recordedReqBody,
 			RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
 		})
@@ -229,18 +283,50 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// 启用路由但请求协议不匹配:本地直接拒绝(421 Misdirected Request),
+	// 不打上游;仍按常规记一次错误日志/trace,保持解析、入库逻辑一致。
+	if routeMismatch != "" {
+		http.Error(w, routeMismatch, http.StatusMisdirectedRequest)
+		if !isProbe {
+			p.logs.Write(logEntry{
+				Timestamp:   time.Now().Format(time.RFC3339Nano),
+				DurationMS:  time.Since(start).Milliseconds(),
+				Method:      r.Method,
+				Path:        r.URL.RequestURI(),
+				UpstreamURL: upstreamURL,
+				Model:       logModel,
+				Status:      http.StatusMisdirectedRequest,
+				RequestBody: recordedReqBody,
+				RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
+				Error:       routeMismatch,
+			})
+		}
+		fmt.Printf("<- %s %s status=%d route_mismatch=%s\n", r.Method, r.URL.RequestURI(), http.StatusMisdirectedRequest, routeMismatch)
+		p.recorder.Finish(traceHandle, TraceFinishRecord{
+			Provider:   provider,
+			Status:     http.StatusMisdirectedRequest,
+			DurationMS: time.Since(start).Milliseconds(),
+			Error:      routeMismatch,
+		})
+		return
+	}
+
 	// 请求体已缓存,响应写回前若上游传输层瞬时失败(常见于经本地代理复用了
 	// 失效的长连接导致 EOF),用全新连接重试若干次,避免把可恢复的抖动透传成 502。
 	const maxAttempts = 3
 	var resp *http.Response
 	for attempt := 1; ; attempt++ {
 		var upstreamReq *http.Request
-		upstreamReq, err = http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(reqBody))
+		upstreamReq, err = http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(forwardBody))
 		if err != nil {
 			break // 构造请求失败,不可重试
 		}
 		copyHeaders(upstreamReq.Header, r.Header)
-		upstreamReq.Host = upstreamTarget.Host
+		upstreamReq.Host = upstreamHost
+		// 走第三方路由时,用配置的凭证覆盖客户端自带的认证头。
+		if routeOK {
+			applyRouteAuth(upstreamReq.Header, route)
+		}
 
 		resp, err = p.client.Do(upstreamReq)
 		if err == nil {
@@ -262,6 +348,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Method:      r.Method,
 				Path:        r.URL.RequestURI(),
 				UpstreamURL: upstreamURL,
+				Model:       logModel,
 				Status:      http.StatusBadGateway,
 				RequestBody: recordedReqBody,
 				RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
@@ -278,14 +365,41 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-
-	var respBody bytes.Buffer
-	copyErr := copyAndFlush(w, resp.Body, &respBody)
-	// 转发给客户端的是原始字节(可能 gzip),记录/解析前要按 Content-Encoding 解压,
-	// 否则 SSE 解析拿到的是压缩流,token 等全部解不出来。
-	decodedRespBody := decodeResponseBody(respBody.Bytes(), resp.Header.Get("Content-Encoding"))
+	var decodedRespBody string
+	var copyErr error
+	var responseBytes int
+	if adaptTarget != "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// 适配路径:读完上游 chat 响应,转换回原生协议(SSE/JSON)后一次性回写。
+		rawUp, readErr := io.ReadAll(resp.Body)
+		chatDecoded := decodeResponseBody(rawUp, resp.Header.Get("Content-Encoding"))
+		native := adaptChatResponseToNative(adaptTarget, chatDecoded, clientStream, logModel)
+		if clientStream {
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+		} else {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, writeErr := io.WriteString(w, native)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		if readErr != nil {
+			copyErr = readErr
+		} else {
+			copyErr = writeErr
+		}
+		decodedRespBody = native
+		responseBytes = len(native)
+	} else {
+		// 原生透传:边读边写回(可能 gzip),记录/解析前再按 Content-Encoding 解压副本。
+		copyHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		var respBody bytes.Buffer
+		copyErr = copyAndFlush(w, resp.Body, &respBody)
+		decodedRespBody = decodeResponseBody(respBody.Bytes(), resp.Header.Get("Content-Encoding"))
+		responseBytes = respBody.Len()
+	}
 	recordedRespBody := truncateBase64Images(decodedRespBody)
 
 	entry := logEntry{
@@ -294,6 +408,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Method:       r.Method,
 		Path:         r.URL.RequestURI(),
 		UpstreamURL:  upstreamURL,
+		Model:        logModel,
 		Status:       resp.StatusCode,
 		RequestBody:  recordedReqBody,
 		ResponseBody: recordedRespBody,
@@ -314,7 +429,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		DurationMS:    time.Since(start).Milliseconds(),
 		ResponseBody:  recordedRespBody,
 		ResponseHdrs:  sanitizeHeader(cloneHeader(resp.Header)),
-		ResponseBytes: respBody.Len(),
+		ResponseBytes: responseBytes,
 	}
 	if copyErr != nil && !errors.Is(copyErr, context.Canceled) {
 		finishRecord.Error = copyErr.Error()
@@ -323,7 +438,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if copyErr != nil {
 		fmt.Printf("<- %s %s status=%d duration=%dms copy_error=%s\n", r.Method, r.URL.RequestURI(), resp.StatusCode, entry.DurationMS, copyErr.Error())
 	} else {
-		fmt.Printf("<- %s %s status=%d duration=%dms bytes=%d\n", r.Method, r.URL.RequestURI(), resp.StatusCode, entry.DurationMS, respBody.Len())
+		fmt.Printf("<- %s %s status=%d duration=%dms bytes=%d\n", r.Method, r.URL.RequestURI(), resp.StatusCode, entry.DurationMS, responseBytes)
 	}
 }
 
@@ -428,6 +543,79 @@ func decodeResponseBody(raw []byte, encoding string) string {
 	}
 	// 空 / identity / 不支持的(br、zstd)直接回退原文
 	return string(raw)
+}
+
+// protocolEndpoint 是每种接口协议对应的标准 endpoint 后缀,用于拼第三方路由的上游地址。
+var protocolEndpoint = map[string]string{
+	"chat_completions": "/chat/completions",
+	"responses":        "/responses",
+	"messages":         "/messages",
+}
+
+// detectProtocol 从请求路径判断接口协议,用于和启用路由配置的协议做匹配。
+// 命中不了(如 legacy /v1/complete)返回空,交由上层判定为不匹配。
+func detectProtocol(path string) string {
+	p := strings.ToLower(path)
+	switch {
+	case strings.Contains(p, "/chat/completions"):
+		return "chat_completions"
+	case strings.Contains(p, "/responses"):
+		return "responses"
+	case strings.Contains(p, "/messages"):
+		return "messages"
+	}
+	return ""
+}
+
+// buildRouteUpstreamURL 用路由配置的 Base URL 拼上游地址:Base URL 已含版本前缀
+// (如 .../v1),按协议追加标准 endpoint,并保留原查询串。
+func buildRouteUpstreamURL(baseURL, protocol, rawQuery string) string {
+	u := strings.TrimRight(baseURL, "/") + protocolEndpoint[protocol]
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	return u
+}
+
+// rewriteModel 把请求体里的 model 改成路由配置的 model(仅当配置了 model 时)。
+// 用 RawMessage map 只替换 model 键,其余字段原值保留,避免 re-marshal 改动。
+func rewriteModel(body []byte, model string) []byte {
+	if strings.TrimSpace(model) == "" {
+		return body
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	mj, err := json.Marshal(model)
+	if err != nil {
+		return body
+	}
+	obj["model"] = mj
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// applyRouteAuth 用路由配置的凭证替换客户端自带的认证头,按 API 风格设置。
+func applyRouteAuth(h http.Header, route APIRoute) {
+	h.Del("Authorization")
+	h.Del("X-Api-Key")
+	h.Del("Chatgpt-Account-Id")
+	h.Del("Openai-Organization")
+	if route.APIKey == "" {
+		return
+	}
+	if route.APIStyle == "anthropic" {
+		h.Set("X-Api-Key", route.APIKey)
+		if h.Get("Anthropic-Version") == "" {
+			h.Set("Anthropic-Version", "2023-06-01")
+		}
+	} else {
+		h.Set("Authorization", "Bearer "+route.APIKey)
+	}
 }
 
 // detectProvider 区分进来的是 Claude(Anthropic)还是 Codex(OpenAI)请求。

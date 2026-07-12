@@ -63,7 +63,7 @@ var baseTemplate = template.Must(template.New("base").Funcs(template.FuncMap{
 			return "ok"
 		}
 	},
-}).Parse(indexHTML + detailHTML))
+}).Parse(indexHTML + detailHTML + routesHTML))
 
 func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -246,6 +246,88 @@ func (p *proxyServer) handleAPIAccountAlias(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, map[string]any{"ok": true}, nil)
 }
 
+func (p *proxyServer) handleRoutes(w http.ResponseWriter, r *http.Request) {
+	if err := baseTemplate.ExecuteTemplate(w, "routes", nil); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (p *proxyServer) handleAPIRoutesList(w http.ResponseWriter, r *http.Request) {
+	routes, err := p.store.ListAPIRoutes(r.Context())
+	writeJSON(w, routes, err)
+}
+
+func (p *proxyServer) handleAPIRouteCreate(w http.ResponseWriter, r *http.Request) {
+	var route APIRoute
+	if err := json.NewDecoder(r.Body).Decode(&route); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	id, err := p.store.CreateAPIRoute(r.Context(), route)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "id": id}, nil)
+}
+
+func (p *proxyServer) handleAPIRouteUpdate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad route id", http.StatusBadRequest)
+		return
+	}
+	var route APIRoute
+	if err := json.NewDecoder(r.Body).Decode(&route); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if err := p.store.UpdateAPIRoute(r.Context(), id, route); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "route not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true}, nil)
+}
+
+func (p *proxyServer) handleAPIRouteDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad route id", http.StatusBadRequest)
+		return
+	}
+	if err := p.store.DeleteAPIRoute(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "route not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true}, nil)
+}
+
+func (p *proxyServer) handleAPIRouteToggle(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad route id", http.StatusBadRequest)
+		return
+	}
+	enabled, err := p.store.ToggleAPIRoute(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "route not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "enabled": enabled}, nil)
+}
+
 func writeJSON(w http.ResponseWriter, data any, err error) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -310,7 +392,13 @@ const indexHTML = `
   <style>
     :root{--bg:#f6f7fb;--panel:#fff;--line:#dfe5ee;--text:#20242c;--muted:#6f7787;--blue:#2f6fed;--green:#139a55;--orange:#d46f1e;--red:#c94040;--purple:#6750d8}
     *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}
-    .page{padding:22px 28px 56px}.top{display:flex;align-items:center;gap:16px}.top h1{font-size:18px;font-weight:600;margin:0;flex:1}.clock{color:#d95252;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    .app{display:flex;min-height:100vh}
+    .sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;align-self:flex-start;height:100vh}
+    .sidebar .brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;padding:6px 10px 18px}
+    .nav-item{display:block;padding:10px 12px;border-radius:8px;color:var(--text);font-weight:500;margin-bottom:4px}
+    .nav-item:hover{background:#eef2fa}
+    .nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}
+    .page{flex:1;min-width:0;padding:22px 28px 56px}.top{display:flex;align-items:center;gap:16px}.top h1{font-size:18px;font-weight:600;margin:0;flex:1}.clock{color:#d95252;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
     .filters{display:grid;grid-template-columns:150px 150px 150px 150px 190px 1fr auto;gap:12px;margin-top:16px}
     select,input,button{height:42px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:0 12px;font:inherit;color:var(--text)}
     button{cursor:pointer}.stats,.table{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05)}
@@ -324,7 +412,15 @@ const indexHTML = `
   </style>
 </head>
 <body>
-<main class="page">
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">AGENT-GO-PROXY</div>
+    <nav>
+      <a class="nav-item active" href="/">Dashboard</a>
+      <a class="nav-item" href="/routes">路由</a>
+    </nav>
+  </aside>
+  <main class="page">
   <div class="top"><h1>对话日志</h1><div class="clock" id="clock">{{fmtTime .Now}}</div></div>
   <form class="filters" method="get">
     <select name="month" id="month-filter">
@@ -384,7 +480,8 @@ const indexHTML = `
       </tbody>
     </table>
   </section>
-</main>
+  </main>
+</div>
 <script>
 const initialConversations = {{toJSON .Conversations}};
 const initialSubagentLinks = {{toJSON .SubagentLinks}};
@@ -666,12 +763,29 @@ function contentText(content){
     return stringify(part);
   }).filter(Boolean).join('\n');
 }
-// systemText 取顶层系统提示:Codex 用 instructions,Claude(Anthropic)用 system(可为字符串或内容块数组)。
+// looksInjectedBlock 判断一段文本是否是注入的上下文块(权限/环境/技能规则等),
+// 这些不算系统提示,单独在「上下文」tab 展示。
+function looksInjectedBlock(text){
+  const t = String(text || '').trim();
+  return /^<(?:permissions instructions|environment_context|app-context|collaboration_mode|skills_instructions|plugins_instructions|user_instructions)>/.test(t) || t.startsWith('# AGENTS.md');
+}
+// systemText 取系统提示:老 Codex 用顶层 instructions,Claude 用顶层 system;
+// 新版 Codex 把系统提示放在 input 的 developer/system 消息里(排除 additional_tools 与注入上下文块)。
 function systemText(body){
   if (!body || typeof body !== 'object') return '';
   if (body.instructions) return String(body.instructions);
   if (typeof body.system === 'string') return body.system;
   if (Array.isArray(body.system)) return contentText(body.system);
+  if (Array.isArray(body.input)) {
+    const parts = [];
+    body.input.forEach(item => {
+      if (!item || typeof item !== 'object' || item.type === 'additional_tools') return;
+      if (item.role !== 'developer' && item.role !== 'system') return;
+      const text = contentText(item.content).trim();
+      if (text && !looksInjectedBlock(text)) parts.push(text);
+    });
+    if (parts.length) return parts.join('\n\n');
+  }
   return '';
 }
 function requestMessages(body){
@@ -696,8 +810,32 @@ function toolName(tool){
   if (tool.type && tool.type !== 'function') return tool.type;
   return '';
 }
+// collectRawTools 收集所有工具定义:老格式在顶层 tools;新版 Codex 在 input 里
+// type=additional_tools 的条目。namespace 分组会展开成带前缀名的子工具。
+function collectRawTools(body){
+  const out = [];
+  const push = arr => {
+    (Array.isArray(arr) ? arr : []).forEach(tool => {
+      if (!tool || typeof tool !== 'object') return;
+      if (tool.type === 'namespace' && Array.isArray(tool.tools)) {
+        tool.tools.forEach(sub => {
+          if (sub && typeof sub === 'object') out.push(Object.assign({}, sub, {name: (tool.name ? tool.name + '.' : '') + (toolName(sub) || 'unknown')}));
+        });
+      } else {
+        out.push(tool);
+      }
+    });
+  };
+  if (body && Array.isArray(body.tools)) push(body.tools);
+  if (body && Array.isArray(body.input)) {
+    body.input.forEach(item => {
+      if (item && item.type === 'additional_tools') push(item.tools);
+    });
+  }
+  return out;
+}
 function toolDetails(body){
-  return Array.isArray(body?.tools) ? body.tools.map(tool => {
+  return collectRawTools(body).map(tool => {
     const params = tool.parameters || tool.input_schema || tool.function?.parameters || {};
     const properties = params && typeof params === 'object' && params.properties && typeof params.properties === 'object' ? params.properties : {};
     return {
@@ -707,7 +845,7 @@ function toolDetails(body){
       required: Array.isArray(params.required) ? params.required : [],
       properties
     };
-  }) : [];
+  });
 }
 function skillDetails(messages){
   const skills = [];
@@ -987,6 +1125,7 @@ function runtimeRows(body, t){
     ['include', stringify(body?.include)],
     ['prompt_cache_key', body?.prompt_cache_key],
     ['text', stringify(body?.text)],
+    ['client_metadata', stringify(body?.client_metadata)],
     ['request_bytes', t.RequestBytes || 0],
     ['response_bytes', t.ResponseBytes || 0],
   ];
@@ -1233,6 +1372,239 @@ async function refreshDetail(forceRender){
 lastPayload = JSON.stringify(initialData);
 renderTraces(initialData.traces || []);
 setInterval(() => refreshDetail().catch(() => {}), 1000);
+</script>
+</body>
+</html>
+{{end}}
+`
+
+const routesHTML = `
+{{define "routes"}}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>路由 · AGENT-GO-PROXY</title>
+  <link rel="icon" type="image/jpeg" href="/assets/favicon.jpg">
+  <style>
+    :root{--bg:#f6f7fb;--panel:#fff;--line:#dfe5ee;--text:#20242c;--muted:#6f7787;--blue:#2f6fed;--green:#139a55;--orange:#d46f1e;--red:#c94040;--purple:#6750d8}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}
+    .app{display:flex;min-height:100vh}
+    .sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;align-self:flex-start;height:100vh}
+    .sidebar .brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;padding:6px 10px 18px}
+    .nav-item{display:block;padding:10px 12px;border-radius:8px;color:var(--text);font-weight:500;margin-bottom:4px}
+    .nav-item:hover{background:#eef2fa}
+    .nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}
+    .page{flex:1;min-width:0;padding:22px 28px 56px}
+    .top{display:flex;align-items:center;gap:16px}.top h1{font-size:18px;font-weight:600;margin:0;flex:1}
+    button{cursor:pointer;height:42px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:0 14px;font:inherit;color:var(--text)}
+    .btn-primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}
+    .btn-primary:hover{background:#265fd0}
+    .table{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05);overflow-x:auto}
+    table{width:100%;min-width:820px;border-collapse:collapse}
+    th,td{padding:14px 16px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+    th{font-size:12px;color:#606a7a;font-weight:600;letter-spacing:.04em;background:#fbfcfe}
+    tr:last-child td{border-bottom:0}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+    .muted{color:var(--muted)}
+    .pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600;color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}
+    .tag{display:inline-block;border-radius:6px;padding:3px 9px;font-size:12px;font-weight:600;color:#2469e8;background:#edf4ff;border:1px solid #c6d9ff}
+    .action{display:inline-flex;align-items:center;justify-content:center;min-width:44px;height:30px;border:1px solid var(--line);padding:0 12px;border-radius:7px;background:#fff;font-weight:500}
+    .action + .action{margin-left:6px}
+    .delete-btn{color:var(--red);border-color:#f0b3b3;background:#fff6f6}.delete-btn:hover{background:#fff1f1;border-color:#e07d7d}
+    .switch{display:inline-flex;align-items:center;justify-content:center;min-width:60px;height:30px;padding:0 16px;border-radius:16px;border:1px solid var(--line);background:#fff;color:var(--muted);font-weight:700;font-size:12px;letter-spacing:.06em;cursor:pointer}
+    .switch:hover{border-color:#b8c7dc}
+    .switch.on{background:var(--green);border-color:var(--green);color:#fff}
+    .switch.on:hover{background:#0f8548}
+    .overlay{display:none;position:fixed;inset:0;background:rgba(22,28,40,.4);align-items:center;justify-content:center;z-index:20}
+    .overlay.show{display:flex}
+    .modal{width:460px;max-width:calc(100vw - 32px);background:#fff;border-radius:12px;box-shadow:0 12px 40px rgba(20,30,50,.24);padding:24px}
+    .modal h2{margin:0 0 18px;font-size:16px}
+    .field{margin-bottom:14px}
+    .field-row{display:flex;gap:12px}.field-row .field{flex:1;margin-bottom:14px}
+    .field label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px}
+    .field input,.field select{width:100%;height:40px;border:1px solid var(--line);border-radius:7px;padding:0 12px;font:inherit;color:var(--text);background:#fff}
+    .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+    .empty{padding:38px 16px;text-align:center;color:var(--muted)}
+    .err{color:var(--red);font-size:13px;min-height:18px;margin-top:4px}
+  </style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">AGENT-GO-PROXY</div>
+    <nav>
+      <a class="nav-item" href="/">Dashboard</a>
+      <a class="nav-item active" href="/routes">路由</a>
+    </nav>
+  </aside>
+  <main class="page">
+    <div class="top"><h1>路由 · 第三方 API 配置</h1><button class="btn-primary" id="add-btn">+ 添加配置</button></div>
+    <section class="table">
+      <table>
+        <thead><tr><th>名称</th><th>Base URL</th><th>API</th><th>接口协议</th><th>Model</th><th>API Key</th><th style="width:90px">启用</th><th style="width:150px">操作</th></tr></thead>
+        <tbody id="route-rows"></tbody>
+      </table>
+      <div class="empty" id="empty-tip" style="display:none">还没有配置。点击右上角「添加配置」新建一个。</div>
+    </section>
+  </main>
+</div>
+
+<div class="overlay" id="modal-overlay">
+  <div class="modal">
+    <h2 id="modal-title">添加配置</h2>
+    <div class="field"><label>名称</label><input id="f-name" placeholder="便于识别的名称，可留空"></div>
+    <div class="field"><label>Base URL</label><input id="f-base-url" placeholder="https://api.example.com/v1"></div>
+    <div class="field-row">
+      <div class="field"><label>API</label><select id="f-api-style"></select></div>
+      <div class="field"><label>接口协议</label><select id="f-protocol"></select></div>
+    </div>
+    <div class="field"><label>Model</label><input id="f-model" placeholder="gpt-4o / claude-sonnet-... 可留空"></div>
+    <div class="field"><label>API Key</label><input id="f-api-key" placeholder="sk-..." autocomplete="off"></div>
+    <div class="err" id="modal-err"></div>
+    <div class="modal-actions">
+      <button id="cancel-btn">取消</button>
+      <button class="btn-primary" id="save-btn">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const maskKey = k => {
+  k = String(k || '');
+  if (!k) return '<span class="muted">—</span>';
+  if (k.length <= 8) return esc('••••' + k.slice(-2));
+  return esc(k.slice(0, 4) + '••••••' + k.slice(-4));
+};
+// API 风格 → 展示名。接口协议按风格联动(需与后端 store.go routeProtocols 保持一致)。
+const STYLES = [{value:'openai', label:'OpenAI'}, {value:'anthropic', label:'Anthropic'}];
+const PROTOCOLS = {
+  openai: [
+    {value:'chat_completions', label:'Chat Completions API'},
+    {value:'responses', label:'Responses API'},
+  ],
+  anthropic: [
+    {value:'messages', label:'Messages API'},
+    {value:'chat_completions', label:'Chat Completions API'},
+  ],
+};
+const styleLabel = v => (STYLES.find(s => s.value === v) || {}).label || v || '';
+const protocolLabel = (style, v) => ((PROTOCOLS[style] || []).find(p => p.value === v) || {}).label || v || '';
+let routes = [];
+let editingId = null;
+const overlay = document.getElementById('modal-overlay');
+const errBox = document.getElementById('modal-err');
+
+function renderRows(){
+  const tbody = document.getElementById('route-rows');
+  const empty = document.getElementById('empty-tip');
+  if (!routes.length){
+    tbody.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  tbody.innerHTML = routes.map(r =>
+    '<tr>' +
+      '<td>' + (r.name ? esc(r.name) : '<span class="muted">未命名</span>') + '</td>' +
+      '<td class="mono">' + esc(r.base_url || '') + '</td>' +
+      '<td>' + (r.api_style ? '<span class="tag">' + esc(styleLabel(r.api_style)) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td>' + (r.protocol ? esc(protocolLabel(r.api_style, r.protocol)) : '<span class="muted">—</span>') + '</td>' +
+      '<td>' + (r.model ? '<span class="pill">' + esc(r.model) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td class="mono">' + maskKey(r.api_key) + '</td>' +
+      '<td><button class="switch' + (r.enabled ? ' on' : '') + '" data-toggle="' + r.id + '">' + (r.enabled ? 'ON' : 'OFF') + '</button></td>' +
+      '<td>' +
+        '<button class="action" data-edit="' + r.id + '">编辑</button>' +
+        '<button class="action delete-btn" data-delete="' + r.id + '">删除</button>' +
+      '</td>' +
+    '</tr>'
+  ).join('');
+}
+
+function fillSelect(select, options){
+  select.innerHTML = options.map(o => '<option value="' + esc(o.value) + '">' + esc(o.label) + '</option>').join('');
+}
+// 接口协议选项跟随 API 风格联动;keepValue 用于编辑回填时保留已保存的协议。
+function syncProtocolOptions(keepValue){
+  const style = document.getElementById('f-api-style').value;
+  const protoSelect = document.getElementById('f-protocol');
+  fillSelect(protoSelect, PROTOCOLS[style] || []);
+  if (keepValue && (PROTOCOLS[style] || []).some(p => p.value === keepValue)) {
+    protoSelect.value = keepValue;
+  }
+}
+
+async function loadRoutes(){
+  const rsp = await fetch('/api/routes', {cache:'no-store'});
+  if (!rsp.ok) return;
+  routes = await rsp.json() || [];
+  renderRows();
+}
+
+function openModal(route){
+  editingId = route ? route.id : null;
+  document.getElementById('modal-title').textContent = route ? '编辑配置' : '添加配置';
+  document.getElementById('f-name').value = route ? (route.name || '') : '';
+  document.getElementById('f-base-url').value = route ? (route.base_url || '') : '';
+  document.getElementById('f-model').value = route ? (route.model || '') : '';
+  document.getElementById('f-api-key').value = route ? (route.api_key || '') : '';
+  const styleSelect = document.getElementById('f-api-style');
+  fillSelect(styleSelect, STYLES);
+  styleSelect.value = (route && route.api_style) || 'openai';
+  syncProtocolOptions(route ? route.protocol : '');
+  errBox.textContent = '';
+  overlay.classList.add('show');
+  document.getElementById('f-base-url').focus();
+}
+function closeModal(){ overlay.classList.remove('show'); editingId = null; }
+
+async function saveRoute(){
+  const payload = {
+    name: document.getElementById('f-name').value.trim(),
+    base_url: document.getElementById('f-base-url').value.trim(),
+    api_style: document.getElementById('f-api-style').value,
+    protocol: document.getElementById('f-protocol').value,
+    model: document.getElementById('f-model').value.trim(),
+    api_key: document.getElementById('f-api-key').value.trim()
+  };
+  if (!payload.base_url){ errBox.textContent = 'Base URL 不能为空'; return; }
+  const url = editingId ? '/api/routes/' + editingId : '/api/routes';
+  const method = editingId ? 'PUT' : 'POST';
+  const rsp = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  if (!rsp.ok){ errBox.textContent = '保存失败：' + await rsp.text(); return; }
+  closeModal();
+  loadRoutes().catch(() => {});
+}
+
+async function toggleRoute(id){
+  const rsp = await fetch('/api/routes/' + id + '/toggle', {method:'POST'});
+  if (!rsp.ok){ alert('切换失败：' + await rsp.text()); return; }
+  loadRoutes().catch(() => {});
+}
+
+async function deleteRoute(id){
+  if (!confirm('确认删除这个配置吗？')) return;
+  const rsp = await fetch('/api/routes/' + id, {method:'DELETE'});
+  if (!rsp.ok){ alert('删除失败：' + await rsp.text()); return; }
+  loadRoutes().catch(() => {});
+}
+
+document.getElementById('add-btn').addEventListener('click', () => openModal(null));
+document.getElementById('cancel-btn').addEventListener('click', closeModal);
+document.getElementById('save-btn').addEventListener('click', () => saveRoute().catch(err => errBox.textContent = String(err)));
+document.getElementById('f-api-style').addEventListener('change', () => syncProtocolOptions());
+overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(); });
+document.getElementById('route-rows').addEventListener('click', e => {
+  const toggleBtn = e.target.closest('[data-toggle]');
+  if (toggleBtn){ toggleRoute(toggleBtn.dataset.toggle).catch(() => {}); return; }
+  const editBtn = e.target.closest('[data-edit]');
+  if (editBtn){ const r = routes.find(x => String(x.id) === editBtn.dataset.edit); if (r) openModal(r); return; }
+  const delBtn = e.target.closest('[data-delete]');
+  if (delBtn){ deleteRoute(delBtn.dataset.delete).catch(() => {}); }
+});
+loadRoutes().catch(() => {});
 </script>
 </body>
 </html>

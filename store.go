@@ -103,6 +103,33 @@ type AccountAliasOption struct {
 	DisplayName string
 }
 
+// APIRoute 是「路由」页配置的第三方 API 供应商,保存 Base URL / Model / API Key。
+// APIStyle(openai/anthropic)与 Protocol(接口协议)联动,Enabled 全表互斥只能一条为真。
+type APIRoute struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	BaseURL   string    `json:"base_url"`
+	Model     string    `json:"model"`
+	APIStyle  string    `json:"api_style"`
+	Protocol  string    `json:"protocol"`
+	APIKey    string    `json:"api_key"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// routeProtocols 定义每种 API 风格支持的接口协议(值→展示名),前后端各用一份保持一致。
+var routeProtocols = map[string]map[string]string{
+	"openai": {
+		"chat_completions": "Chat Completions API",
+		"responses":        "Responses API",
+	},
+	"anthropic": {
+		"messages":         "Messages API",
+		"chat_completions": "Chat Completions API",
+	},
+}
+
 type FilterOptions struct {
 	Months         []string
 	Dates          []string
@@ -225,6 +252,18 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at DATETIME(6) NOT NULL,
 			updated_at DATETIME(6) NOT NULL
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS api_routes (
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			name VARCHAR(128) NOT NULL DEFAULT '',
+			base_url VARCHAR(512) NOT NULL DEFAULT '',
+			model VARCHAR(128) NOT NULL DEFAULT '',
+			api_style VARCHAR(32) NOT NULL DEFAULT 'openai',
+			protocol VARCHAR(64) NOT NULL DEFAULT '',
+			api_key VARCHAR(512) NOT NULL DEFAULT '',
+			enabled TINYINT(1) NOT NULL DEFAULT 0,
+			created_at DATETIME(6) NOT NULL,
+			updated_at DATETIME(6) NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -254,6 +293,16 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.repairInjectedPrompts(ctx); err != nil {
+		return err
+	}
+	// api_routes 新增字段(旧库补迁移)
+	if err := s.ensureColumn(ctx, "api_routes", "api_style", "VARCHAR(32) NOT NULL DEFAULT 'openai' AFTER model"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "api_routes", "protocol", "VARCHAR(64) NOT NULL DEFAULT '' AFTER api_style"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "api_routes", "enabled", "TINYINT(1) NOT NULL DEFAULT 0 AFTER api_key"); err != nil {
 		return err
 	}
 	return nil
@@ -751,6 +800,151 @@ func (s *Store) Stats(ctx context.Context, query, status, month, date, agent, ac
 		return 0, 0, 0, 0, 0, err
 	}
 	return conversationCount, traceCount, inputTokens, outputTokens, cachedTokens, nil
+}
+
+func (s *Store) ListAPIRoutes(ctx context.Context) ([]APIRoute, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, base_url, model, api_style, protocol, api_key, enabled, created_at, updated_at
+		FROM api_routes ORDER BY updated_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]APIRoute, 0)
+	for rows.Next() {
+		var r APIRoute
+		if err := rows.Scan(&r.ID, &r.Name, &r.BaseURL, &r.Model, &r.APIStyle, &r.Protocol, &r.APIKey, &r.Enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// EnabledAPIRouteForStyle 返回指定 API 风格下当前启用的路由(每种风格至多一条)。
+// 无启用项时 ok=false。转发时按请求所属风格(codex→openai / claude→anthropic)选取。
+func (s *Store) EnabledAPIRouteForStyle(ctx context.Context, style string) (APIRoute, bool, error) {
+	var r APIRoute
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, base_url, model, api_style, protocol, api_key, enabled, created_at, updated_at
+		FROM api_routes WHERE enabled=1 AND api_style=? ORDER BY id LIMIT 1`, style).
+		Scan(&r.ID, &r.Name, &r.BaseURL, &r.Model, &r.APIStyle, &r.Protocol, &r.APIKey, &r.Enabled, &r.CreatedAt, &r.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r, false, nil
+	}
+	if err != nil {
+		return r, false, err
+	}
+	return r, true, nil
+}
+
+func (s *Store) CreateAPIRoute(ctx context.Context, in APIRoute) (int64, error) {
+	if err := validateAPIRoute(&in); err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	res, err := s.db.ExecContext(ctx, `INSERT INTO api_routes (name, base_url, model, api_style, protocol, api_key, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, in.Name, in.BaseURL, in.Model, in.APIStyle, in.Protocol, in.APIKey, now, now)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *Store) UpdateAPIRoute(ctx context.Context, id int64, in APIRoute) error {
+	if err := validateAPIRoute(&in); err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE api_routes SET name=?, base_url=?, model=?, api_style=?, protocol=?, api_key=?, updated_at=? WHERE id=?`,
+		in.Name, in.BaseURL, in.Model, in.APIStyle, in.Protocol, in.APIKey, time.Now(), id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// ToggleAPIRoute 切换某条配置的启用状态,并保证全表互斥:开启一条会关闭其余所有。
+// 返回切换后的启用状态。
+func (s *Store) ToggleAPIRoute(ctx context.Context, id int64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var enabled bool
+	var style string
+	if err := tx.QueryRowContext(ctx, `SELECT enabled, api_style FROM api_routes WHERE id=? FOR UPDATE`, id).Scan(&enabled, &style); err != nil {
+		return false, err
+	}
+	// 只切 enabled 状态,不动 updated_at,避免列表按 updated_at 排序时启用项跳到最前。
+	if enabled {
+		// 当前已开 → 关掉它
+		if _, err := tx.ExecContext(ctx, `UPDATE api_routes SET enabled=0 WHERE id=?`, id); err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
+	}
+	// 当前关闭 → 先关掉同一 API 风格下的其它启用项(按风格互斥,每种风格至多一条),再开这条
+	if _, err := tx.ExecContext(ctx, `UPDATE api_routes SET enabled=0 WHERE enabled=1 AND api_style=?`, style); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE api_routes SET enabled=1 WHERE id=?`, id); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *Store) DeleteAPIRoute(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM api_routes WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// validateAPIRoute 归一化字段并校验必填项与长度,避免超出列宽被数据库截断。
+func validateAPIRoute(in *APIRoute) error {
+	in.Name = strings.TrimSpace(in.Name)
+	in.BaseURL = strings.TrimSpace(in.BaseURL)
+	in.Model = strings.TrimSpace(in.Model)
+	in.APIKey = strings.TrimSpace(in.APIKey)
+	in.APIStyle = strings.TrimSpace(strings.ToLower(in.APIStyle))
+	in.Protocol = strings.TrimSpace(in.Protocol)
+	if in.BaseURL == "" {
+		return errors.New("Base URL 不能为空")
+	}
+	if len(in.Name) > 128 || len(in.Model) > 128 {
+		return errors.New("名称 / Model 过长")
+	}
+	if len(in.BaseURL) > 512 || len(in.APIKey) > 512 {
+		return errors.New("Base URL / API Key 过长")
+	}
+	if in.APIStyle == "" {
+		in.APIStyle = "openai"
+	}
+	protocols, ok := routeProtocols[in.APIStyle]
+	if !ok {
+		return errors.New("API 风格不合法")
+	}
+	if in.Protocol != "" {
+		if _, ok := protocols[in.Protocol]; !ok {
+			return errors.New("接口协议与 API 风格不匹配")
+		}
+	}
+	return nil
 }
 
 func nullJSON(raw []byte) any {

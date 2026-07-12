@@ -50,6 +50,15 @@ func requestMetaFromHTTP(r *http.Request, body []byte, provider string) requestM
 	return requestMetaFromHeaders(r.Header, body, provider)
 }
 
+// modelFromBody 轻量解析请求体里的 model,用于日志按模型分文件。
+func modelFromBody(body []byte) string {
+	var parsed struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &parsed)
+	return strings.TrimSpace(parsed.Model)
+}
+
 func requestMetaFromHeaders(headers http.Header, body []byte, provider string) requestMeta {
 	if provider == providerClaude {
 		return claudeRequestMeta(headers, body)
