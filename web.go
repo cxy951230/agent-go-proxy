@@ -63,7 +63,7 @@ var baseTemplate = template.Must(template.New("base").Funcs(template.FuncMap{
 			return "ok"
 		}
 	},
-}).Parse(indexHTML + detailHTML + routesHTML))
+}).Parse(indexHTML + detailHTML + routesHTML + chainsHTML))
 
 func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -281,6 +281,12 @@ func (p *proxyServer) handleRoutes(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (p *proxyServer) handleChains(w http.ResponseWriter, r *http.Request) {
+	if err := baseTemplate.ExecuteTemplate(w, "chains", nil); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
 func (p *proxyServer) handleAPIRoutesList(w http.ResponseWriter, r *http.Request) {
 	routes, err := p.store.ListAPIRoutes(r.Context())
 	writeJSON(w, routes, err)
@@ -355,6 +361,91 @@ func (p *proxyServer) handleAPIRouteToggle(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "enabled": enabled}, nil)
+}
+
+func (p *proxyServer) handleAPIChainsList(w http.ResponseWriter, r *http.Request) {
+	chains, err := p.store.ListChainProxies(r.Context())
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	routes, err := p.store.ListAPIRoutes(r.Context())
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"chains": chains, "routes": routes}, nil)
+}
+
+func (p *proxyServer) handleAPIChainCreate(w http.ResponseWriter, r *http.Request) {
+	var chain ChainProxy
+	if err := json.NewDecoder(r.Body).Decode(&chain); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	id, err := p.store.CreateChainProxy(r.Context(), chain)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "id": id}, nil)
+}
+
+func (p *proxyServer) handleAPIChainUpdate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad chain id", http.StatusBadRequest)
+		return
+	}
+	var chain ChainProxy
+	if err := json.NewDecoder(r.Body).Decode(&chain); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if err := p.store.UpdateChainProxy(r.Context(), id, chain); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "chain not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true}, nil)
+}
+
+func (p *proxyServer) handleAPIChainToggle(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad chain id", http.StatusBadRequest)
+		return
+	}
+	enabled, err := p.store.ToggleChainProxy(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "chain not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "enabled": enabled}, nil)
+}
+
+func (p *proxyServer) handleAPIChainDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad chain id", http.StatusBadRequest)
+		return
+	}
+	if err := p.store.DeleteChainProxy(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "chain not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true}, nil)
 }
 
 func writeJSON(w http.ResponseWriter, data any, err error) {
@@ -449,6 +540,7 @@ const indexHTML = `
     <nav>
       <a class="nav-item active" href="/">Dashboard</a>
       <a class="nav-item" href="/routes">路由</a>
+      <a class="nav-item" href="/chains">链式代理</a>
     </nav>
   </aside>
   <main class="page">
@@ -776,6 +868,256 @@ window.addEventListener('scroll', () => {
   }
 });
 setInterval(() => refreshDashboard().catch(() => {}), 3000);
+</script>
+</body>
+</html>
+{{end}}
+`
+
+const chainsHTML = `
+{{define "chains"}}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>链式代理 · AGENT-GO-PROXY</title>
+  <link rel="icon" type="image/jpeg" href="/assets/favicon.jpg">
+  <style>
+    :root{--bg:#f6f7fb;--panel:#fff;--line:#dfe5ee;--text:#20242c;--muted:#6f7787;--blue:#2f6fed;--green:#139a55;--red:#c94040;--purple:#6750d8}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}
+    .app{display:flex;min-height:100vh}
+    .sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;align-self:flex-start;height:100vh;transition:width .16s ease,padding .16s ease}
+    .sidebar .brand-row{display:flex;align-items:center;gap:8px;padding:6px 2px 18px 10px}.sidebar .brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;flex:1;white-space:nowrap;overflow:hidden}
+    .sidebar-toggle{width:30px;height:30px;padding:0;border-radius:7px;border:1px solid var(--line);background:#fff;color:#667284;font-weight:800}
+    .app.sidebar-collapsed .sidebar{width:58px;padding-left:10px;padding-right:10px}.app.sidebar-collapsed .brand{display:none}.app.sidebar-collapsed .nav-item{padding:10px 0;text-align:center;font-size:0}.app.sidebar-collapsed .nav-item::first-letter{font-size:15px}.app.sidebar-collapsed .sidebar-toggle{transform:rotate(180deg)}
+    .nav-item{display:block;padding:10px 12px;border-radius:8px;color:var(--text);font-weight:500;margin-bottom:4px}
+    .nav-item:hover{background:#eef2fa}
+    .nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}
+    .page{flex:1;min-width:0;padding:22px 28px 56px}
+    .top{display:flex;align-items:center;gap:16px}.top h1{font-size:18px;font-weight:600;margin:0;flex:1}
+    button{cursor:pointer;height:42px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:0 14px;font:inherit;color:var(--text)}
+    .btn-primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}.btn-primary:hover{background:#265fd0}
+    .table{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05);overflow-x:auto}
+    table{width:100%;min-width:900px;border-collapse:collapse}th,td{padding:14px 16px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{font-size:12px;color:#606a7a;font-weight:600;letter-spacing:.04em;background:#fbfcfe}tr:last-child td{border-bottom:0}
+    .muted{color:var(--muted)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+    .tag{display:inline-block;border-radius:6px;padding:3px 9px;font-size:12px;font-weight:600;color:#2469e8;background:#edf4ff;border:1px solid #c6d9ff}.pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600;color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}
+    .route-stack{display:grid;gap:6px}.route-chip{display:inline-flex;align-items:center;gap:8px;max-width:100%;padding:5px 9px;border:1px solid #d8e0eb;border-radius:7px;background:#f8fafc}.order{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:#2f6fed;color:#fff;font-size:12px;font-weight:800}.route-name{font-weight:700}.route-model{color:#6b55d9}
+    .action{display:inline-flex;align-items:center;justify-content:center;min-width:44px;height:30px;border:1px solid var(--line);padding:0 12px;border-radius:7px;background:#fff;font-weight:500}.action + .action{margin-left:6px}
+    .delete-btn{color:var(--red);border-color:#f0b3b3;background:#fff6f6}.delete-btn:hover{background:#fff1f1;border-color:#e07d7d}
+    .switch{display:inline-flex;align-items:center;justify-content:center;min-width:60px;height:30px;padding:0 16px;border-radius:16px;border:1px solid var(--line);background:#fff;color:var(--muted);font-weight:700;font-size:12px;letter-spacing:.06em;cursor:pointer}.switch.on{background:var(--green);border-color:var(--green);color:#fff}
+    .overlay{display:none;position:fixed;inset:0;background:rgba(22,28,40,.4);align-items:center;justify-content:center;z-index:20}.overlay.show{display:flex}
+    .modal{width:620px;max-width:calc(100vw - 32px);background:#fff;border-radius:12px;box-shadow:0 12px 40px rgba(20,30,50,.24);padding:24px}.modal h2{margin:0 0 18px;font-size:16px}
+    .field{margin-bottom:14px}.field-row{display:flex;gap:12px}.field-row .field{flex:1}.field label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px}.field input,.field select{width:100%;height:40px;border:1px solid var(--line);border-radius:7px;padding:0 12px;font:inherit;color:var(--text);background:#fff}
+    .route-picker{max-height:310px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:#fbfcfe}.route-option{display:grid;grid-template-columns:34px 1fr auto;gap:10px;align-items:center;width:100%;height:auto;border:0;border-bottom:1px solid var(--line);border-radius:0;background:transparent;padding:12px 14px;text-align:left}.route-option:last-child{border-bottom:0}.route-option.selected{background:#eaf1ff}.rank{display:grid;place-items:center;width:26px;height:26px;border-radius:50%;border:1px solid #c7d7fb;color:#2f6fed;font-weight:800}.route-option:not(.selected) .rank{color:#a0a8b7;border-color:#d8e0eb}.route-meta{color:#697386;font-size:12px;margin-top:3px;word-break:break-all}.selected-list{min-height:28px;color:#596474}.selected-chip{display:inline-flex;align-items:center;gap:8px;margin:0 6px 6px 0}.selected-remove{display:inline-grid;place-items:center;width:20px;height:20px;padding:0;border:1px solid #cfd8e7;border-radius:50%;background:#fff;color:#7b8494;font-weight:800;line-height:1}.selected-remove:hover{border-color:#e07d7d;color:#c94040;background:#fff6f6}.empty{padding:38px 16px;text-align:center;color:var(--muted)}.err{color:var(--red);font-size:13px;min-height:18px;margin-top:4px}.modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+  </style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand-row"><div class="brand">AGENT-GO-PROXY</div><button class="sidebar-toggle" id="sidebar-toggle" type="button" title="收起/展开侧栏">‹</button></div>
+    <nav>
+      <a class="nav-item" href="/">Dashboard</a>
+      <a class="nav-item" href="/routes">路由</a>
+      <a class="nav-item active" href="/chains">链式代理</a>
+    </nav>
+  </aside>
+  <main class="page">
+    <div class="top"><h1>链式代理</h1><button class="btn-primary" id="add-btn">+ 添加链式代理</button></div>
+    <section class="table">
+      <table>
+        <thead><tr><th>名称</th><th>API</th><th>链路顺序</th><th style="width:90px">启用</th><th style="width:150px">操作</th></tr></thead>
+        <tbody id="chain-rows"></tbody>
+      </table>
+      <div class="empty" id="empty-tip" style="display:none">还没有链式代理。点击右上角添加一个。</div>
+    </section>
+  </main>
+</div>
+
+<div class="overlay" id="modal-overlay">
+  <div class="modal">
+    <h2 id="modal-title">添加链式代理</h2>
+    <div class="field-row">
+      <div class="field"><label>名称</label><input id="f-name" placeholder="便于识别的名称，可留空"></div>
+      <div class="field"><label>API 类型</label><select id="f-api-style"></select></div>
+    </div>
+    <div class="field">
+      <label>选择路由</label>
+      <div class="route-picker" id="route-picker"></div>
+    </div>
+    <div class="field">
+      <label>当前顺序</label>
+      <div class="selected-list" id="selected-list">未选择路由</div>
+    </div>
+    <div class="err" id="modal-err"></div>
+    <div class="modal-actions">
+      <button id="cancel-btn">取消</button>
+      <button class="btn-primary" id="save-btn">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const appEl = document.querySelector('.app');
+if (localStorage.getItem('sidebarCollapsed') === '1') appEl.classList.add('sidebar-collapsed');
+document.getElementById('sidebar-toggle').addEventListener('click', () => {
+  appEl.classList.toggle('sidebar-collapsed');
+  localStorage.setItem('sidebarCollapsed', appEl.classList.contains('sidebar-collapsed') ? '1' : '0');
+});
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const STYLES = [{value:'openai', label:'OpenAI'}, {value:'anthropic', label:'Anthropic'}];
+const styleLabel = v => (STYLES.find(s => s.value === v) || {}).label || v || '';
+let chains = [];
+let routes = [];
+let editingId = null;
+let selectedRouteIDs = [];
+const overlay = document.getElementById('modal-overlay');
+const errBox = document.getElementById('modal-err');
+const styleSelect = document.getElementById('f-api-style');
+
+function fillStyleSelect(){
+  styleSelect.innerHTML = STYLES.map(s => '<option value="' + esc(s.value) + '">' + esc(s.label) + '</option>').join('');
+}
+function routeLabel(route){
+  return route.name || route.model || route.base_url || ('Route #' + route.id);
+}
+function routesForStyle(style){
+  return routes.filter(r => r.api_style === style);
+}
+function selectedRoutes(){
+  const byID = new Map(routes.map(r => [String(r.id), r]));
+  return selectedRouteIDs.map(id => byID.get(String(id))).filter(Boolean);
+}
+function renderRows(){
+  const tbody = document.getElementById('chain-rows');
+  const empty = document.getElementById('empty-tip');
+  if (!chains.length){
+    tbody.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  tbody.innerHTML = chains.map(chain => {
+    const routeHTML = (chain.routes || []).map((r, idx) =>
+      '<span class="route-chip"><span class="order">' + (idx + 1) + '</span><span><span class="route-name">' + esc(routeLabel(r)) + '</span>' +
+      (r.model ? ' <span class="route-model">' + esc(r.model) + '</span>' : '') +
+      '<div class="route-meta">' + esc(r.base_url || '') + '</div></span></span>'
+    ).join('');
+    return '<tr>' +
+      '<td>' + (chain.name ? esc(chain.name) : '<span class="muted">未命名</span>') + '</td>' +
+      '<td><span class="tag">' + esc(styleLabel(chain.api_style)) + '</span></td>' +
+      '<td><div class="route-stack">' + (routeHTML || '<span class="muted">无路由</span>') + '</div></td>' +
+      '<td><button class="switch' + (chain.enabled ? ' on' : '') + '" data-toggle="' + chain.id + '">' + (chain.enabled ? 'ON' : 'OFF') + '</button></td>' +
+      '<td><button class="action" data-edit="' + chain.id + '">编辑</button><button class="action delete-btn" data-delete="' + chain.id + '">删除</button></td>' +
+    '</tr>';
+  }).join('');
+}
+function renderPicker(){
+  const picker = document.getElementById('route-picker');
+  const style = styleSelect.value;
+  const list = routesForStyle(style);
+  if (!list.length) {
+    picker.innerHTML = '<div class="empty">这个 API 类型下还没有路由配置。</div>';
+    document.getElementById('selected-list').textContent = '未选择路由';
+    return;
+  }
+  picker.innerHTML = list.map(route => {
+    const idx = selectedRouteIDs.indexOf(route.id);
+    const selected = idx >= 0;
+    return '<button type="button" class="route-option' + (selected ? ' selected' : '') + '" data-route-id="' + route.id + '">' +
+      '<span class="rank">' + (selected ? idx + 1 : '+') + '</span>' +
+      '<span><strong>' + esc(routeLabel(route)) + '</strong><div class="route-meta">' + esc(route.base_url || '') + (route.model ? ' · ' + esc(route.model) : '') + '</div></span>' +
+      '<span class="pill">' + esc(route.protocol || '-') + '</span>' +
+    '</button>';
+  }).join('');
+  const picked = selectedRoutes();
+  document.getElementById('selected-list').innerHTML = picked.length
+    ? picked.map((r, idx) => '<span class="route-chip selected-chip"><span class="order">' + (idx + 1) + '</span>' + esc(routeLabel(r)) + '<button type="button" class="selected-remove" data-remove-route-id="' + r.id + '" title="移除">×</button></span>').join(' ')
+    : '未选择路由';
+}
+async function loadData(){
+  const rsp = await fetch('/api/chains', {cache:'no-store'});
+  if (!rsp.ok) return;
+  const data = await rsp.json();
+  chains = data.chains || [];
+  routes = data.routes || [];
+  renderRows();
+}
+function openModal(chain){
+  editingId = chain ? chain.id : null;
+  document.getElementById('modal-title').textContent = chain ? '编辑链式代理' : '添加链式代理';
+  document.getElementById('f-name').value = chain ? (chain.name || '') : '';
+  fillStyleSelect();
+  styleSelect.value = (chain && chain.api_style) || 'openai';
+  selectedRouteIDs = chain ? (chain.route_ids || []).slice() : [];
+  selectedRouteIDs = selectedRouteIDs.filter(id => routes.some(r => r.id === id && r.api_style === styleSelect.value));
+  errBox.textContent = '';
+  renderPicker();
+  overlay.classList.add('show');
+}
+function closeModal(){
+  overlay.classList.remove('show');
+  editingId = null;
+  selectedRouteIDs = [];
+}
+async function saveChain(){
+  const payload = {
+    name: document.getElementById('f-name').value.trim(),
+    api_style: styleSelect.value,
+    route_ids: selectedRouteIDs
+  };
+  if (!payload.route_ids.length){ errBox.textContent = '请至少选择一个路由'; return; }
+  const url = editingId ? '/api/chains/' + editingId : '/api/chains';
+  const method = editingId ? 'PUT' : 'POST';
+  const rsp = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  if (!rsp.ok){ errBox.textContent = '保存失败：' + await rsp.text(); return; }
+  closeModal();
+  loadData().catch(() => {});
+}
+async function toggleChain(id){
+  const rsp = await fetch('/api/chains/' + id + '/toggle', {method:'POST'});
+  if (!rsp.ok){ alert('切换失败：' + await rsp.text()); return; }
+  loadData().catch(() => {});
+}
+async function deleteChain(id){
+  if (!confirm('确认删除这个链式代理吗？')) return;
+  const rsp = await fetch('/api/chains/' + id, {method:'DELETE'});
+  if (!rsp.ok){ alert('删除失败：' + await rsp.text()); return; }
+  loadData().catch(() => {});
+}
+document.getElementById('add-btn').addEventListener('click', () => openModal(null));
+document.getElementById('cancel-btn').addEventListener('click', closeModal);
+document.getElementById('save-btn').addEventListener('click', () => saveChain().catch(err => errBox.textContent = String(err)));
+styleSelect.addEventListener('change', () => {
+  selectedRouteIDs = [];
+  renderPicker();
+});
+document.getElementById('route-picker').addEventListener('click', event => {
+  const btn = event.target.closest('[data-route-id]');
+  if (!btn) return;
+  const id = Number(btn.dataset.routeId);
+  const idx = selectedRouteIDs.indexOf(id);
+  if (idx >= 0) selectedRouteIDs.splice(idx, 1);
+  else selectedRouteIDs.push(id);
+  renderPicker();
+});
+document.getElementById('selected-list').addEventListener('click', event => {
+  const btn = event.target.closest('[data-remove-route-id]');
+  if (!btn) return;
+  const id = Number(btn.dataset.removeRouteId);
+  selectedRouteIDs = selectedRouteIDs.filter(value => value !== id);
+  renderPicker();
+});
+document.getElementById('chain-rows').addEventListener('click', event => {
+  const toggleBtn = event.target.closest('[data-toggle]');
+  if (toggleBtn){ toggleChain(toggleBtn.dataset.toggle).catch(() => {}); return; }
+  const editBtn = event.target.closest('[data-edit]');
+  if (editBtn){ const chain = chains.find(x => String(x.id) === editBtn.dataset.edit); if (chain) openModal(chain); return; }
+  const delBtn = event.target.closest('[data-delete]');
+  if (delBtn){ deleteChain(delBtn.dataset.delete).catch(() => {}); }
+});
+overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(); });
+loadData().catch(() => {});
 </script>
 </body>
 </html>
@@ -1530,6 +1872,7 @@ const routesHTML = `
     <nav>
       <a class="nav-item" href="/">Dashboard</a>
       <a class="nav-item active" href="/routes">路由</a>
+      <a class="nav-item" href="/chains">链式代理</a>
     </nav>
   </aside>
   <main class="page">

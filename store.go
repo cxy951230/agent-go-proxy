@@ -118,6 +118,19 @@ type APIRoute struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// ChainProxy 是链式代理配置:同一种 API 风格下按 route_ids 顺序尝试多个路由。
+// 这里只负责配置保存与启用状态,实际转发链路另行接入。
+type ChainProxy struct {
+	ID        int64      `json:"id"`
+	Name      string     `json:"name"`
+	APIStyle  string     `json:"api_style"`
+	RouteIDs  []int64    `json:"route_ids"`
+	Enabled   bool       `json:"enabled"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	Routes    []APIRoute `json:"routes,omitempty"`
+}
+
 // routeProtocols 定义每种 API 风格支持的接口协议(值→展示名),前后端各用一份保持一致。
 var routeProtocols = map[string]map[string]string{
 	"openai": {
@@ -263,6 +276,17 @@ func (s *Store) migrate(ctx context.Context) error {
 			enabled TINYINT(1) NOT NULL DEFAULT 0,
 			created_at DATETIME(6) NOT NULL,
 			updated_at DATETIME(6) NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS chain_proxies (
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			name VARCHAR(128) NOT NULL DEFAULT '',
+			api_style VARCHAR(32) NOT NULL DEFAULT 'openai',
+			route_ids JSON NOT NULL,
+			enabled TINYINT(1) NOT NULL DEFAULT 0,
+			created_at DATETIME(6) NOT NULL,
+			updated_at DATETIME(6) NOT NULL,
+			INDEX idx_chain_proxies_api_style (api_style),
+			INDEX idx_chain_proxies_updated_at (updated_at)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 	}
 	for _, stmt := range stmts {
@@ -936,6 +960,190 @@ func (s *Store) DeleteAPIRoute(ctx context.Context, id int64) error {
 	return nil
 }
 
+func (s *Store) ListChainProxies(ctx context.Context) ([]ChainProxy, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, api_style, route_ids, enabled, created_at, updated_at
+		FROM chain_proxies ORDER BY updated_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ChainProxy, 0)
+	for rows.Next() {
+		var item ChainProxy
+		var routeIDsRaw string
+		if err := rows.Scan(&item.ID, &item.Name, &item.APIStyle, &routeIDsRaw, &item.Enabled, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		item.RouteIDs = decodeInt64List(routeIDsRaw)
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.attachChainProxyRoutes(ctx, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) attachChainProxyRoutes(ctx context.Context, chains []ChainProxy) error {
+	if len(chains) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{})
+	var ids []int64
+	for _, chain := range chains {
+		for _, id := range chain.RouteIDs {
+			if id <= 0 {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, 0, len(ids))
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, base_url, model, api_style, protocol, api_key, enabled, created_at, updated_at
+		FROM api_routes WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	byID := make(map[int64]APIRoute)
+	for rows.Next() {
+		var r APIRoute
+		if err := rows.Scan(&r.ID, &r.Name, &r.BaseURL, &r.Model, &r.APIStyle, &r.Protocol, &r.APIKey, &r.Enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return err
+		}
+		byID[r.ID] = r
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range chains {
+		for _, id := range chains[i].RouteIDs {
+			if route, ok := byID[id]; ok {
+				chains[i].Routes = append(chains[i].Routes, route)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Store) CreateChainProxy(ctx context.Context, in ChainProxy) (int64, error) {
+	if err := validateChainProxy(&in); err != nil {
+		return 0, err
+	}
+	if err := s.validateChainProxyRoutes(ctx, in.APIStyle, in.RouteIDs); err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	routeIDs, _ := json.Marshal(in.RouteIDs)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO chain_proxies (name, api_style, route_ids, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)`, in.Name, in.APIStyle, string(routeIDs), now, now)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *Store) UpdateChainProxy(ctx context.Context, id int64, in ChainProxy) error {
+	if err := validateChainProxy(&in); err != nil {
+		return err
+	}
+	if err := s.validateChainProxyRoutes(ctx, in.APIStyle, in.RouteIDs); err != nil {
+		return err
+	}
+	routeIDs, _ := json.Marshal(in.RouteIDs)
+	res, err := s.db.ExecContext(ctx, `UPDATE chain_proxies SET name=?, api_style=?, route_ids=?, updated_at=? WHERE id=?`,
+		in.Name, in.APIStyle, string(routeIDs), time.Now(), id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) ToggleChainProxy(ctx context.Context, id int64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var enabled bool
+	var style string
+	if err := tx.QueryRowContext(ctx, `SELECT enabled, api_style FROM chain_proxies WHERE id=? FOR UPDATE`, id).Scan(&enabled, &style); err != nil {
+		return false, err
+	}
+	if enabled {
+		if _, err := tx.ExecContext(ctx, `UPDATE chain_proxies SET enabled=0 WHERE id=?`, id); err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE chain_proxies SET enabled=0 WHERE enabled=1 AND api_style=?`, style); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE chain_proxies SET enabled=1 WHERE id=?`, id); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *Store) DeleteChainProxy(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM chain_proxies WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) validateChainProxyRoutes(ctx context.Context, style string, routeIDs []int64) error {
+	if len(routeIDs) == 0 {
+		return errors.New("请至少选择一个路由")
+	}
+	placeholders := make([]string, 0, len(routeIDs))
+	args := make([]any, 0, len(routeIDs)+1)
+	args = append(args, style)
+	for _, id := range routeIDs {
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM api_routes WHERE api_style=? AND id IN (`+strings.Join(placeholders, ",")+`)`, args...).Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count != len(routeIDs) {
+		return errors.New("选择的路由与 API 类型不匹配或不存在")
+	}
+	return nil
+}
+
 // validateAPIRoute 归一化字段并校验必填项与长度,避免超出列宽被数据库截断。
 func validateAPIRoute(in *APIRoute) error {
 	in.Name = strings.TrimSpace(in.Name)
@@ -966,6 +1174,43 @@ func validateAPIRoute(in *APIRoute) error {
 		}
 	}
 	return nil
+}
+
+func validateChainProxy(in *ChainProxy) error {
+	in.Name = strings.TrimSpace(in.Name)
+	in.APIStyle = strings.TrimSpace(strings.ToLower(in.APIStyle))
+	if in.APIStyle == "" {
+		in.APIStyle = "openai"
+	}
+	if _, ok := routeProtocols[in.APIStyle]; !ok {
+		return errors.New("API 风格不合法")
+	}
+	if len(in.Name) > 128 {
+		return errors.New("名称过长")
+	}
+	seen := make(map[int64]struct{})
+	out := make([]int64, 0, len(in.RouteIDs))
+	for _, id := range in.RouteIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return errors.New("请至少选择一个路由")
+	}
+	in.RouteIDs = out
+	return nil
+}
+
+func decodeInt64List(raw string) []int64 {
+	var values []int64
+	_ = json.Unmarshal([]byte(raw), &values)
+	return values
 }
 
 func nullJSON(raw []byte) any {
