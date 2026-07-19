@@ -24,6 +24,7 @@ type logEntry struct {
 	ResponseBody string              `json:"response_body"`
 	RequestHdrs  map[string][]string `json:"request_headers,omitempty"`
 	ResponseHdrs map[string][]string `json:"response_headers,omitempty"`
+	AdapterInfo  map[string]any      `json:"adapter_info,omitempty"`
 	Error        string              `json:"error,omitempty"`
 }
 

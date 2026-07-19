@@ -71,14 +71,15 @@ no_proxy=127.0.0.1,localhost \
 ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
 ```
 
-## 左侧菜单与路由页
+## 左侧菜单、路由页与链式代理页
 
-Web 页面左侧有侧边栏菜单，两项：
+Web 页面左侧有侧边栏菜单，三项：
 
 - `Dashboard`：原会话列表页（`/`）。
 - `路由`：第三方 API 配置页（`/routes`）。
+- `链式代理`：按顺序组合多个路由的配置页（`/chains`）。
 
-两页共用同一套侧边栏，当前页高亮。侧边栏支持收起/展开，状态保存在浏览器 `localStorage.sidebarCollapsed`，Dashboard 与路由页共享同一个折叠状态。路由页是对 `api_routes` 表的增删改查：
+各页共用同一套侧边栏，当前页高亮。侧边栏支持收起/展开，状态保存在浏览器 `localStorage.sidebarCollapsed`，Dashboard、路由页与链式代理页共享同一个折叠状态。路由页是对 `api_routes` 表的增删改查：
 
 - 每条配置字段：名称、Base URL、`API`（风格，openai / anthropic）、接口协议、Model、API Key、启用开关。
 - `API`（风格）与「接口协议」联动：openai → `Chat Completions API` / `Responses API`；anthropic → `Messages API` / `Chat Completions API`。前后端各存一份协议表（web.go `PROTOCOLS` 与 store.go `routeProtocols`），必须保持一致。
@@ -86,9 +87,21 @@ Web 页面左侧有侧边栏菜单，两项：
 - 启用开关（ON/OFF）点击直接切换、无二次确认，`ToggleAPIRoute` 只改 `enabled` 不动 `updated_at`（避免列表按 `updated_at` 排序时启用项跳到最前）。
 - **互斥粒度：每种 `api_style` 至多一条启用**（openai 一条、anthropic 一条可同时 ON）。开启一条时只关掉同风格的其它启用项。
 
+链式代理页是对 `chain_proxies` 表的增删改查：
+
+- 每条配置字段：名称、`API`（风格，openai / anthropic）、按顺序选择的多个路由、启用开关。
+- 新增/编辑时先选择 `API` 类型，再只展示该类型下的路由；点击路由即加入链路，点击顺序就是 `1 / 2 / 3...` 的尝试顺序。
+- “当前顺序”里的已选路由支持直接点击 `×` 删除，删除后编号自动重排。
+- 启用开关（ON/OFF）按 `api_style` 互斥：同一 API 类型下最多一个链式代理 ON，openai 和 anthropic 各自独立。
+- 链式代理只负责优先级和故障切换；其中每个子路由仍沿用路由页的 Base URL / Model / API Key / 协议配置。
+
 ## 路由与第三方 API 转发
 
-`ServeHTTP`（main.go）在转发前按请求风格挑选启用的路由：
+`ServeHTTP`（main.go）在转发前按请求风格挑选启用的链式代理或路由，优先级如下：
+
+1. 同 API 风格下启用的链式代理（`chain_proxies.enabled=1`）。
+2. 同 API 风格下启用的单路由（`api_routes.enabled=1`）。
+3. 官方默认上游（`-target` / `-claude-target`）。
 
 - 风格映射：`provider=codex → openai`，`provider=claude → anthropic`。用 `EnabledAPIRouteForStyle(style)` 取该风格当前启用的那条。
 - **默认模式**（该风格无启用路由）：行为不变，按 provider 转发到官方上游（`-target` / `-claude-target`）。
@@ -100,6 +113,20 @@ Web 页面左侧有侧边栏菜单，两项：
 - 记录/日志的请求体仍保存**客户端原始请求**（`recordedReqBody`），转发用的 `forwardBody` 可能已改写 model 或转成 chat，两者分离。
 - 看板和 JSONL 日志里的 `model` 使用**实际出站模型**（`effectiveModel`）：路由配置有 Model 时取路由 Model；路由 Model 为空时回落转发体/原始请求体里的 model。这样 Codex CLI 本地配置仍可写 `gpt-5.6-sol`，但启用 qwen/kimi/deepseek/mimo 等第三方路由后，看板模型列显示实际请求的第三方模型。
 - 入库时 `TraceStartRecord.Model` 会覆盖 `requestMetaFromHeaders` 从原始请求体解析出的 model；`conversations.model` 后续请求有有效模型时会刷新为最新实际模型，避免同一 session 首次记录为 GPT 后一直不变。
+
+### 链式代理转发
+
+链式代理模式由 `forwardPlans` 生成多个候选 `forwardPlan`，按链路顺序尝试：
+
+- 如果同 API 风格存在启用的链式代理，就**只走链式代理**；链内都失败时不再回退到路由页 ON 的单路由，也不回退官方上游。
+- 每个子路由按它自己的协议配置构造出站请求；协议不匹配、请求转换失败、上游传输失败、HTTP 状态 `>=400`、适配后空响应都会视为该路由失败，然后尝试下一个。
+- HTTP `>=400` 的中间失败会读取并丢弃响应体，关闭连接，写一条 `phase=chain_attempt` 的 JSONL 日志，然后继续下一个路由。
+- 适配路径中，如果三方上游返回 HTTP 200 但 Chat 响应没有非空文本、也没有 tool call（例如 NVIDIA SSE 里只有 `data: {"error": ...}` 或空 choices），视为“空响应”失败；中间路由继续 next。
+- 最后一个路由也失败时，返回最后一个路由的真实响应给 agent（避免本地造 502 导致 Codex CLI 自动重试整轮）。如果最后一个是空 200，会把最后的空响应适配后返回。
+- 链式状态按 `chain_id + session_id` 存在进程内存中，不落库。成功路由会记录为 `LastSuccessRouteID`；失败路由进入默认 2 分钟冷却（`chainRouteCooldown`）。
+- 下一轮同一会话进入时：冷却中的失败路由会跳过，优先从上次成功路由附近继续尝试；冷却过期后，前面失败过的路由重新进入候选，成功后会更新后续起点。
+- 如果一次请求里链内全部失败，会清空该会话该链的失败冷却；用户下一次重新发起请求时，从链路第一个路由重新开始尝试。
+- 如果进入请求时发现链路所有路由都在冷却中，也会清空冷却并从第一个路由重新生成候选。
 
 ## 协议适配层（adapter.go）
 
@@ -113,6 +140,7 @@ Web 页面左侧有侧边栏菜单，两项：
 - **响应 chat → native**（`adaptChatResponseToNative`）：
   - 先 `parseChatResponse` 把三方的 chat 响应（SSE 或 JSON）解析出文本、tool_calls、finish_reason、usage。
   - 再按目标协议还原：`emitAnthropicSSE/JSON`（message_start/content_block/message_delta…）或 `emitResponsesSSE/JSON`（response.created/output_item/response.completed…）。usage 一并带上，供 recorder 正常统计。
+  - 注意：部分三方 SSE 会以 HTTP 200 返回 `data: {"error": ...}`（例如上游推理过程中才失败，HTTP 头已经发出），当前解析会得到空 Chat completion；链式代理层会把这种空响应当作该路由失败并尝试 next。
 - **usage 兼容**：
   - 流式 Chat Completions 请求会补 `stream_options: {"include_usage": true}`，方便 MiMo/OpenAI 兼容接口在流末返回 usage。
   - 缓存 token 兼容 OpenAI/MiMo 的 `usage.prompt_tokens_details.cached_tokens`，也兼容 DeepSeek 的 `usage.prompt_cache_hit_tokens`。
@@ -137,6 +165,7 @@ Web 页面左侧有侧边栏菜单，两项：
 - `traces`：每次 `/v1/responses` 请求记录，保存请求/响应 headers、body、SSE events、token、状态、耗时和完成时间。
 - `account_aliases`：`Chatgpt-Account-Id` 到自定义账号名的映射。
 - `api_routes`：路由页配置的第三方 API 供应商。字段 `name`、`base_url`、`model`、`api_style`（openai/anthropic）、`protocol`（chat_completions/responses/messages）、`api_key`、`enabled`。旧库通过 `ensureColumn` 补 `api_style`/`protocol`/`enabled` 三列。
+- `chain_proxies`：链式代理配置。字段 `name`、`api_style`、`route_ids`（JSON 数组，保存点击顺序）、`enabled`、`created_at`、`updated_at`。同一 `api_style` 至多一条启用；`route_ids` 里的路由必须属于同一 API 风格。
 
 迁移会确保历史数据补齐 `account_id`、`tags` 等字段，并尝试修复旧数据里误保存为注入上下文的 `first_prompt`。
 
@@ -263,6 +292,14 @@ log/YYYY-MM-DD-{model}.log
 
 - 默认模式下模型名取客户端原始请求体的 `model`；启用第三方路由后取实际出站模型（`effectiveModel`），不同模型写到不同日志文件。
 - 模型名里的 `/`、`:` 等非法字符会清洗成 `_`（`sanitizeModelForFile`），空模型归 `unknown`。
+- 适配路径的 JSONL 会带 `adapter_info`：
+  - `upstream_raw_body` / `upstream_decoded_body`：三方上游原始 Chat 响应与解压后文本。
+  - `upstream_raw_bytes` / `upstream_decoded_bytes` / `upstream_content_encoding`。
+  - `adapt_target`、`route_id`、`route_name`、`route_model`、`route_protocol`。
+  - `chain_current` / `chain_next`、`chain_attempt_result`（如 `selected`、`status_failure`、`empty_response`、`final_empty_response`）。
+  - `chat_text_chars`、`chat_text_trimmed_chars`、`chat_tool_calls`、`chat_finish_reason`、`chat_usage_*`、`chat_empty`。
+  - 有 tool call 时记录 `chat_tool_call_details`；有文本时记录 `chat_text_preview`。
+- 链式代理中间失败的候选也会单独写 JSONL，`phase=chain_attempt`，用于排查“前几条路由为什么被跳过”。这些中间失败不写入 MySQL trace，避免污染看板会话。
 
 当前按用户要求暂不脱敏，请求头和请求体会完整保存。
 
@@ -279,11 +316,17 @@ log/YYYY-MM-DD-{model}.log
 - `POST /api/conversations/{id}/tags`：保存会话标签。
 - `POST /api/accounts/{id}/alias`：保存账号别名。
 - `GET /routes`：第三方 API 配置页。
+- `GET /chains`：链式代理配置页。
 - `GET /api/routes`：路由配置列表 JSON。
 - `POST /api/routes`：新建路由配置。
 - `PUT /api/routes/{id}`：更新路由配置。
 - `POST /api/routes/{id}/toggle`：切换启用状态（按 `api_style` 互斥）。
 - `DELETE /api/routes/{id}`：删除路由配置。
+- `GET /api/chains`：链式代理列表 JSON（同时返回可选路由）。
+- `POST /api/chains`：新建链式代理。
+- `PUT /api/chains/{id}`：更新链式代理。
+- `POST /api/chains/{id}/toggle`：切换链式代理启用状态（按 `api_style` 互斥）。
+- `DELETE /api/chains/{id}`：删除链式代理。
 - `GET /healthz`：健康检查。
 
 ## 当前技术栈

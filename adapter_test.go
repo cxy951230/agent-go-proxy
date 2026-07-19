@@ -173,3 +173,20 @@ func TestResponsesUsageMapsMiMoPromptTokenDetails(t *testing.T) {
 		t.Fatalf("ReasoningTokens = %d, want 3", usage.ReasoningTokens)
 	}
 }
+
+func TestEmptyChatCompletionDetectsNoUsefulOutput(t *testing.T) {
+	empty := parseChatResponse(`{"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
+	if !emptyChatCompletion(empty) {
+		t.Fatalf("empty chat completion should be treated as no useful output")
+	}
+
+	whitespace := parseChatResponse(`{"choices":[{"message":{"content":"\n\n"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}`)
+	if !emptyChatCompletion(whitespace) {
+		t.Fatalf("whitespace-only chat completion should be treated as no useful output")
+	}
+
+	tool := parseChatResponse(`{"choices":[{"message":{"tool_calls":[{"id":"call_1","function":{"name":"exec","arguments":"{\"input\":\"hi\"}"}}]},"finish_reason":"tool_calls"}]}`)
+	if emptyChatCompletion(tool) {
+		t.Fatalf("tool call response should be useful output")
+	}
+}

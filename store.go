@@ -986,6 +986,26 @@ func (s *Store) ListChainProxies(ctx context.Context) ([]ChainProxy, error) {
 	return out, nil
 }
 
+func (s *Store) EnabledChainProxyForStyle(ctx context.Context, style string) (ChainProxy, bool, error) {
+	var chain ChainProxy
+	var routeIDsRaw string
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, api_style, route_ids, enabled, created_at, updated_at
+		FROM chain_proxies WHERE enabled=1 AND api_style=? ORDER BY id LIMIT 1`, style).
+		Scan(&chain.ID, &chain.Name, &chain.APIStyle, &routeIDsRaw, &chain.Enabled, &chain.CreatedAt, &chain.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return chain, false, nil
+	}
+	if err != nil {
+		return chain, false, err
+	}
+	chain.RouteIDs = decodeInt64List(routeIDsRaw)
+	chains := []ChainProxy{chain}
+	if err := s.attachChainProxyRoutes(ctx, chains); err != nil {
+		return chain, false, err
+	}
+	return chains[0], true, nil
+}
+
 func (s *Store) attachChainProxyRoutes(ctx context.Context, chains []ChainProxy) error {
 	if len(chains) == 0 {
 		return nil

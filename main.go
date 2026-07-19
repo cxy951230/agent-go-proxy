@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -50,6 +51,134 @@ type proxyServer struct {
 	logs     *logWriter
 	store    *Store
 	recorder *asyncRecorder
+	chains   *chainRouteState
+}
+
+const chainRouteCooldown = 2 * time.Minute
+
+type chainSessionState struct {
+	LastSuccessRouteID int64
+	FailedUntil        map[int64]time.Time
+}
+
+type chainRouteState struct {
+	mu       sync.Mutex
+	sessions map[string]*chainSessionState
+}
+
+type forwardPlan struct {
+	route          *APIRoute
+	chainID        int64
+	upstreamURL    string
+	upstreamHost   string
+	forwardBody    []byte
+	effectiveModel string
+	adaptTarget    string
+	adaptState     *adapterState
+	mismatch       string
+}
+
+func newChainRouteState() *chainRouteState {
+	return &chainRouteState{sessions: make(map[string]*chainSessionState)}
+}
+
+func (s *chainRouteState) OrderedRoutes(chainID int64, sessionID string, routes []APIRoute) []APIRoute {
+	if len(routes) == 0 {
+		return nil
+	}
+	key := chainSessionKey(chainID, sessionID)
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.sessions[key]
+	if state == nil {
+		state = &chainSessionState{FailedUntil: make(map[int64]time.Time)}
+		s.sessions[key] = state
+	}
+	for routeID, until := range state.FailedUntil {
+		if !until.After(now) {
+			delete(state.FailedUntil, routeID)
+		}
+	}
+
+	lastSuccessIndex := -1
+	for i, route := range routes {
+		if route.ID == state.LastSuccessRouteID {
+			lastSuccessIndex = i
+			break
+		}
+	}
+
+	out := make([]APIRoute, 0, len(routes))
+	addIfReady := func(route APIRoute) {
+		if until, cooling := state.FailedUntil[route.ID]; cooling && until.After(now) {
+			return
+		}
+		out = append(out, route)
+	}
+	if lastSuccessIndex > 0 {
+		for _, route := range routes[:lastSuccessIndex] {
+			addIfReady(route)
+		}
+	}
+	if lastSuccessIndex >= 0 {
+		addIfReady(routes[lastSuccessIndex])
+		for _, route := range routes[lastSuccessIndex+1:] {
+			addIfReady(route)
+		}
+		return out
+	}
+	for _, route := range routes {
+		addIfReady(route)
+	}
+	return out
+}
+
+func (s *chainRouteState) MarkFailure(chainID int64, sessionID string, routeID int64) {
+	if routeID == 0 {
+		return
+	}
+	key := chainSessionKey(chainID, sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.sessions[key]
+	if state == nil {
+		state = &chainSessionState{FailedUntil: make(map[int64]time.Time)}
+		s.sessions[key] = state
+	}
+	state.FailedUntil[routeID] = time.Now().Add(chainRouteCooldown)
+}
+
+func (s *chainRouteState) MarkSuccess(chainID int64, sessionID string, routeID int64) {
+	if routeID == 0 {
+		return
+	}
+	key := chainSessionKey(chainID, sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.sessions[key]
+	if state == nil {
+		state = &chainSessionState{FailedUntil: make(map[int64]time.Time)}
+		s.sessions[key] = state
+	}
+	state.LastSuccessRouteID = routeID
+	delete(state.FailedUntil, routeID)
+}
+
+func (s *chainRouteState) ClearFailures(chainID int64, sessionID string) {
+	key := chainSessionKey(chainID, sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.sessions[key]
+	if state == nil {
+		return
+	}
+	state.FailedUntil = make(map[int64]time.Time)
+}
+
+func chainSessionKey(chainID int64, sessionID string) string {
+	return fmt.Sprintf("%d:%s", chainID, fallback(sessionID, "unknown"))
 }
 
 func main() {
@@ -113,6 +242,7 @@ func main() {
 		logs:     lw,
 		store:    store,
 		recorder: recorder,
+		chains:   newChainRouteState(),
 	}
 
 	router := chi.NewRouter()
@@ -190,25 +320,16 @@ func (p *proxyServer) handleProxyFallback(w http.ResponseWriter, r *http.Request
 func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	provider := detectProvider(r)
-	// 默认(原生)模式:按 provider 选官方上游,URL 由请求路径推导。
-	upstreamTarget := p.cfg.target
-	if provider == providerClaude {
-		upstreamTarget = p.cfg.claudeTarget
-	}
-	upstreamURL := buildUpstreamURL(upstreamTarget, r.URL)
-	upstreamHost := upstreamTarget.Host
-
 	reqBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
 		p.logs.Write(logEntry{
-			Timestamp:   time.Now().Format(time.RFC3339Nano),
-			DurationMS:  time.Since(start).Milliseconds(),
-			Method:      r.Method,
-			Path:        r.URL.RequestURI(),
-			UpstreamURL: upstreamURL,
-			Status:      http.StatusBadRequest,
-			Error:       err.Error(),
+			Timestamp:  time.Now().Format(time.RFC3339Nano),
+			DurationMS: time.Since(start).Milliseconds(),
+			Method:     r.Method,
+			Path:       r.URL.RequestURI(),
+			Status:     http.StatusBadRequest,
+			Error:      err.Error(),
 		})
 		fmt.Printf("<- %s %s status=%d error=%s\n", r.Method, r.URL.RequestURI(), http.StatusBadRequest, err.Error())
 		return
@@ -218,56 +339,140 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	logModel := modelFromBody(reqBody)
 	effectiveModel := logModel
 	clientStream := clientWantsStream(reqBody)
+	meta := requestMetaFromHeaders(r.Header, reqBody, provider)
 	// Claude Code 的 quota/warmup 探测请求(max_tokens<=1,内容为 "quota"):
 	// 只转发给上游让 CC 读限流状态,不落库、不写日志,避免污染看板。
 	isProbe := provider == providerClaude && isClaudeQuotaProbe(reqBody)
 
-	// 若配置了启用的路由,改走该第三方接口(默认模式下 routeOK=false,保持原生转发)。
-	// 路由按请求风格选取:Codex(openai) / Claude(anthropic) 各自用同风格里启用的那条。
-	// 转发用的 body 可能被路由的 model 改写;记录/日志仍用客户端原始请求。
-	forwardBody := reqBody
-	adaptTarget := "" // 非空表示需把上游 chat 响应转回该原生协议(messages/responses)
-	var adaptState *adapterState
+	upstreamTarget := p.cfg.target
+	if provider == providerClaude {
+		upstreamTarget = p.cfg.claudeTarget
+	}
 	routeStyle := "openai"
 	if provider == providerClaude {
 		routeStyle = "anthropic"
 	}
-	route, routeOK, rerr := p.store.EnabledAPIRouteForStyle(r.Context(), routeStyle)
-	if rerr != nil {
-		log.Printf("load enabled route: %v", rerr)
-		routeOK = false
+
+	reqProtocol := detectProtocol(r.URL.Path)
+	plans, chainMode, planErr := p.forwardPlans(r.Context(), routeStyle, upstreamTarget, r, reqProtocol, reqBody, logModel, meta.SessionID)
+	if planErr != nil {
+		p.finishLocalError(w, r, start, nil, provider, http.StatusServiceUnavailable, planErr.Error(), recordedReqBody, effectiveModel, !isProbe)
+		return
 	}
-	var routeMismatch string
-	if routeOK {
-		reqProtocol := detectProtocol(r.URL.Path)
-		base, perr := url.Parse(route.BaseURL)
-		switch {
-		case perr != nil || base.Scheme == "" || base.Host == "":
-			routeMismatch = "启用路由的 Base URL 无效"
-		case reqProtocol == route.Protocol:
-			// 协议一致,直接透传到该 endpoint
-			upstreamURL = buildRouteUpstreamURL(route.BaseURL, reqProtocol, r.URL.RawQuery)
-			upstreamHost = base.Host
-			forwardBody = rewriteModel(reqBody, route.Model)
-			effectiveModel = effectiveRequestModel(forwardBody, route.Model, logModel)
-		case route.Protocol == "chat_completions" && (reqProtocol == "messages" || reqProtocol == "responses"):
-			// 适配层:三方只支持 chat 时,请求转 chat 发出去,响应再转回原生协议
-			chatBody, state, cerr := adaptRequestToChat(reqProtocol, reqBody)
-			if cerr != nil {
-				routeMismatch = "请求转换为 Chat 失败: " + cerr.Error()
-			} else {
-				upstreamURL = buildRouteUpstreamURL(route.BaseURL, "chat_completions", r.URL.RawQuery)
-				upstreamHost = base.Host
-				forwardBody = rewriteModel(chatBody, route.Model)
-				effectiveModel = effectiveRequestModel(forwardBody, route.Model, logModel)
-				adaptTarget = reqProtocol
-				adaptState = state
+	if len(plans) == 0 {
+		msg := "链式代理所有路由都在冷却中"
+		p.finishLocalError(w, r, start, nil, provider, http.StatusServiceUnavailable, msg, recordedReqBody, effectiveModel, !isProbe)
+		return
+	}
+
+	var plan forwardPlan
+	var resp *http.Response
+	var preparedNative string
+	var preparedResponseBytes int
+	var preparedReadErr error
+	var adapterInfo map[string]any
+	var lastErr error
+	var lastMismatch string
+	for i, candidate := range plans {
+		plan = candidate
+		preparedNative = ""
+		preparedResponseBytes = 0
+		preparedReadErr = nil
+		adapterInfo = nil
+		effectiveModel = plan.effectiveModel
+		if plan.mismatch != "" {
+			lastMismatch = plan.mismatch
+			if chainMode && plan.route != nil {
+				p.chains.MarkFailure(plan.chainID, meta.SessionID, plan.route.ID)
 			}
-		default:
-			routeMismatch = fmt.Sprintf("请求接口协议(%s)与启用路由(%s)不匹配", fallback(reqProtocol, "unknown"), route.Protocol)
+			if !chainMode || i == len(plans)-1 {
+				if chainMode {
+					p.chains.ClearFailures(plan.chainID, meta.SessionID)
+				}
+				p.finishLocalError(w, r, start, &plan, provider, http.StatusMisdirectedRequest, plan.mismatch, recordedReqBody, effectiveModel, !isProbe)
+				return
+			}
+			fmt.Printf("!! chain route failed current=%s next=%s reason=%s\n", chainPlanLabel(plans, i), chainNextLabel(plans, i), plan.mismatch)
+			continue
 		}
+		fmt.Printf("-> [%s] %s %s upstream=%s adapt=%s\n", provider, r.Method, r.URL.RequestURI(), plan.upstreamURL, fallback(plan.adaptTarget, "none"))
+		resp, err = p.doUpstream(r, plan)
+		if err != nil {
+			lastErr = err
+			if chainMode && plan.route != nil {
+				p.chains.MarkFailure(plan.chainID, meta.SessionID, plan.route.ID)
+			}
+			if !chainMode || i == len(plans)-1 {
+				if chainMode {
+					p.chains.ClearFailures(plan.chainID, meta.SessionID)
+				}
+				p.finishLocalError(w, r, start, &plan, provider, http.StatusBadGateway, err.Error(), recordedReqBody, effectiveModel, !isProbe)
+				return
+			}
+			fmt.Printf("!! chain route failed current=%s next=%s error=%v\n", chainPlanLabel(plans, i), chainNextLabel(plans, i), err)
+			continue
+		}
+		if chainMode && resp.StatusCode >= 400 {
+			if plan.route != nil {
+				p.chains.MarkFailure(plan.chainID, meta.SessionID, plan.route.ID)
+			}
+			if i < len(plans)-1 {
+				rawFail, _ := io.ReadAll(resp.Body)
+				decodedFail := decodeResponseBody(rawFail, resp.Header.Get("Content-Encoding"))
+				_ = resp.Body.Close()
+				p.writeChainAttemptLog(r, start, plan, resp, recordedReqBody, decodedFail, rawFail, map[string]any{
+					"chain_attempt_result": "status_failure",
+					"chain_current":        chainPlanLabel(plans, i),
+					"chain_next":           chainNextLabel(plans, i),
+				}, !isProbe)
+				fmt.Printf("!! chain route returned current=%s status=%d next=%s\n", chainPlanLabel(plans, i), resp.StatusCode, chainNextLabel(plans, i))
+				continue
+			}
+			p.chains.ClearFailures(plan.chainID, meta.SessionID)
+		}
+		if chainMode && plan.adaptTarget != "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			rawUp, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			chatDecoded := decodeResponseBody(rawUp, resp.Header.Get("Content-Encoding"))
+			chat := parseChatResponse(chatDecoded)
+			adapterInfo = chainAdapterInfo(plan, plans, i, rawUp, chatDecoded, chat, resp.Header.Get("Content-Encoding"))
+			if emptyChatCompletion(chat) {
+				if plan.route != nil {
+					p.chains.MarkFailure(plan.chainID, meta.SessionID, plan.route.ID)
+				}
+				lastErr = errors.New("chain route returned empty response")
+				if i < len(plans)-1 {
+					adapterInfo["chain_attempt_result"] = "empty_response"
+					p.writeChainAttemptLog(r, start, plan, resp, recordedReqBody, "", rawUp, adapterInfo, !isProbe)
+					fmt.Printf("!! chain route empty current=%s next=%s\n", chainPlanLabel(plans, i), chainNextLabel(plans, i))
+					continue
+				}
+				p.chains.ClearFailures(plan.chainID, meta.SessionID)
+				preparedNative = adaptChatResponseToNative(plan.adaptTarget, chatDecoded, clientStream, effectiveModel, plan.adaptState)
+				preparedResponseBytes = len(preparedNative)
+				preparedReadErr = readErr
+				adapterInfo["chain_attempt_result"] = "final_empty_response"
+				break
+			}
+			preparedNative = adaptChatResponseToNative(plan.adaptTarget, chatDecoded, clientStream, effectiveModel, plan.adaptState)
+			preparedResponseBytes = len(preparedNative)
+			preparedReadErr = readErr
+			adapterInfo["chain_attempt_result"] = "selected"
+		}
+		if chainMode && resp.StatusCode < 400 && plan.route != nil {
+			p.chains.MarkSuccess(plan.chainID, meta.SessionID, plan.route.ID)
+		}
+		break
 	}
-	fmt.Printf("-> [%s] %s %s upstream=%s adapt=%s\n", provider, r.Method, r.URL.RequestURI(), upstreamURL, fallback(adaptTarget, "none"))
+	if resp == nil {
+		msg := fallback(lastMismatch, "链式代理没有可用路由")
+		if lastErr != nil {
+			msg = lastErr.Error()
+		}
+		p.finishLocalError(w, r, start, &plan, provider, http.StatusBadGateway, msg, recordedReqBody, effectiveModel, !isProbe)
+		return
+	}
+	defer resp.Body.Close()
 
 	var traceHandle *traceHandle
 	if !isProbe {
@@ -277,7 +482,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			DurationMS:  time.Since(start).Milliseconds(),
 			Method:      r.Method,
 			Path:        r.URL.RequestURI(),
-			UpstreamURL: upstreamURL,
+			UpstreamURL: plan.upstreamURL,
 			Model:       effectiveModel,
 			RequestBody: recordedReqBody,
 			RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
@@ -287,7 +492,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Provider:     provider,
 			Method:       r.Method,
 			Path:         r.URL.RequestURI(),
-			UpstreamURL:  upstreamURL,
+			UpstreamURL:  plan.upstreamURL,
 			Model:        effectiveModel,
 			RequestBody:  recordedReqBody,
 			RequestHdrs:  sanitizeHeader(cloneHeader(r.Header)),
@@ -295,96 +500,22 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// 启用路由但请求协议不匹配:本地直接拒绝(421 Misdirected Request),
-	// 不打上游;仍按常规记一次错误日志/trace,保持解析、入库逻辑一致。
-	if routeMismatch != "" {
-		http.Error(w, routeMismatch, http.StatusMisdirectedRequest)
-		if !isProbe {
-			p.logs.Write(logEntry{
-				Timestamp:   time.Now().Format(time.RFC3339Nano),
-				DurationMS:  time.Since(start).Milliseconds(),
-				Method:      r.Method,
-				Path:        r.URL.RequestURI(),
-				UpstreamURL: upstreamURL,
-				Model:       effectiveModel,
-				Status:      http.StatusMisdirectedRequest,
-				RequestBody: recordedReqBody,
-				RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
-				Error:       routeMismatch,
-			})
-		}
-		fmt.Printf("<- %s %s status=%d route_mismatch=%s\n", r.Method, r.URL.RequestURI(), http.StatusMisdirectedRequest, routeMismatch)
-		p.recorder.Finish(traceHandle, TraceFinishRecord{
-			Provider:   provider,
-			Status:     http.StatusMisdirectedRequest,
-			DurationMS: time.Since(start).Milliseconds(),
-			Error:      routeMismatch,
-		})
-		return
-	}
-
-	// 请求体已缓存,响应写回前若上游传输层瞬时失败(常见于经本地代理复用了
-	// 失效的长连接导致 EOF),用全新连接重试若干次,避免把可恢复的抖动透传成 502。
-	const maxAttempts = 3
-	var resp *http.Response
-	for attempt := 1; ; attempt++ {
-		var upstreamReq *http.Request
-		upstreamReq, err = http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(forwardBody))
-		if err != nil {
-			break // 构造请求失败,不可重试
-		}
-		copyHeaders(upstreamReq.Header, r.Header)
-		upstreamReq.Host = upstreamHost
-		// 走第三方路由时,用配置的凭证覆盖客户端自带的认证头。
-		if routeOK {
-			applyRouteAuth(upstreamReq.Header, route)
-		}
-
-		resp, err = p.client.Do(upstreamReq)
-		if err == nil {
-			break
-		}
-		// 客户端已断开、已达上限则不再重试
-		if r.Context().Err() != nil || attempt >= maxAttempts {
-			break
-		}
-		fmt.Printf("!! upstream attempt %d/%d failed, retrying: %v\n", attempt, maxAttempts, err)
-		time.Sleep(time.Duration(attempt) * 150 * time.Millisecond)
-	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		if !isProbe {
-			p.logs.Write(logEntry{
-				Timestamp:   time.Now().Format(time.RFC3339Nano),
-				DurationMS:  time.Since(start).Milliseconds(),
-				Method:      r.Method,
-				Path:        r.URL.RequestURI(),
-				UpstreamURL: upstreamURL,
-				Model:       effectiveModel,
-				Status:      http.StatusBadGateway,
-				RequestBody: recordedReqBody,
-				RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
-				Error:       err.Error(),
-			})
-		}
-		fmt.Printf("<- %s %s status=%d error=%s\n", r.Method, r.URL.RequestURI(), http.StatusBadGateway, err.Error())
-		p.recorder.Finish(traceHandle, TraceFinishRecord{
-			Status:     http.StatusBadGateway,
-			DurationMS: time.Since(start).Milliseconds(),
-			Error:      err.Error(),
-		})
-		return
-	}
-	defer resp.Body.Close()
-
 	var decodedRespBody string
 	var copyErr error
 	var responseBytes int
-	if adaptTarget != "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if plan.adaptTarget != "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		// 适配路径:读完上游 chat 响应,转换回原生协议(SSE/JSON)后一次性回写。
-		rawUp, readErr := io.ReadAll(resp.Body)
-		chatDecoded := decodeResponseBody(rawUp, resp.Header.Get("Content-Encoding"))
-		native := adaptChatResponseToNative(adaptTarget, chatDecoded, clientStream, effectiveModel, adaptState)
+		native := preparedNative
+		readErr := preparedReadErr
+		if native == "" {
+			rawUp, err := io.ReadAll(resp.Body)
+			readErr = err
+			chatDecoded := decodeResponseBody(rawUp, resp.Header.Get("Content-Encoding"))
+			chat := parseChatResponse(chatDecoded)
+			adapterInfo = chainAdapterInfo(plan, nil, -1, rawUp, chatDecoded, chat, resp.Header.Get("Content-Encoding"))
+			adapterInfo["chain_attempt_result"] = "selected"
+			native = adaptChatResponseToNative(plan.adaptTarget, chatDecoded, clientStream, effectiveModel, plan.adaptState)
+		}
 		if clientStream {
 			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")
@@ -402,7 +533,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			copyErr = writeErr
 		}
 		decodedRespBody = native
-		responseBytes = len(native)
+		responseBytes = fallbackInt(preparedResponseBytes, len(native))
 	} else {
 		// 原生透传:边读边写回(可能 gzip),记录/解析前再按 Content-Encoding 解压副本。
 		copyHeaders(w.Header(), resp.Header)
@@ -419,13 +550,14 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		DurationMS:   time.Since(start).Milliseconds(),
 		Method:       r.Method,
 		Path:         r.URL.RequestURI(),
-		UpstreamURL:  upstreamURL,
+		UpstreamURL:  plan.upstreamURL,
 		Model:        effectiveModel,
 		Status:       resp.StatusCode,
 		RequestBody:  recordedReqBody,
 		ResponseBody: recordedRespBody,
 		RequestHdrs:  sanitizeHeader(cloneHeader(r.Header)),
 		ResponseHdrs: sanitizeHeader(cloneHeader(resp.Header)),
+		AdapterInfo:  adapterInfo,
 	}
 	if copyErr != nil && !errors.Is(copyErr, context.Canceled) {
 		entry.Error = copyErr.Error()
@@ -452,6 +584,244 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		fmt.Printf("<- %s %s status=%d duration=%dms bytes=%d\n", r.Method, r.URL.RequestURI(), resp.StatusCode, entry.DurationMS, responseBytes)
 	}
+}
+
+func (p *proxyServer) forwardPlans(ctx context.Context, routeStyle string, upstreamTarget *url.URL, r *http.Request, reqProtocol string, reqBody []byte, logModel, sessionID string) ([]forwardPlan, bool, error) {
+	chain, chainOK, err := p.store.EnabledChainProxyForStyle(ctx, routeStyle)
+	if err != nil {
+		log.Printf("load enabled chain proxy: %v", err)
+		chainOK = false
+	}
+	if chainOK {
+		routes := p.chains.OrderedRoutes(chain.ID, sessionID, chain.Routes)
+		if len(routes) == 0 && len(chain.Routes) > 0 {
+			p.chains.ClearFailures(chain.ID, sessionID)
+			routes = p.chains.OrderedRoutes(chain.ID, sessionID, chain.Routes)
+		}
+		plans := make([]forwardPlan, 0, len(routes))
+		for _, route := range routes {
+			plans = append(plans, buildRoutePlan(route, chain.ID, reqProtocol, r.URL, reqBody, logModel))
+		}
+		return plans, true, nil
+	}
+
+	route, routeOK, err := p.store.EnabledAPIRouteForStyle(ctx, routeStyle)
+	if err != nil {
+		log.Printf("load enabled route: %v", err)
+		routeOK = false
+	}
+	if routeOK {
+		return []forwardPlan{buildRoutePlan(route, 0, reqProtocol, r.URL, reqBody, logModel)}, false, nil
+	}
+	return []forwardPlan{{
+		upstreamURL:    buildUpstreamURL(upstreamTarget, r.URL),
+		upstreamHost:   upstreamTarget.Host,
+		forwardBody:    reqBody,
+		effectiveModel: logModel,
+	}}, false, nil
+}
+
+func buildRoutePlan(route APIRoute, chainID int64, reqProtocol string, requestURL *url.URL, reqBody []byte, logModel string) forwardPlan {
+	plan := forwardPlan{
+		route:          &route,
+		chainID:        chainID,
+		forwardBody:    reqBody,
+		effectiveModel: logModel,
+	}
+	base, err := url.Parse(route.BaseURL)
+	switch {
+	case err != nil || base.Scheme == "" || base.Host == "":
+		plan.mismatch = "启用路由的 Base URL 无效"
+	case reqProtocol == route.Protocol:
+		plan.upstreamURL = buildRouteUpstreamURL(route.BaseURL, reqProtocol, requestURL.RawQuery)
+		plan.upstreamHost = base.Host
+		plan.forwardBody = rewriteModel(reqBody, route.Model)
+		plan.effectiveModel = effectiveRequestModel(plan.forwardBody, route.Model, logModel)
+	case route.Protocol == "chat_completions" && (reqProtocol == "messages" || reqProtocol == "responses"):
+		chatBody, state, err := adaptRequestToChat(reqProtocol, reqBody)
+		if err != nil {
+			plan.mismatch = "请求转换为 Chat 失败: " + err.Error()
+		} else {
+			plan.upstreamURL = buildRouteUpstreamURL(route.BaseURL, "chat_completions", requestURL.RawQuery)
+			plan.upstreamHost = base.Host
+			plan.forwardBody = rewriteModel(chatBody, route.Model)
+			plan.effectiveModel = effectiveRequestModel(plan.forwardBody, route.Model, logModel)
+			plan.adaptTarget = reqProtocol
+			plan.adaptState = state
+		}
+	default:
+		plan.mismatch = fmt.Sprintf("请求接口协议(%s)与启用路由(%s)不匹配", fallback(reqProtocol, "unknown"), route.Protocol)
+	}
+	return plan
+}
+
+func (p *proxyServer) doUpstream(r *http.Request, plan forwardPlan) (*http.Response, error) {
+	const maxAttempts = 3
+	var resp *http.Response
+	var err error
+	for attempt := 1; ; attempt++ {
+		var upstreamReq *http.Request
+		upstreamReq, err = http.NewRequestWithContext(r.Context(), r.Method, plan.upstreamURL, bytes.NewReader(plan.forwardBody))
+		if err != nil {
+			return nil, err
+		}
+		copyHeaders(upstreamReq.Header, r.Header)
+		upstreamReq.Host = plan.upstreamHost
+		if plan.route != nil {
+			applyRouteAuth(upstreamReq.Header, *plan.route)
+		}
+		resp, err = p.client.Do(upstreamReq)
+		if err == nil {
+			return resp, nil
+		}
+		if r.Context().Err() != nil || attempt >= maxAttempts {
+			return nil, err
+		}
+		fmt.Printf("!! upstream attempt %d/%d failed, retrying: %v\n", attempt, maxAttempts, err)
+		time.Sleep(time.Duration(attempt) * 150 * time.Millisecond)
+	}
+}
+
+func (p *proxyServer) finishLocalError(w http.ResponseWriter, r *http.Request, start time.Time, plan *forwardPlan, provider string, status int, message, recordedReqBody, model string, record bool) {
+	upstreamURL := ""
+	if plan != nil {
+		upstreamURL = plan.upstreamURL
+	}
+	http.Error(w, message, status)
+	if record {
+		p.logs.Write(logEntry{
+			Timestamp:   time.Now().Format(time.RFC3339Nano),
+			DurationMS:  time.Since(start).Milliseconds(),
+			Method:      r.Method,
+			Path:        r.URL.RequestURI(),
+			UpstreamURL: upstreamURL,
+			Model:       model,
+			Status:      status,
+			RequestBody: recordedReqBody,
+			RequestHdrs: sanitizeHeader(cloneHeader(r.Header)),
+			Error:       message,
+		})
+		traceHandle := p.recorder.Start(TraceStartRecord{
+			Provider:     provider,
+			Method:       r.Method,
+			Path:         r.URL.RequestURI(),
+			UpstreamURL:  upstreamURL,
+			Model:        model,
+			RequestBody:  recordedReqBody,
+			RequestHdrs:  sanitizeHeader(cloneHeader(r.Header)),
+			RequestBytes: len(recordedReqBody),
+		})
+		p.recorder.Finish(traceHandle, TraceFinishRecord{
+			Provider:   provider,
+			Status:     status,
+			DurationMS: time.Since(start).Milliseconds(),
+			Error:      message,
+		})
+	}
+	fmt.Printf("<- %s %s status=%d error=%s\n", r.Method, r.URL.RequestURI(), status, message)
+}
+
+func (p *proxyServer) writeChainAttemptLog(r *http.Request, start time.Time, plan forwardPlan, resp *http.Response, recordedReqBody, decodedBody string, rawBody []byte, info map[string]any, record bool) {
+	if !record {
+		return
+	}
+	if info == nil {
+		info = make(map[string]any)
+	}
+	info["upstream_raw_body"] = truncateBase64Images(string(rawBody))
+	if decodedBody != "" {
+		info["upstream_decoded_body"] = truncateBase64Images(decodedBody)
+	}
+	p.logs.Write(logEntry{
+		Timestamp:    time.Now().Format(time.RFC3339Nano),
+		Phase:        "chain_attempt",
+		DurationMS:   time.Since(start).Milliseconds(),
+		Method:       r.Method,
+		Path:         r.URL.RequestURI(),
+		UpstreamURL:  plan.upstreamURL,
+		Model:        plan.effectiveModel,
+		Status:       resp.StatusCode,
+		RequestBody:  recordedReqBody,
+		ResponseBody: truncateBase64Images(decodedBody),
+		RequestHdrs:  sanitizeHeader(cloneHeader(r.Header)),
+		ResponseHdrs: sanitizeHeader(cloneHeader(resp.Header)),
+		AdapterInfo:  info,
+	})
+}
+
+func chainPlanLabel(plans []forwardPlan, idx int) string {
+	if idx < 0 || idx >= len(plans) {
+		return "none"
+	}
+	plan := plans[idx]
+	if plan.route == nil {
+		return fmt.Sprintf("%d/%d official", idx+1, len(plans))
+	}
+	parts := []string{fmt.Sprintf("%d/%d", idx+1, len(plans)), fmt.Sprintf("id=%d", plan.route.ID)}
+	if name := strings.TrimSpace(plan.route.Name); name != "" {
+		parts = append(parts, "name="+name)
+	}
+	if model := strings.TrimSpace(plan.route.Model); model != "" {
+		parts = append(parts, "model="+model)
+	}
+	return strings.Join(parts, " ")
+}
+
+func chainNextLabel(plans []forwardPlan, idx int) string {
+	if idx+1 >= len(plans) {
+		return "none"
+	}
+	return chainPlanLabel(plans, idx+1)
+}
+
+func emptyChatCompletion(c chatCompletion) bool {
+	return strings.TrimSpace(c.Text) == "" && len(c.ToolCalls) == 0
+}
+
+func chainAdapterInfo(plan forwardPlan, plans []forwardPlan, idx int, rawBody []byte, decoded string, chat chatCompletion, encoding string) map[string]any {
+	info := map[string]any{
+		"adapt_target":              plan.adaptTarget,
+		"upstream_content_encoding": encoding,
+		"upstream_raw_bytes":        len(rawBody),
+		"upstream_decoded_bytes":    len(decoded),
+		"upstream_raw_body":         truncateBase64Images(string(rawBody)),
+		"upstream_decoded_body":     truncateBase64Images(decoded),
+		"chat_text_chars":           len(chat.Text),
+		"chat_text_trimmed_chars":   len(strings.TrimSpace(chat.Text)),
+		"chat_tool_calls":           len(chat.ToolCalls),
+		"chat_finish_reason":        chat.FinishReason,
+		"chat_usage_input":          chat.Usage.Input,
+		"chat_usage_output":         chat.Usage.Output,
+		"chat_usage_total":          chat.Usage.total(),
+		"chat_usage_cached":         chat.Usage.Cached,
+		"chat_usage_reasoning":      chat.Usage.Reasoning,
+		"chat_empty":                emptyChatCompletion(chat),
+	}
+	if plan.route != nil {
+		info["route_id"] = plan.route.ID
+		info["route_name"] = plan.route.Name
+		info["route_model"] = plan.route.Model
+		info["route_protocol"] = plan.route.Protocol
+	}
+	if len(plans) > 0 && idx >= 0 {
+		info["chain_current"] = chainPlanLabel(plans, idx)
+		info["chain_next"] = chainNextLabel(plans, idx)
+	}
+	if len(chat.ToolCalls) > 0 {
+		tools := make([]map[string]string, 0, len(chat.ToolCalls))
+		for _, tc := range chat.ToolCalls {
+			tools = append(tools, map[string]string{
+				"id":        tc.ID,
+				"name":      tc.Name,
+				"arguments": limitString(tc.Arguments, 1000),
+			})
+		}
+		info["chat_tool_call_details"] = tools
+	}
+	if strings.TrimSpace(chat.Text) != "" {
+		info["chat_text_preview"] = limitString(chat.Text, 2000)
+	}
+	return info
 }
 
 func buildUpstreamURL(target *url.URL, requestURL *url.URL) string {
