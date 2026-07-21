@@ -73,13 +73,21 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
 
 ## 左侧菜单、路由页与链式代理页
 
-Web 页面左侧有侧边栏菜单，三项：
+Web 页面左侧有侧边栏菜单，五项：
 
 - `Dashboard`：原会话列表页（`/`）。
 - `路由`：第三方 API 配置页（`/routes`）。
 - `链式代理`：按顺序组合多个路由的配置页（`/chains`）。
+- `OPENAI`：通过 Codex Bridge 登录和管理 GPT 账号（`/openai`）。
+- `API Key`：管理直连用的 API Key（`/api-keys`，`apikeys_web.go`）。
 
-各页共用同一套侧边栏，当前页高亮。侧边栏支持收起/展开，状态保存在浏览器 `localStorage.sidebarCollapsed`，Dashboard、路由页与链式代理页共享同一个折叠状态。路由页是对 `api_routes` 表的增删改查：
+各页共用同一套侧边栏，当前页高亮。侧边栏支持收起/展开，状态保存在浏览器 `localStorage.sidebarCollapsed`。
+
+`API Key` 页是对 `api_keys` 表的增删改查，字段只有名称和 API Key：新增时前端 `crypto.getRandomValues` 自动生成一个 `sk-` 开头的随机 Key（可改），列表里打码显示、编辑时回填完整值。这些 Key 用于「API Key 直连」的命中判定。
+
+`OPENAI` 页除账号摘要/额度/Token 过期外，还有「模型配置」列（模型/推理强度/速度下拉）与「拉取模型」按钮，见「GPT 账号模型配置」。
+
+路由页是对 `api_routes` 表的增删改查：
 
 - 每条配置字段：名称、Base URL、`API`（风格，openai / anthropic）、接口协议、Model、API Key、启用开关。
 - `API`（风格）与「接口协议」联动：openai → `Chat Completions API` / `Responses API`；anthropic → `Messages API` / `Chat Completions API`。前后端各存一份协议表（web.go `PROTOCOLS` 与 store.go `routeProtocols`），必须保持一致。
@@ -95,10 +103,19 @@ Web 页面左侧有侧边栏菜单，三项：
 - 启用开关（ON/OFF）按 `api_style` 互斥：同一 API 类型下最多一个链式代理 ON，openai 和 anthropic 各自独立。
 - 链式代理只负责优先级和故障切换；其中每个子路由仍沿用路由页的 Base URL / Model / API Key / 协议配置。
 
+### GPT 账号模型配置
+
+OPENAI 页每个账号可配置直连时用的模型/推理强度/速度，逻辑在 `openai_login.go` + `openai_web.go`：
+
+- 「拉取模型」调 Bridge `modelsList`（`codex_bridge_models_list` ABI，等价 CLI 的 `/model`），把该账号可用的模型目录缓存到 `openai_accounts.models_json`。目录**按账号套餐过滤**，free 账号看不到 plus 才有的模型。
+- 三个下拉的可选项**由目录里每个模型各自携带**：模型（`display_name`/slug）、推理强度（`supported_reasoning_efforts`，`none|minimal|low|medium|high|xhigh|max|ultra`）、速度（`service_tiers`，外加一个固定的 `default`=标准）。换模型后推理强度/速度选项会变，前端换模型时清空另两项回落新模型默认值。
+- 下拉改动即存（`selected_model` / `selected_reasoning_effort` / `selected_service_tier`）。当前这三项**只存库**，「API Key 直连」目前只按 `selected_model` 匹配账号，推理强度/速度尚未回写进转发请求体。
+
 ## 路由与第三方 API 转发
 
-`ServeHTTP`（main.go）在转发前按请求风格挑选启用的链式代理或路由，优先级如下：
+`ServeHTTP`（main.go）在转发前按请求风格挑选上游，`forwardPlans` 生成候选，优先级如下：
 
+0. **API Key 直连**（最高优先级，仅 openai 风格）：请求头 key 命中 `api_keys` 表，用 OPENAI 账号凭证直连官方 ChatGPT 后端。见「API Key 直连」。
 1. 同 API 风格下启用的链式代理（`chain_proxies.enabled=1`）。
 2. 同 API 风格下启用的单路由（`api_routes.enabled=1`）。
 3. 官方默认上游（`-target` / `-claude-target`）。
@@ -127,6 +144,48 @@ Web 页面左侧有侧边栏菜单，三项：
 - 下一轮同一会话进入时：冷却中的失败路由会跳过，优先从上次成功路由附近继续尝试；冷却过期后，前面失败过的路由重新进入候选，成功后会更新后续起点。
 - 如果一次请求里链内全部失败，会清空该会话该链的失败冷却；用户下一次重新发起请求时，从链路第一个路由重新开始尝试。
 - 如果进入请求时发现链路所有路由都在冷却中，也会清空冷却并从第一个路由重新生成候选。
+
+## API Key 直连（GPT 账号反代）
+
+让任意带 API Key 的客户端（原生 OpenAI SDK / Codex CLI 指向本代理）透明地借用「OPENAI」页里登录的 ChatGPT 账号，直连官方 Codex 后端，不经过路由/链式代理。逻辑在 `accountAuthForRequest`（main.go）。
+
+命中条件（三者全满足才走直连，否则回落老逻辑）：
+
+1. 请求是 openai 风格（Codex/Responses）；Claude 请求不适用。
+2. 请求头里的 key（`Authorization: Bearer` 或 `X-Api-Key`）命中 `api_keys` 表任意一条（`MatchAPIKey`）。
+3. 按请求体的 `model` 能匹配到账号：查 `selected_model` 相同的账号取 id 最小的一个（`OpenAIAccountForModel`，大小写不敏感）。
+
+匹配结果与错误码（`localError` 带状态码，避免 CLI 把配置错误当临时故障反复重试）：
+
+- 命中 → 用账号凭证直连，`applyAccountAuth` 注入 `Authorization: Bearer <access_token>` + `ChatGPT-Account-ID`，剥掉客户端自带认证头。
+- 请求无 `model` / 没有账号配置该模型 → **400**，不转发也不回落（回落会用错模型且用户无感）。
+- 查库失败 / 账号凭证损坏 → **503**（可能是临时的，值得重试）。
+
+### Token 自动刷新
+
+账号的 `access_token`（JWT）会过期。存库时同时记录 `token_expires_at`（本地解 JWT 的 `exp`，`accessTokenExpiry`）。
+
+- **主动刷新**：直连转发前 `EnsureFreshAuth` 判断剩余是否 <5 分钟（`tokenRefreshWindow`），是则调 Bridge `tokenRefresh` 刷新、回写完整 `auth.json` 与新过期时间。
+- **401 兜底**：上游真返回 401 时 `retryDirectWithRefresh` 强制刷新一次并用新凭证重试（覆盖时钟偏差、服务端提前失效）。
+- **并发安全**：刷新走 `refreshMu` 串行化，并传入「被拒绝的旧 token」判重——上游刷新会**轮换 refresh_token**，并发或重复刷新会把账号刷成 `refresh_token_reused` 而必须重新登录。
+- **永久失败**：Bridge 返回 `permanent=true`（refresh token 过期/被复用/被吊销）时写 `refresh_error`，页面显示「需重新登录」。
+
+### Codex 后端请求体兼容
+
+官方 Codex 后端（`/backend-api/codex`）对请求体有硬性要求，原生 SDK 客户端不带这些字段。直连时 `prepareCodexBackendBody` 补齐：
+
+- 强制 `store=false`（缺了 400 `Store must be set to false`）。
+- 强制 `stream=true`（缺了 400 `Stream must be set to true`；上游只支持流式）。
+- 剥掉后端不支持的参数（`codexBackendUnsupportedParams`，当前含 `max_output_tokens`，报 400 `Unsupported parameter`）。
+- 其余缺失字段按 Bridge 的 Responses JSON Schema 默认值补齐（`ResponsesDefaults`，来自 `codex_bridge_responses_schema` ABI，`sync.Once` 只取一次）。这份 schema 是「Codex 补哪些字段」的唯一真相，避免在 Go 里硬编码一份。
+
+### 非流式客户端：SSE→JSON 聚合
+
+后端强制流式，但原生 SDK 的非流式调用**省略 `stream` 字段**、期待一次性 JSON。`clientWantsSSE` 据此区分（缺省视为非流式，只有显式 `stream:true` 才是要流），直连计划记 `directJSON`。
+
+- 客户端要 SSE → 原样透传上游 SSE。
+- 客户端要 JSON（`directJSON`）→ 读完上游 SSE，`aggregateResponsesSSEToJSON` 聚合成单个 Responses JSON 返回。**注意**：Codex 后端的 `response.completed` 事件里 `response.output` 是空的，真正输出项在流式过程的 `response.output_item.done` 事件里，聚合时若 `output` 为空则按 `output_index` 顺序用这些 item 重建。
+- 记录/统计仍用原始 SSE（usage 与事件解析依赖它），客户端拿到的 JSON 只是聚合结果，两者分离。
 
 ## 协议适配层（adapter.go）
 
@@ -166,6 +225,8 @@ Web 页面左侧有侧边栏菜单，三项：
 - `account_aliases`：`Chatgpt-Account-Id` 到自定义账号名的映射。
 - `api_routes`：路由页配置的第三方 API 供应商。字段 `name`、`base_url`、`model`、`api_style`（openai/anthropic）、`protocol`（chat_completions/responses/messages）、`api_key`、`enabled`。旧库通过 `ensureColumn` 补 `api_style`/`protocol`/`enabled` 三列。
 - `chain_proxies`：链式代理配置。字段 `name`、`api_style`、`route_ids`（JSON 数组，保存点击顺序）、`enabled`、`created_at`、`updated_at`。同一 `api_style` 至多一条启用；`route_ids` 里的路由必须属于同一 API 风格。
+- `api_keys`：「API Key 直连」用的 Key 配置，字段 `name`、`api_key`。请求头 key 命中其中任意一条即触发直连。
+- `openai_accounts`：通过 `libcodex_bridge` 动态库登录的 GPT 账号。账号摘要单独分列，完整 Codex `auth.json` 保存在 `auth_json`，额度结果保存在 `status_json`，列表 API 不返回鉴权字段。后续通过 `ensureColumn` 补的列：`token_expires_at`（access_token JWT 的 exp，用于主动刷新）、`refresh_error`（刷新永久失败原因）、`models_json`/`models_at`（缓存的模型目录）、`selected_model`/`selected_reasoning_effort`/`selected_service_tier`（页面选的模型配置）。
 
 迁移会确保历史数据补齐 `account_id`、`tags` 等字段，并尝试修复旧数据里误保存为注入上下文的 `first_prompt`。
 
@@ -327,6 +388,21 @@ log/YYYY-MM-DD-{model}.log
 - `PUT /api/chains/{id}`：更新链式代理。
 - `POST /api/chains/{id}/toggle`：切换链式代理启用状态（按 `api_style` 互斥）。
 - `DELETE /api/chains/{id}`：删除链式代理。
+- `GET /api-keys`：API Key 配置页。
+- `GET /api/api-keys`：API Key 列表 JSON。
+- `POST /api/api-keys`：新建 API Key 配置。
+- `PUT /api/api-keys/{id}`：更新 API Key 配置。
+- `DELETE /api/api-keys/{id}`：删除 API Key 配置。
+- `GET /openai`：GPT 账号管理页。
+- `GET /openai/accounts/{id}`：GPT 账号额度详情页。
+- `GET /api/openai/accounts`：GPT 账号列表，不包含鉴权 JSON。
+- `DELETE /api/openai/accounts/{id}`：删除 GPT 账号及其鉴权信息。
+- `POST /api/openai/logins`：启动一次 Codex Bridge 动态库浏览器登录。
+- `GET /api/openai/logins/{id}`：查询登录状态。
+- `POST /api/openai/logins/{id}/cancel`：取消登录。
+- `POST /api/openai/accounts/{id}/refresh`：刷新该账号：本地补齐 Token 过期时间、按需刷新凭证、异步查额度。
+- `POST /api/openai/accounts/{id}/models`：同步拉取该账号可用模型目录并缓存。
+- `POST /api/openai/accounts/{id}/settings`：保存该账号选的模型/推理强度/速度。
 - `GET /healthz`：健康检查。
 
 ## 当前技术栈

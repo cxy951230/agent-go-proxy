@@ -103,6 +103,37 @@ type AccountAliasOption struct {
 	DisplayName string
 }
 
+// OpenAIAccount 是通过 Codex Bridge 登录的 ChatGPT 账号。AuthJSON 只在写入数据库时
+// 使用，列表 API 不返回该字段，避免浏览器页面接触 access/refresh token。
+type OpenAIAccount struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Email       string    `json:"email"`
+	AccountID   string    `json:"account_id"`
+	PlanType    string    `json:"plan_type"`
+	AuthJSON    string    `json:"-"`
+	CodexCommit string    `json:"codex_commit"`
+	// TokenExpiresAt 是 access_token(JWT)的 exp,登录与每次刷新后写入,
+	// 转发前据此判断是否需要提前刷新。零值表示未知。
+	TokenExpiresAt time.Time `json:"token_expires_at,omitempty"`
+	// RefreshError 记录最近一次刷新失败原因;permanent 失败(refresh token 过期/
+	// 被复用/被吊销)意味着必须重新登录。
+	RefreshError string `json:"refresh_error,omitempty"`
+	// Models 是 Bridge 拉回的可选模型目录(ModelPreset 列表),按账号套餐过滤后的结果。
+	// 每个模型自带 supported_reasoning_efforts 与 service_tiers。
+	Models   any       `json:"models,omitempty"`
+	ModelsAt time.Time `json:"models_at,omitempty"`
+	// 以下三项是用户在页面上选的配置。
+	SelectedModel           string `json:"selected_model"`
+	SelectedReasoningEffort string `json:"selected_reasoning_effort"`
+	SelectedServiceTier     string `json:"selected_service_tier"`
+	Status      any       `json:"status,omitempty"`
+	StatusError string    `json:"status_error,omitempty"`
+	StatusAt    time.Time `json:"status_at,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 // APIRoute 是「路由」页配置的第三方 API 供应商,保存 Base URL / Model / API Key。
 // APIStyle(openai/anthropic)与 Protocol(接口协议)联动,Enabled 全表互斥只能一条为真。
 type APIRoute struct {
@@ -114,6 +145,15 @@ type APIRoute struct {
 	Protocol  string    `json:"protocol"`
 	APIKey    string    `json:"api_key"`
 	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// APIKey 是「API Key」页管理的密钥配置,只保存名称与 Key 两个字段。
+type APIKey struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	APIKey    string    `json:"api_key"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -288,6 +328,30 @@ func (s *Store) migrate(ctx context.Context) error {
 			INDEX idx_chain_proxies_api_style (api_style),
 			INDEX idx_chain_proxies_updated_at (updated_at)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS api_keys (
+				id BIGINT AUTO_INCREMENT PRIMARY KEY,
+				name VARCHAR(128) NOT NULL DEFAULT '',
+				api_key VARCHAR(512) NOT NULL DEFAULT '',
+				created_at DATETIME(6) NOT NULL,
+				updated_at DATETIME(6) NOT NULL,
+				INDEX idx_api_keys_updated_at (updated_at)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS openai_accounts (
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			name VARCHAR(128) NOT NULL DEFAULT '',
+			email VARCHAR(320) NOT NULL DEFAULT '',
+			account_id VARCHAR(128) NOT NULL,
+			plan_type VARCHAR(64) NOT NULL DEFAULT '',
+			auth_json LONGTEXT NOT NULL,
+			codex_commit VARCHAR(64) NOT NULL DEFAULT '',
+			status_json LONGTEXT NOT NULL,
+			status_error TEXT NOT NULL,
+			status_at DATETIME(6) NULL,
+			created_at DATETIME(6) NOT NULL,
+			updated_at DATETIME(6) NOT NULL,
+			UNIQUE KEY uk_openai_accounts_account_id (account_id),
+		INDEX idx_openai_accounts_updated_at (updated_at)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -328,6 +392,250 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if err := s.ensureColumn(ctx, "api_routes", "enabled", "TINYINT(1) NOT NULL DEFAULT 0 AFTER api_key"); err != nil {
 		return err
+	}
+	if err := s.ensureColumn(ctx, "openai_accounts", "status_json", "LONGTEXT NOT NULL AFTER codex_commit"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "openai_accounts", "status_error", "TEXT NOT NULL AFTER status_json"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "openai_accounts", "status_at", "DATETIME(6) NULL AFTER status_error"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "openai_accounts", "token_expires_at", "DATETIME(6) NULL AFTER auth_json"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "openai_accounts", "refresh_error", "TEXT NULL AFTER token_expires_at"); err != nil {
+		return err
+	}
+	for _, col := range [][2]string{
+		{"models_json", "LONGTEXT NULL"},
+		{"models_at", "DATETIME(6) NULL"},
+		{"selected_model", "VARCHAR(128) NOT NULL DEFAULT ''"},
+		{"selected_reasoning_effort", "VARCHAR(32) NOT NULL DEFAULT ''"},
+		{"selected_service_tier", "VARCHAR(64) NOT NULL DEFAULT ''"},
+	} {
+		if err := s.ensureColumn(ctx, "openai_accounts", col[0], col[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// UpdateOpenAIAccountModels 缓存 Bridge 拉回的模型目录。目录随账号套餐变化,
+// 由页面手动刷新触发,不在转发路径里拉取。
+func (s *Store) UpdateOpenAIAccountModels(ctx context.Context, id int64, modelsJSON string) error {
+	if !json.Valid([]byte(modelsJSON)) {
+		return errors.New("Bridge 返回的模型 JSON 无效")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE openai_accounts SET models_json=?, models_at=? WHERE id=?`,
+		modelsJSON, time.Now(), id)
+	return err
+}
+
+// UpdateOpenAIAccountSettings 保存页面上选择的模型 / 推理强度 / 速度档位。
+func (s *Store) UpdateOpenAIAccountSettings(ctx context.Context, id int64, model, effort, serviceTier string) error {
+	model = strings.TrimSpace(model)
+	effort = strings.TrimSpace(effort)
+	serviceTier = strings.TrimSpace(serviceTier)
+	if len(model) > 128 || len(effort) > 32 || len(serviceTier) > 64 {
+		return errors.New("模型配置字段过长")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE openai_accounts
+		SET selected_model=?, selected_reasoning_effort=?, selected_service_tier=?, updated_at=? WHERE id=?`,
+		model, effort, serviceTier, time.Now(), id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// UpdateOpenAIAccountAuth 刷新成功后回写完整凭证与新的过期时间。
+// 必须整份覆盖 auth_json:上游刷新会轮换 refresh_token,旧值再用会被判定为
+// refresh_token_reused 而导致账号必须重新登录。
+func (s *Store) UpdateOpenAIAccountAuth(ctx context.Context, id int64, authJSON string, expiresAt time.Time) error {
+	if !json.Valid([]byte(authJSON)) {
+		return errors.New("刷新返回的鉴权 JSON 无效")
+	}
+	var expires any
+	if !expiresAt.IsZero() {
+		expires = expiresAt
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE openai_accounts
+		SET auth_json=?, token_expires_at=?, refresh_error='', updated_at=? WHERE id=?`,
+		authJSON, expires, time.Now(), id)
+	return err
+}
+
+// UpdateOpenAIAccountTokenExpiry 只回填过期时间。用于历史记录补齐:过期时间能直接从
+// 已存的 access_token(JWT)本地算出,不需要发起刷新。
+func (s *Store) UpdateOpenAIAccountTokenExpiry(ctx context.Context, id int64, expiresAt time.Time) error {
+	var expires any
+	if !expiresAt.IsZero() {
+		expires = expiresAt
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE openai_accounts SET token_expires_at=? WHERE id=?`, expires, id)
+	return err
+}
+
+// SetOpenAIAccountRefreshError 记录刷新失败原因,供页面提示「需重新登录」。
+func (s *Store) SetOpenAIAccountRefreshError(ctx context.Context, id int64, message string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE openai_accounts SET refresh_error=? WHERE id=?`, message, id)
+	return err
+}
+
+func (s *Store) GetOpenAIAccount(ctx context.Context, id int64) (OpenAIAccount, error) {
+	var account OpenAIAccount
+	var statusRaw string
+	var statusAt, expiresAt sql.NullTime
+	var refreshError sql.NullString
+	var modelsRaw sql.NullString
+	var modelsAt sql.NullTime
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, email, account_id, plan_type, auth_json, codex_commit, status_json, status_error, status_at, token_expires_at, refresh_error,
+		models_json, models_at, selected_model, selected_reasoning_effort, selected_service_tier, created_at, updated_at
+		FROM openai_accounts WHERE id=?`, id).Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.AuthJSON, &account.CodexCommit, &statusRaw, &account.StatusError, &statusAt, &expiresAt, &refreshError,
+		&modelsRaw, &modelsAt, &account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier, &account.CreatedAt, &account.UpdatedAt)
+	if err != nil {
+		return account, err
+	}
+	account.Models = decodeModelsJSON(modelsRaw)
+	if modelsAt.Valid {
+		account.ModelsAt = modelsAt.Time
+	}
+	if expiresAt.Valid {
+		account.TokenExpiresAt = expiresAt.Time
+	}
+	if refreshError.Valid {
+		account.RefreshError = refreshError.String
+	}
+	if json.Valid([]byte(statusRaw)) && statusRaw != "null" && statusRaw != "" {
+		_ = json.Unmarshal([]byte(statusRaw), &account.Status)
+	}
+	if statusAt.Valid {
+		account.StatusAt = statusAt.Time
+	}
+	return account, nil
+}
+
+func (s *Store) UpdateOpenAIAccountStatus(ctx context.Context, id int64, statusJSON, statusError string) error {
+	if statusJSON == "" {
+		statusJSON = "null"
+	}
+	if !json.Valid([]byte(statusJSON)) {
+		return errors.New("Bridge 返回的额度 JSON 无效")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE openai_accounts SET status_json=?, status_error=?, status_at=? WHERE id=?`, statusJSON, statusError, time.Now(), id)
+	return err
+}
+
+func (s *Store) ListOpenAIAccounts(ctx context.Context) ([]OpenAIAccount, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, email, account_id, plan_type, codex_commit, status_json, status_error, status_at, token_expires_at, refresh_error,
+		models_json, models_at, selected_model, selected_reasoning_effort, selected_service_tier, created_at, updated_at
+		FROM openai_accounts ORDER BY updated_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]OpenAIAccount, 0)
+	for rows.Next() {
+		var account OpenAIAccount
+		var statusRaw string
+		var statusAt, expiresAt, modelsAt sql.NullTime
+		var refreshError, modelsRaw sql.NullString
+		if err := rows.Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.CodexCommit, &statusRaw, &account.StatusError, &statusAt, &expiresAt, &refreshError,
+			&modelsRaw, &modelsAt, &account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier, &account.CreatedAt, &account.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if expiresAt.Valid {
+			account.TokenExpiresAt = expiresAt.Time
+		}
+		if refreshError.Valid {
+			account.RefreshError = refreshError.String
+		}
+		account.Models = decodeModelsJSON(modelsRaw)
+		if modelsAt.Valid {
+			account.ModelsAt = modelsAt.Time
+		}
+		if json.Valid([]byte(statusRaw)) && statusRaw != "null" && statusRaw != "" {
+			_ = json.Unmarshal([]byte(statusRaw), &account.Status)
+		}
+		if statusAt.Valid {
+			account.StatusAt = statusAt.Time
+		}
+		out = append(out, account)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertOpenAIAccount(ctx context.Context, account OpenAIAccount) (int64, error) {
+	account.Name = strings.TrimSpace(account.Name)
+	account.Email = strings.TrimSpace(account.Email)
+	account.AccountID = strings.TrimSpace(account.AccountID)
+	account.PlanType = strings.TrimSpace(account.PlanType)
+	if account.AccountID == "" {
+		return 0, errors.New("ChatGPT account id 为空")
+	}
+	if !json.Valid([]byte(account.AuthJSON)) {
+		return 0, errors.New("Bridge 返回的鉴权 JSON 无效")
+	}
+	if len(account.Name) > 128 || len(account.AccountID) > 128 || len(account.PlanType) > 64 || len(account.CodexCommit) > 64 {
+		return 0, errors.New("OpenAI 账号字段过长")
+	}
+	if len(account.Email) > 320 {
+		return 0, errors.New("OpenAI 账号邮箱过长")
+	}
+	now := time.Now()
+	var expires any
+	if !account.TokenExpiresAt.IsZero() {
+		expires = account.TokenExpiresAt
+	}
+	res, err := s.db.ExecContext(ctx, `INSERT INTO openai_accounts
+		(name, email, account_id, plan_type, auth_json, token_expires_at, refresh_error, codex_commit, status_json, status_error, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, '', ?, 'null', '', ?, ?)
+		ON DUPLICATE KEY UPDATE
+			name=IF(VALUES(name)='', name, VALUES(name)), email=VALUES(email),
+			plan_type=VALUES(plan_type), auth_json=VALUES(auth_json),
+			token_expires_at=VALUES(token_expires_at), refresh_error='',
+			codex_commit=VALUES(codex_commit), updated_at=VALUES(updated_at)`,
+		account.Name, account.Email, account.AccountID, account.PlanType, account.AuthJSON, expires, account.CodexCommit, now, now)
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if id == 0 {
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM openai_accounts WHERE account_id=?`, account.AccountID).Scan(&id); err != nil {
+			return 0, err
+		}
+	}
+	if account.Name != "" {
+		_, err = s.db.ExecContext(ctx, `INSERT INTO account_aliases (account_id, display_name, created_at, updated_at)
+			VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE display_name=VALUES(display_name), updated_at=VALUES(updated_at)`,
+			account.AccountID, account.Name, now, now)
+	}
+	return id, err
+}
+
+func (s *Store) DeleteOpenAIAccount(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM openai_accounts WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
 	}
 	return nil
 }
@@ -960,6 +1268,144 @@ func (s *Store) DeleteAPIRoute(ctx context.Context, id int64) error {
 	return nil
 }
 
+func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, api_key, created_at, updated_at
+		FROM api_keys ORDER BY updated_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]APIKey, 0)
+	for rows.Next() {
+		var k APIKey
+		if err := rows.Scan(&k.ID, &k.Name, &k.APIKey, &k.CreatedAt, &k.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// MatchAPIKey 判断客户端带来的 key 是否命中「API Key」页里配置的任意一条。
+func (s *Store) MatchAPIKey(ctx context.Context, key string) (bool, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false, nil
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM api_keys WHERE api_key=?`, key).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// DefaultOpenAIAccount 取用于直连反代的 GPT 账号。当前按 id 取第一个(只配了一个),
+// 后续要做多账号调度时改这里即可。返回值包含 AuthJSON。
+func (s *Store) DefaultOpenAIAccount(ctx context.Context) (OpenAIAccount, bool, error) {
+	return s.queryOpenAIAccount(ctx, "", "")
+}
+
+// OpenAIAccountForModel 按请求里的模型挑账号:选中该模型的账号里取 id 最小的一个。
+// 匹配不到返回 ok=false,由调用方决定如何报错(不静默回落,避免用错模型)。
+func (s *Store) OpenAIAccountForModel(ctx context.Context, model string) (OpenAIAccount, bool, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return OpenAIAccount{}, false, nil
+	}
+	return s.queryOpenAIAccount(ctx, "WHERE LOWER(selected_model)=LOWER(?)", model)
+}
+
+func (s *Store) queryOpenAIAccount(ctx context.Context, where string, args ...any) (OpenAIAccount, bool, error) {
+	var account OpenAIAccount
+	var expiresAt sql.NullTime
+	var refreshError sql.NullString
+	query := `SELECT id, name, email, account_id, plan_type, auth_json, token_expires_at, refresh_error,
+		selected_model, selected_reasoning_effort, selected_service_tier
+		FROM openai_accounts ` + where + ` ORDER BY id LIMIT 1`
+	if where == "" {
+		args = nil
+	}
+	err := s.db.QueryRowContext(ctx, query, args...).
+		Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.AuthJSON, &expiresAt, &refreshError,
+			&account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier)
+	if errors.Is(err, sql.ErrNoRows) {
+		return account, false, nil
+	}
+	if expiresAt.Valid {
+		account.TokenExpiresAt = expiresAt.Time
+	}
+	if refreshError.Valid {
+		account.RefreshError = refreshError.String
+	}
+	if err != nil {
+		return account, false, err
+	}
+	return account, true, nil
+}
+
+func (s *Store) CreateAPIKey(ctx context.Context, in APIKey) (int64, error) {
+	if err := validateAPIKey(&in); err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	res, err := s.db.ExecContext(ctx, `INSERT INTO api_keys (name, api_key, created_at, updated_at)
+		VALUES (?, ?, ?, ?)`, in.Name, in.APIKey, now, now)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *Store) UpdateAPIKey(ctx context.Context, id int64, in APIKey) error {
+	if err := validateAPIKey(&in); err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE api_keys SET name=?, api_key=?, updated_at=? WHERE id=?`,
+		in.Name, in.APIKey, time.Now(), id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) DeleteAPIKey(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM api_keys WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// validateAPIKey 归一化并校验:API Key 必填,名称可选,两者都有长度上限。
+func validateAPIKey(in *APIKey) error {
+	in.Name = strings.TrimSpace(in.Name)
+	in.APIKey = strings.TrimSpace(in.APIKey)
+	if in.APIKey == "" {
+		return errors.New("API Key 不能为空")
+	}
+	if len(in.Name) > 128 {
+		return errors.New("名称过长")
+	}
+	if len(in.APIKey) > 512 {
+		return errors.New("API Key 过长")
+	}
+	return nil
+}
+
 func (s *Store) ListChainProxies(ctx context.Context) ([]ChainProxy, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, api_style, route_ids, enabled, created_at, updated_at
 		FROM chain_proxies ORDER BY updated_at DESC, id DESC`)
@@ -1231,6 +1677,18 @@ func decodeInt64List(raw string) []int64 {
 	var values []int64
 	_ = json.Unmarshal([]byte(raw), &values)
 	return values
+}
+
+// decodeModelsJSON 把缓存的模型目录还原成结构化值,供 API 直接返回给页面。
+func decodeModelsJSON(raw sql.NullString) any {
+	if !raw.Valid || raw.String == "" || raw.String == "null" || !json.Valid([]byte(raw.String)) {
+		return nil
+	}
+	var value any
+	if json.Unmarshal([]byte(raw.String), &value) != nil {
+		return nil
+	}
+	return value
 }
 
 func nullJSON(raw []byte) any {

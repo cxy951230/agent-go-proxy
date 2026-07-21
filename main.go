@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -46,12 +47,13 @@ type config struct {
 }
 
 type proxyServer struct {
-	cfg      config
-	client   *http.Client
-	logs     *logWriter
-	store    *Store
-	recorder *asyncRecorder
-	chains   *chainRouteState
+	cfg          config
+	client       *http.Client
+	logs         *logWriter
+	store        *Store
+	recorder     *asyncRecorder
+	chains       *chainRouteState
+	openaiLogins *openAILoginManager
 }
 
 const chainRouteCooldown = 2 * time.Minute
@@ -76,6 +78,30 @@ type forwardPlan struct {
 	adaptTarget    string
 	adaptState     *adapterState
 	mismatch       string
+	// accountAuth 非空表示走「API Key 直连」:用 OPENAI 菜单里配置的 GPT 账号
+	// 凭证直接打官方 ChatGPT 后端,不经过路由/链式代理。
+	accountAuth *openaiAccountAuth
+	// directJSON:直连时客户端要非流式响应。上游一律流式,拿到 SSE 后聚合成单个 JSON 返回。
+	directJSON bool
+}
+
+// openaiAccountAuth 是直连官方上游时要注入的账号凭证。
+type openaiAccountAuth struct {
+	AccessToken string
+	AccountID   string
+	Label       string
+}
+
+// localError 是代理自己产生的错误(不是上游返回的),带上要回给客户端的状态码。
+type localError struct {
+	status  int
+	message string
+}
+
+func (e *localError) Error() string { return e.message }
+
+func newLocalError(status int, format string, args ...any) *localError {
+	return &localError{status: status, message: fmt.Sprintf(format, args...)}
 }
 
 func newChainRouteState() *chainRouteState {
@@ -187,6 +213,7 @@ func main() {
 	claudeTargetValue := flag.String("claude-target", envOrDefault("CLAUDE_BASE_URL", "https://api.anthropic.com"), "upstream base URL for Claude (Anthropic) requests")
 	logDir := flag.String("log-dir", "log", "directory for date-based JSONL logs")
 	dsn := flag.String("mysql-dsn", envOrDefault("MYSQL_DSN", "root:123456@tcp(127.0.0.1:3306)/agent_go_proxy?parseTime=true&charset=utf8mb4&loc=Local"), "MySQL DSN")
+	bridgeLibrary := flag.String("codex-bridge-lib", defaultBridgeLoginBin(), "path to libcodex_bridge dynamic library")
 	flag.Parse()
 
 	target, err := url.Parse(*targetValue)
@@ -213,6 +240,8 @@ func main() {
 	defer store.Close()
 	recorder := newAsyncRecorder(store)
 	defer recorder.Close()
+	openaiLogins := newOpenAILoginManager(*bridgeLibrary, store)
+	defer openaiLogins.Close()
 
 	srv := &proxyServer{
 		cfg: config{
@@ -239,16 +268,20 @@ func main() {
 			},
 			Timeout: 0,
 		},
-		logs:     lw,
-		store:    store,
-		recorder: recorder,
-		chains:   newChainRouteState(),
+		logs:         lw,
+		store:        store,
+		recorder:     recorder,
+		chains:       newChainRouteState(),
+		openaiLogins: openaiLogins,
 	}
 
 	router := chi.NewRouter()
 	router.Get("/", srv.handleIndex)
 	router.Get("/routes", srv.handleRoutes)
 	router.Get("/chains", srv.handleChains)
+	router.Get("/api-keys", srv.handleAPIKeysPage)
+	router.Get("/openai", srv.handleOpenAI)
+	router.Get("/openai/accounts/{id}", srv.handleOpenAIAccount)
 	router.Get("/conversations/{id}", srv.handleConversationDetail)
 	router.Get("/favicon.ico", srv.handleFavicon)
 	router.Get("/assets/favicon.jpg", srv.handleFavicon)
@@ -263,6 +296,18 @@ func main() {
 	router.Put("/api/chains/{id}", srv.handleAPIChainUpdate)
 	router.Post("/api/chains/{id}/toggle", srv.handleAPIChainToggle)
 	router.Delete("/api/chains/{id}", srv.handleAPIChainDelete)
+	router.Get("/api/api-keys", srv.handleAPIKeysList)
+	router.Post("/api/api-keys", srv.handleAPIKeyCreate)
+	router.Put("/api/api-keys/{id}", srv.handleAPIKeyUpdate)
+	router.Delete("/api/api-keys/{id}", srv.handleAPIKeyDelete)
+	router.Get("/api/openai/accounts", srv.handleAPIOpenAIAccounts)
+	router.Delete("/api/openai/accounts/{id}", srv.handleAPIOpenAIAccountDelete)
+	router.Post("/api/openai/logins", srv.handleAPIOpenAILoginStart)
+	router.Get("/api/openai/logins/{id}", srv.handleAPIOpenAILoginStatus)
+	router.Post("/api/openai/logins/{id}/cancel", srv.handleAPIOpenAILoginCancel)
+	router.Post("/api/openai/accounts/{id}/refresh", srv.handleAPIOpenAIAccountRefresh)
+	router.Post("/api/openai/accounts/{id}/models", srv.handleAPIOpenAIAccountModels)
+	router.Post("/api/openai/accounts/{id}/settings", srv.handleAPIOpenAIAccountSettings)
 	router.Get("/api/conversations", srv.handleAPIConversations)
 	router.Get("/api/conversations/{id}", srv.handleAPIConversationDetail)
 	router.Delete("/api/conversations/{id}", srv.handleAPIConversationDelete)
@@ -287,6 +332,7 @@ func main() {
 		fmt.Printf("claude upstream target: %s\n", claudeTarget.String())
 		fmt.Printf("log dir: %s\n", *logDir)
 		fmt.Printf("dashboard: http://%s/\n", *listenAddr)
+		fmt.Printf("codex bridge library: %s\n", *bridgeLibrary)
 		fmt.Printf("for Codex CLI: CODEX_HOME=/path/to/codex_home NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost codex\n")
 		errCh <- httpServer.ListenAndServe()
 	}()
@@ -356,7 +402,13 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqProtocol := detectProtocol(r.URL.Path)
 	plans, chainMode, planErr := p.forwardPlans(r.Context(), routeStyle, upstreamTarget, r, reqProtocol, reqBody, logModel, meta.SessionID)
 	if planErr != nil {
-		p.finishLocalError(w, r, start, nil, provider, http.StatusServiceUnavailable, planErr.Error(), recordedReqBody, effectiveModel, !isProbe)
+		// 代理自己产生的错误可以指定状态码(如模型匹配不上用 400,避免 CLI 反复重试)。
+		status := http.StatusServiceUnavailable
+		var local *localError
+		if errors.As(planErr, &local) {
+			status = local.status
+		}
+		p.finishLocalError(w, r, start, nil, provider, status, planErr.Error(), recordedReqBody, effectiveModel, !isProbe)
 		return
 	}
 	if len(plans) == 0 {
@@ -395,7 +447,11 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Printf("!! chain route failed current=%s next=%s reason=%s\n", chainPlanLabel(plans, i), chainNextLabel(plans, i), plan.mismatch)
 			continue
 		}
-		fmt.Printf("-> [%s] %s %s upstream=%s adapt=%s\n", provider, r.Method, r.URL.RequestURI(), plan.upstreamURL, fallback(plan.adaptTarget, "none"))
+		accountNote := ""
+		if plan.accountAuth != nil {
+			accountNote = " account=" + plan.accountAuth.Label
+		}
+		fmt.Printf("-> [%s] %s %s upstream=%s adapt=%s%s\n", provider, r.Method, r.URL.RequestURI(), plan.upstreamURL, fallback(plan.adaptTarget, "none"), accountNote)
 		resp, err = p.doUpstream(r, plan)
 		if err != nil {
 			lastErr = err
@@ -411,6 +467,16 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			fmt.Printf("!! chain route failed current=%s next=%s error=%v\n", chainPlanLabel(plans, i), chainNextLabel(plans, i), err)
 			continue
+		}
+		// 直连路径的 401 兜底:凭证被上游拒绝时强制刷新并重试一次。
+		if plan.accountAuth != nil && resp.StatusCode == http.StatusUnauthorized {
+			if retried, ok := p.retryDirectWithRefresh(r, &plan); ok {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				resp = retried
+				plans[i] = plan
+				fmt.Printf("== upstream 401, refreshed credentials and retried, status=%d\n", resp.StatusCode)
+			}
 		}
 		if chainMode && resp.StatusCode >= 400 {
 			if plan.route != nil {
@@ -534,6 +600,29 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		decodedRespBody = native
 		responseBytes = fallbackInt(preparedResponseBytes, len(native))
+	} else if plan.directJSON && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// 直连但客户端要非流式:上游是强制的 SSE,读完聚合成单个 Responses JSON 返回。
+		rawUp, err := io.ReadAll(resp.Body)
+		sse := decodeResponseBody(rawUp, resp.Header.Get("Content-Encoding"))
+		jsonBody, ok := aggregateResponsesSSEToJSON(sse)
+		if !ok {
+			// 聚合不出来(异常流)就把解码后的原文回给客户端,别吞掉。
+			jsonBody = sse
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(resp.StatusCode)
+		_, writeErr := io.WriteString(w, jsonBody)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		if err != nil {
+			copyErr = err
+		} else {
+			copyErr = writeErr
+		}
+		// 记录/统计仍用原始 SSE:usage 与事件解析都依赖它,客户端拿到的 JSON 只是聚合结果。
+		decodedRespBody = sse
+		responseBytes = len(jsonBody)
 	} else {
 		// 原生透传:边读边写回(可能 gzip),记录/解析前再按 Content-Encoding 解压副本。
 		copyHeaders(w.Header(), resp.Header)
@@ -587,6 +676,23 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *proxyServer) forwardPlans(ctx context.Context, routeStyle string, upstreamTarget *url.URL, r *http.Request, reqProtocol string, reqBody []byte, logModel, sessionID string) ([]forwardPlan, bool, error) {
+	// 最高优先级:请求头里的 key 命中「API Key」页配置 → 换成 GPT 账号凭证直连官方上游,
+	// 不走链式代理/路由。没命中则继续下面的老逻辑。
+	auth, ok, authErr := p.accountAuthForRequest(ctx, r, routeStyle, logModel)
+	if authErr != nil {
+		return nil, false, authErr
+	}
+	if ok {
+		return []forwardPlan{{
+			upstreamURL:    buildUpstreamURL(upstreamTarget, r.URL),
+			upstreamHost:   upstreamTarget.Host,
+			forwardBody:    p.prepareCodexBackendBody(reqBody),
+			effectiveModel: logModel,
+			accountAuth:    auth,
+			directJSON:     !clientWantsSSE(reqBody),
+		}}, false, nil
+	}
+
 	chain, chainOK, err := p.store.EnabledChainProxyForStyle(ctx, routeStyle)
 	if err != nil {
 		log.Printf("load enabled chain proxy: %v", err)
@@ -670,6 +776,9 @@ func (p *proxyServer) doUpstream(r *http.Request, plan forwardPlan) (*http.Respo
 		if plan.route != nil {
 			applyRouteAuth(upstreamReq.Header, *plan.route)
 		}
+		if plan.accountAuth != nil {
+			applyAccountAuth(upstreamReq.Header, *plan.accountAuth)
+		}
 		resp, err = p.client.Do(upstreamReq)
 		if err == nil {
 			return resp, nil
@@ -680,6 +789,25 @@ func (p *proxyServer) doUpstream(r *http.Request, plan forwardPlan) (*http.Respo
 		fmt.Printf("!! upstream attempt %d/%d failed, retrying: %v\n", attempt, maxAttempts, err)
 		time.Sleep(time.Duration(attempt) * 150 * time.Millisecond)
 	}
+}
+
+// retryDirectWithRefresh 是直连路径的 401 兜底:强制刷新凭证后用新 token 重试一次。
+// 只有拿到新响应才算成功,失败时不动原响应,由调用方把上游的 401 原样返回。
+func (p *proxyServer) retryDirectWithRefresh(r *http.Request, plan *forwardPlan) (*http.Response, bool) {
+	auth, err := p.openaiLogins.ForceRefreshAuth(r.Context(), plan.accountAuth.AccessToken)
+	if err != nil {
+		log.Printf("upstream returned 401 but refreshing credentials failed: %v", err)
+		return nil, false
+	}
+	retryPlan := *plan
+	retryPlan.accountAuth = auth
+	retried, err := p.doUpstream(r, retryPlan)
+	if err != nil {
+		log.Printf("retry after credential refresh failed: %v", err)
+		return nil, false
+	}
+	plan.accountAuth = auth
+	return retried, true
 }
 
 func (p *proxyServer) finishLocalError(w http.ResponseWriter, r *http.Request, start time.Time, plan *forwardPlan, provider string, status int, message, recordedReqBody, model string, record bool) {
@@ -959,6 +1087,117 @@ func buildRouteUpstreamURL(baseURL, protocol, rawQuery string) string {
 	return u
 }
 
+// codexBackendUnsupportedParams 是 ChatGPT Codex 后端不认、但原生 SDK 会带的参数,
+// 直连转发前剥掉,否则报 400 {"detail":"Unsupported parameter: ..."}。Codex CLI 本身不带这些。
+var codexBackendUnsupportedParams = []string{"max_output_tokens"}
+
+// prepareCodexBackendBody 把请求体补成 ChatGPT Codex 后端(/backend-api/codex)能接受的形式。
+// Codex CLI 自带 store/include/stream 等字段,原生 OpenAI SDK 客户端不带,直连时代理据 Bridge 的
+// JSON Schema 默认值补齐缺失字段(客户端已设的保留),并处理后端的两条硬性要求:
+//
+//   - store 必须 false —— 缺了 400 {"detail":"Store must be set to false"}
+//   - stream 必须 true —— 缺了 400 {"detail":"Stream must be set to true"}
+//
+// 无论客户端是否要流式,上游都强制 stream=true(后端不支持非流式);客户端若要非流式,
+// 由转发层把 SSE 聚合回 JSON,见 aggregateResponsesSSEToJSON。
+func (p *proxyServer) prepareCodexBackendBody(body []byte) []byte {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	for key, def := range p.openaiLogins.ResponsesDefaults() {
+		if _, exists := obj[key]; !exists {
+			obj[key] = def
+		}
+	}
+	// 后端硬性要求,强制覆盖(Schema 默认值也是这两个,这里再兜一层保证 Bridge 不可用时也对)。
+	obj["store"] = json.RawMessage("false")
+	obj["stream"] = json.RawMessage("true")
+	for _, key := range codexBackendUnsupportedParams {
+		delete(obj, key)
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// clientWantsSSE 判断客户端是否期望 SSE 流式响应。
+// 与 clientWantsStream 不同:这里「缺省」视为非流式——原生 OpenAI SDK 的非流式调用会
+// 省略 stream 字段(期待一次性 JSON),只有显式 stream:true 才当作要流。
+func clientWantsSSE(body []byte) bool {
+	var s struct {
+		Stream *bool `json:"stream"`
+	}
+	if json.Unmarshal(body, &s) == nil && s.Stream != nil {
+		return *s.Stream
+	}
+	return false
+}
+
+// aggregateResponsesSSEToJSON 把 Responses 协议的 SSE 流聚合成非流式响应体。
+//
+// 注意 ChatGPT Codex 后端的一个特性:response.completed 事件里的 response.output 是**空**的,
+// 真正的输出项分散在流式过程的 response.output_item.done 事件里。所以只取 completed 会得到
+// 一个没有正文的壳(SDK 的 output_text 为空)。这里以 completed 的 response 为基,若它的
+// output 为空,就用各 output_item.done 的 item 按 output_index 顺序重建 output 数组。
+func aggregateResponsesSSEToJSON(sseBody string) (string, bool) {
+	events := parseSSEEvents(sseBody)
+	var completed map[string]any
+	type indexedItem struct {
+		idx  int
+		item json.RawMessage
+	}
+	var items []indexedItem
+	for _, ev := range events {
+		if len(ev.Data) == 0 {
+			continue
+		}
+		var d struct {
+			Type        string          `json:"type"`
+			OutputIndex int             `json:"output_index"`
+			Item        json.RawMessage `json:"item"`
+			Response    json.RawMessage `json:"response"`
+		}
+		if json.Unmarshal(ev.Data, &d) != nil {
+			continue
+		}
+		switch d.Type {
+		case "response.completed":
+			if len(d.Response) > 0 {
+				var m map[string]any
+				if json.Unmarshal(d.Response, &m) == nil {
+					completed = m
+				}
+			}
+		case "response.output_item.done":
+			if len(d.Item) > 0 {
+				items = append(items, indexedItem{idx: d.OutputIndex, item: d.Item})
+			}
+		}
+	}
+	if completed == nil {
+		return "", false
+	}
+	if out, ok := completed["output"].([]any); !ok || len(out) == 0 {
+		sort.SliceStable(items, func(i, j int) bool { return items[i].idx < items[j].idx })
+		rebuilt := make([]any, 0, len(items))
+		for _, it := range items {
+			var v any
+			if json.Unmarshal(it.item, &v) == nil {
+				rebuilt = append(rebuilt, v)
+			}
+		}
+		completed["output"] = rebuilt
+	}
+	out, err := json.Marshal(completed)
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
 // rewriteModel 把请求体里的 model 改成路由配置的 model(仅当配置了 model 时)。
 // 用 RawMessage map 只替换 model 键,其余字段原值保留,避免 re-marshal 改动。
 func rewriteModel(body []byte, model string) []byte {
@@ -1007,6 +1246,99 @@ func applyRouteAuth(h http.Header, route APIRoute) {
 		}
 	} else {
 		h.Set("Authorization", "Bearer "+route.APIKey)
+	}
+}
+
+// clientAPIKey 从请求头取客户端携带的 key:OpenAI 风格在 Authorization: Bearer,
+// Anthropic 风格在 X-Api-Key。两者都取不到返回空串。
+func clientAPIKey(r *http.Request) string {
+	if value := strings.TrimSpace(r.Header.Get("Authorization")); value != "" {
+		if len(value) >= 7 && strings.EqualFold(value[:7], "Bearer ") {
+			return strings.TrimSpace(value[7:])
+		}
+		return value
+	}
+	return strings.TrimSpace(r.Header.Get("X-Api-Key"))
+}
+
+// accountAuthForRequest 判断这次请求是否该走「API Key 直连」:
+// 只对 OpenAI 风格(Codex)生效,且请求头里的 key 要命中 api_keys 配置,
+// 同时 OPENAI 菜单里至少有一个可用账号。任一条件不满足都回落老逻辑。
+func (p *proxyServer) accountAuthForRequest(ctx context.Context, r *http.Request, routeStyle, model string) (*openaiAccountAuth, bool, error) {
+	if routeStyle != "openai" {
+		return nil, false, nil
+	}
+	key := clientAPIKey(r)
+	if key == "" {
+		return nil, false, nil
+	}
+	matched, err := p.store.MatchAPIKey(ctx, key)
+	if err != nil {
+		log.Printf("match api key: %v", err)
+		return nil, false, nil
+	}
+	if !matched {
+		return nil, false, nil
+	}
+
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, false, newLocalError(http.StatusBadRequest, "请求里没有 model 字段，无法匹配 GPT 账号")
+	}
+	account, ok, err := p.store.OpenAIAccountForModel(ctx, model)
+	if err != nil {
+		log.Printf("load openai account for model %q: %v", model, err)
+		return nil, false, newLocalError(http.StatusServiceUnavailable, "查询 GPT 账号失败: %v", err)
+	}
+	if !ok {
+		return nil, false, newLocalError(http.StatusBadRequest,
+			"没有账号配置了模型 %s，请在 OPENAI 页面为某个账号选择该模型", model)
+	}
+	// access_token 快过期就先刷新(Bridge 刷新 + 回写库)。刷新失败仍用旧凭证试一次,
+	// 让上游给出真实错误,而不是在本地直接把请求打回。
+	if refreshed, err := p.openaiLogins.EnsureFreshAuth(ctx, account); err != nil {
+		log.Printf("refresh openai account %d: %v", account.ID, err)
+	} else {
+		account = refreshed
+	}
+	auth, err := newAccountAuth(account)
+	if err != nil {
+		log.Printf("parse openai account auth (id=%d): %v", account.ID, err)
+		return nil, false, newLocalError(http.StatusServiceUnavailable,
+			"账号 %s 的鉴权信息不可用，请重新登录", fallback(account.Name, account.AccountID))
+	}
+	return auth, true, nil
+}
+
+// accountAuthFromJSON 从存库的 Codex auth.json 里取出 access token 与 account id。
+// account_id 缺失时回落到登录时解析出的列值。
+func accountAuthFromJSON(raw, fallbackAccountID string) (*openaiAccountAuth, error) {
+	var parsed struct {
+		Tokens struct {
+			AccessToken string `json:"access_token"`
+			AccountID   string `json:"account_id"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(parsed.Tokens.AccessToken) == "" {
+		return nil, errors.New("账号鉴权信息里没有 access_token")
+	}
+	return &openaiAccountAuth{
+		AccessToken: parsed.Tokens.AccessToken,
+		AccountID:   fallback(parsed.Tokens.AccountID, fallbackAccountID),
+	}, nil
+}
+
+// applyAccountAuth 用 GPT 账号凭证替换客户端带来的代理 key,直连官方上游时使用。
+func applyAccountAuth(h http.Header, auth openaiAccountAuth) {
+	h.Del("Authorization")
+	h.Del("X-Api-Key")
+	h.Del("Chatgpt-Account-Id")
+	h.Set("Authorization", "Bearer "+auth.AccessToken)
+	if auth.AccountID != "" {
+		h.Set("Chatgpt-Account-Id", auth.AccountID)
 	}
 }
 

@@ -55,6 +55,17 @@ The dashboard is served by the same process:
 http://127.0.0.1:8080/
 ```
 
+The `OPENAI` page starts ChatGPT browser OAuth through the `libcodex_bridge` dynamic library and
+stores the resulting Codex `auth.json` payload in the MySQL `openai_accounts.auth_json` column.
+It can query each account's current `/wham/usage` rate-limit and credit details through the same
+dynamic library. Account list responses never include the credential payload. The library is
+auto-detected from the adjacent `codex-bridge` checkout and can be overridden with:
+
+```sh
+CODEX_BRIDGE_LIB=/path/to/libcodex_bridge.dylib go run .
+# or: go run . -codex-bridge-lib /path/to/libcodex_bridge.dylib
+```
+
 MySQL defaults:
 
 ```text

@@ -63,7 +63,9 @@ func requestMetaFromHeaders(headers http.Header, body []byte, provider string) r
 	if provider == providerClaude {
 		return claudeRequestMeta(headers, body)
 	}
-	sessionID := firstHeader(headers, "Session_id")
+	// 新版 Codex CLI 发的是 Session-Id(连字符),旧版是 Session_id(下划线)。
+	// HTTP 头名大小写不敏感,但 '-' 和 '_' 是不同字符,两个都认,连字符优先。
+	sessionID := firstHeaderAny(headers, "Session-Id", "Session_id")
 	accountID := firstHeader(headers, "Chatgpt-Account-Id")
 	windowID := firstHeader(headers, "X-Codex-Window-Id")
 	if sessionID == "" && windowID != "" {
@@ -209,6 +211,17 @@ func firstHeader(h http.Header, key string) string {
 		return ""
 	}
 	return values[0]
+}
+
+// firstHeaderAny 按顺序返回第一个非空的头值,用于兼容同义但拼写不同的头名
+// (如 Session-Id / Session_id)。
+func firstHeaderAny(h http.Header, keys ...string) string {
+	for _, key := range keys {
+		if value := firstHeader(h, key); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func firstUserPrompt(input []struct {

@@ -63,7 +63,7 @@ var baseTemplate = template.Must(template.New("base").Funcs(template.FuncMap{
 			return "ok"
 		}
 	},
-}).Parse(indexHTML + detailHTML + routesHTML + chainsHTML))
+}).Parse(indexHTML + detailHTML + routesHTML + chainsHTML + apiKeysHTML + openAIHTML + openAIAccountHTML))
 
 func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -541,6 +541,8 @@ const indexHTML = `
       <a class="nav-item active" href="/">Dashboard</a>
       <a class="nav-item" href="/routes">路由</a>
       <a class="nav-item" href="/chains">链式代理</a>
+      <a class="nav-item" href="/openai">OPENAI</a>
+      <a class="nav-item" href="/api-keys">API Key</a>
     </nav>
   </aside>
   <main class="page">
@@ -920,6 +922,8 @@ const chainsHTML = `
       <a class="nav-item" href="/">Dashboard</a>
       <a class="nav-item" href="/routes">路由</a>
       <a class="nav-item active" href="/chains">链式代理</a>
+      <a class="nav-item" href="/openai">OPENAI</a>
+      <a class="nav-item" href="/api-keys">API Key</a>
     </nav>
   </aside>
   <main class="page">
@@ -1873,6 +1877,8 @@ const routesHTML = `
       <a class="nav-item" href="/">Dashboard</a>
       <a class="nav-item active" href="/routes">路由</a>
       <a class="nav-item" href="/chains">链式代理</a>
+      <a class="nav-item" href="/openai">OPENAI</a>
+      <a class="nav-item" href="/api-keys">API Key</a>
     </nav>
   </aside>
   <main class="page">

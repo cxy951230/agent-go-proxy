@@ -344,8 +344,14 @@ func responsesToolsToChat(raw json.RawMessage, state *adapterState) []map[string
 			return
 		}
 		originalName := asStr(t["name"])
-		if originalName == "" && toolType == "web_search" {
-			originalName = "web_search"
+		// 内置工具(web_search / tool_search 等)只有 type 没有 name,
+		// 直接转成 Chat function 会得到空函数名,三方(kimi/nvidia/minimax)
+		// 一律报 "function name is invalid"。无 name 时统一用 type 兜底。
+		if originalName == "" {
+			originalName = toolType
+		}
+		if originalName == "" {
+			return
 		}
 		chatName := prefix + originalName
 		params := t["parameters"]
