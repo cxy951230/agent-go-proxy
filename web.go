@@ -63,17 +63,26 @@ var baseTemplate = template.Must(template.New("base").Funcs(template.FuncMap{
 			return "ok"
 		}
 	},
-}).Parse(indexHTML + detailHTML + routesHTML + chainsHTML + apiKeysHTML + openAIHTML + openAIAccountHTML))
+}).Parse(indexHTML + detailHTML + routesHTML + chainsHTML + apiKeysHTML + openAIHTML + openAIAccountHTML + tokenStatsHTML))
+
+func conversationFilterFromRequest(r *http.Request) ConversationFilter {
+	q := r.URL.Query()
+	return ConversationFilter{
+		Query:     strings.TrimSpace(q.Get("q")),
+		Status:    strings.TrimSpace(q.Get("status")),
+		Month:     strings.TrimSpace(q.Get("month")),
+		Date:      strings.TrimSpace(q.Get("date")),
+		Agent:     strings.TrimSpace(q.Get("agent")),
+		AccountID: strings.TrimSpace(q.Get("account_id")),
+		Model:     strings.TrimSpace(q.Get("model")),
+		Source:    strings.TrimSpace(q.Get("source")),
+	}
+}
 
 func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	status := strings.TrimSpace(r.URL.Query().Get("status"))
-	month := strings.TrimSpace(r.URL.Query().Get("month"))
-	date := strings.TrimSpace(r.URL.Query().Get("date"))
-	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
-	accountID := strings.TrimSpace(r.URL.Query().Get("account_id"))
+	filter := conversationFilterFromRequest(r)
 	const pageSize = 10
-	conversations, err := p.store.ListConversationsPage(r.Context(), query, status, month, date, agent, accountID, pageSize+1, 0)
+	conversations, err := p.store.ListConversationsPage(r.Context(), filter, pageSize+1, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -92,19 +101,21 @@ func (p *proxyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	conversationCount, traceCount, inputTokens, outputTokens, cachedTokens, err := p.store.Stats(r.Context(), query, status, month, date, agent, accountID)
+	conversationCount, traceCount, inputTokens, outputTokens, cachedTokens, err := p.store.Stats(r.Context(), filter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	data := map[string]any{
 		"Now":               time.Now(),
-		"Query":             query,
-		"Status":            status,
-		"Month":             month,
-		"Date":              date,
-		"Agent":             agent,
-		"AccountID":         accountID,
+		"Query":             filter.Query,
+		"Status":            filter.Status,
+		"Month":             filter.Month,
+		"Date":              filter.Date,
+		"Agent":             filter.Agent,
+		"AccountID":         filter.AccountID,
+		"Model":             filter.Model,
+		"Source":            filter.Source,
 		"FilterOptions":     filterOptions,
 		"Conversations":     conversations,
 		"SubagentLinks":     subagentLinks,
@@ -146,19 +157,14 @@ func (p *proxyServer) handleConversationDetail(w http.ResponseWriter, r *http.Re
 
 func (p *proxyServer) handleAPIConversations(w http.ResponseWriter, r *http.Request) {
 	limit, offset := paginationParams(r)
-	conversations, err := p.store.ListConversationsPage(r.Context(), r.URL.Query().Get("q"), r.URL.Query().Get("status"), r.URL.Query().Get("month"), r.URL.Query().Get("date"), r.URL.Query().Get("agent"), r.URL.Query().Get("account_id"), limit, offset)
+	conversations, err := p.store.ListConversationsPage(r.Context(), conversationFilterFromRequest(r), limit, offset)
 	writeJSON(w, conversations, err)
 }
 
 func (p *proxyServer) handleAPIDashboard(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query().Get("q")
-	status := r.URL.Query().Get("status")
-	month := r.URL.Query().Get("month")
-	date := r.URL.Query().Get("date")
-	agent := r.URL.Query().Get("agent")
-	accountID := r.URL.Query().Get("account_id")
+	filter := conversationFilterFromRequest(r)
 	limit, offset := paginationParams(r)
-	conversations, err := p.store.ListConversationsPage(r.Context(), query, status, month, date, agent, accountID, limit+1, offset)
+	conversations, err := p.store.ListConversationsPage(r.Context(), filter, limit+1, offset)
 	if err != nil {
 		writeJSON(w, nil, err)
 		return
@@ -177,7 +183,7 @@ func (p *proxyServer) handleAPIDashboard(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, nil, err)
 		return
 	}
-	conversationCount, traceCount, inputTokens, outputTokens, cachedTokens, err := p.store.Stats(r.Context(), query, status, month, date, agent, accountID)
+	conversationCount, traceCount, inputTokens, outputTokens, cachedTokens, err := p.store.Stats(r.Context(), filter)
 	if err != nil {
 		writeJSON(w, nil, err)
 		return
@@ -257,6 +263,75 @@ func (p *proxyServer) handleAPIConversationDelete(w http.ResponseWriter, r *http
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true}, nil)
+}
+
+// handleAPIConversationsBatchDelete 批量删除会话:逐个复用单删逻辑(含 subagent 级联)。
+func (p *proxyServer) handleAPIConversationsBatchDelete(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	deleted := 0
+	for _, id := range payload.IDs {
+		if id <= 0 {
+			continue
+		}
+		if err := p.store.DeleteConversation(r.Context(), id); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			writeJSON(w, nil, err)
+			return
+		}
+		deleted++
+	}
+	writeJSON(w, map[string]any{"ok": true, "deleted": deleted}, nil)
+}
+
+// handleAPITokenStats 返回某维度(路由/账号/API Key)的 token 消耗时间序列与按模型拆分,供图表页使用。
+func (p *proxyServer) handleAPITokenStats(w http.ResponseWriter, r *http.Request) {
+	dim := strings.TrimSpace(r.URL.Query().Get("dim"))
+	granularity := strings.TrimSpace(r.URL.Query().Get("granularity"))
+	if granularity == "" {
+		granularity = "day"
+	}
+	id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad id", http.StatusBadRequest)
+		return
+	}
+	series, err := p.store.TokenSeries(r.Context(), dim, id, granularity)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	byModel, err := p.store.TokenBreakdownByModel(r.Context(), dim, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"dim":         dim,
+		"id":          id,
+		"granularity": granularity,
+		"series":      series,
+		"by_model":    byModel,
+	}, nil)
+}
+
+// handleTokenStatsPage 渲染 token 消耗详情图表页。dim/id/name 由查询串传入,由前端拉数据画图。
+func (p *proxyServer) handleTokenStatsPage(w http.ResponseWriter, r *http.Request) {
+	data := map[string]any{
+		"Dim":  strings.TrimSpace(r.URL.Query().Get("dim")),
+		"ID":   strings.TrimSpace(r.URL.Query().Get("id")),
+		"Name": strings.TrimSpace(r.URL.Query().Get("name")),
+	}
+	if err := baseTemplate.ExecuteTemplate(w, "token-stats", data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func (p *proxyServer) handleAPIAccountAlias(w http.ResponseWriter, r *http.Request) {
@@ -521,8 +596,13 @@ const indexHTML = `
     .nav-item:hover{background:#eef2fa}
     .nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}
     .page{flex:1;min-width:0;padding:22px 28px 56px}.top{display:flex;align-items:center;gap:16px}.top h1{font-size:18px;font-weight:600;margin:0;flex:1}.clock{color:#d95252;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-    .filters{display:grid;grid-template-columns:150px 150px 150px 150px 190px 1fr auto;gap:12px;margin-top:16px}
+    .filters{display:flex;flex-wrap:wrap;gap:12px;margin-top:16px;align-items:center}
+    .filters select{min-width:132px}.filters input[name=q]{flex:1;min-width:200px}
     select,input,button{height:42px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:0 12px;font:inherit;color:var(--text)}
+    .toolbar{display:flex;align-items:center;gap:12px;margin-top:16px}.toolbar .spacer{flex:1}
+    .batch-del{color:var(--red);border-color:#f0b3b3;background:#fff6f6;font-weight:600}.batch-del:disabled{opacity:.5;cursor:not-allowed}.batch-del:not(:disabled):hover{background:#fff1f1;border-color:#e07d7d}
+    .sel-info{color:var(--muted);font-size:13px}
+    .check-cell{padding-left:12px;padding-right:2px;white-space:nowrap}.row-check,.all-check{width:16px;height:16px;vertical-align:middle;margin-right:6px;cursor:pointer;accent-color:var(--blue)}
     button{cursor:pointer}.stats,.table{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05)}
     .stats{display:flex;gap:36px;padding:22px 26px;margin-top:16px}.stat-label{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.02em}.stat-value{font-size:28px;font-weight:600;margin-top:4px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
     .table{margin-top:18px;overflow-x:auto}table{width:100%;min-width:1360px;border-collapse:collapse;table-layout:fixed}th,td{padding:14px 14px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{font-size:12px;color:#606a7a;font-weight:600;letter-spacing:.04em;background:#fbfcfe}tr:last-child td{border-bottom:0}tbody tr.row-link{cursor:pointer}tbody tr.row-link:hover{background:#fafcff}tbody tr.child-row{background:#fbf9ff}tbody tr.child-row:hover{background:#f7f3ff}
@@ -570,9 +650,25 @@ const indexHTML = `
       <option value="all">全部账号</option>
       {{range .FilterOptions.AccountAliases}}<option value="{{.AccountID}}" {{if eq $.AccountID .AccountID}}selected{{end}}>{{.DisplayName}}</option>{{end}}
     </select>
+    <select name="model" id="model-filter">
+      <option value="all">全部模型</option>
+      {{range .FilterOptions.Models}}<option value="{{.}}" {{if eq $.Model .}}selected{{end}}>{{.}}</option>{{end}}
+    </select>
+    <select name="source" id="source-filter">
+      <option value="all">全部来源</option>
+      <option value="direct" {{if eq .Source "direct"}}selected{{end}}>直连官方</option>
+      <option value="route" {{if eq .Source "route"}}selected{{end}}>路由</option>
+      <option value="chain" {{if eq .Source "chain"}}selected{{end}}>链式代理</option>
+      <option value="account" {{if eq .Source "account"}}selected{{end}}>APIKey账号反代</option>
+    </select>
     <input name="q" value="{{.Query}}" placeholder="搜索消息、Session...">
     <button type="submit">搜索</button>
   </form>
+  <div class="toolbar">
+    <span class="sel-info" id="sel-info">已选 0 项</span>
+    <span class="spacer"></span>
+    <button type="button" class="batch-del" id="batch-del" disabled>批量删除</button>
+  </div>
   <section class="stats">
     <div><div class="stat-label">会话数</div><div class="stat-value" id="stat-conversations">{{.ConversationCount}}</div></div>
     <div><div class="stat-label">Trace 数</div><div class="stat-value" id="stat-traces">{{.TraceCount}}</div></div>
@@ -582,11 +678,11 @@ const indexHTML = `
   </section>
   <section class="table">
     <table>
-      <thead><tr><th></th><th>时间</th><th>首条用户 PROMPT</th><th>账号</th><th>标签</th><th>TRACE</th><th>Token<br>输入/输出/缓存</th><th>模型</th><th>AGENT</th><th>耗时(分)</th><th>状态</th><th>操作</th></tr></thead>
+      <thead><tr><th class="check-cell"><input type="checkbox" class="all-check" id="all-check" title="全选本页"></th><th>时间</th><th>首条用户 PROMPT</th><th>账号</th><th>标签</th><th>TRACE</th><th>Token<br>输入/输出/缓存</th><th>模型</th><th>AGENT</th><th>耗时(分)</th><th>状态</th><th>操作</th></tr></thead>
       <tbody id="conversation-rows">
       {{range .Conversations}}
         <tr class="row-link" data-href="/conversations/{{.ID}}">
-          <td class="tree-cell"></td>
+          <td class="check-cell"><input type="checkbox" class="row-check" data-id="{{.ID}}"></td>
           <td>{{fmtTime .UpdatedAt}}</td>
           <td><span class="prompt">{{short .FirstPrompt 80}}</span><span class="sid">{{.SessionID}}</span></td>
           <td><button class="account-btn" title="{{.AccountID}}" data-account-id="{{.AccountID}}" data-account-name="{{.AccountName}}">{{if .AccountName}}{{.AccountName}}{{else}}{{short .AccountID 12}}{{end}}</button></td>
@@ -634,6 +730,7 @@ const accountLabel = item => item.AccountName || short(item.AccountID || 'unknow
 let latestConversations = initialConversations || [];
 let latestSubagentLinks = initialSubagentLinks || {};
 const expandedParents = new Set();
+const selectedIDs = new Set();
 const fmtMinutes = v => {
   v = Math.max(0, Number(v || 0));
   return v >= 10 ? Math.round(v).toString() : v.toFixed(1);
@@ -657,7 +754,7 @@ function conversationRowHTML(item, opts = {}){
     ? '<button class="tree-toggle" type="button" data-parent-session="' + esc(item.SessionID || '') + '" aria-expanded="' + (expanded ? 'true' : 'false') + '">' + (expanded ? '▾' : '▸') + '</button>'
     : isChild ? '<span class="child-mark">└</span>' : '';
   return '<tr class="' + (missing ? '' : 'row-link ') + (isChild ? 'child-row' : '') + '"' + (missing ? '' : ' data-href="/conversations/' + item.ID + '"') + '>' +
-    '<td class="tree-cell">' + tree + '</td>' +
+    '<td class="check-cell">' + (missing ? '' : '<input type="checkbox" class="row-check" data-id="' + item.ID + '">') + tree + '</td>' +
     '<td>' + fmtTime(item.UpdatedAt) + '</td>' +
     '<td><span class="prompt">' + esc(short(item.FirstPrompt || '未捕获到用户 prompt。', 80)) + '</span><span class="sid">' + esc(item.SessionID) + '</span></td>' +
     '<td><button class="account-btn" title="' + esc(item.AccountID || '') + '" data-account-id="' + esc(item.AccountID || '') + '" data-account-name="' + esc(item.AccountName || '') + '">' + esc(accountLabel(item)) + '</button></td>' +
@@ -709,8 +806,58 @@ function renderConversationRows(conversations, links){
     }
   });
   rows.innerHTML = html.join('') || '<tr><td colspan="12">暂无数据。发起一次 Codex 请求后这里会出现新会话。</td></tr>';
+  applySelection();
   updateLoadStatus();
 }
+function applySelection(){
+  // 重渲染后按 selectedIDs 恢复勾选状态,并更新全选框与批量删除按钮。
+  const checks = document.querySelectorAll('#conversation-rows .row-check');
+  let total = 0, checked = 0;
+  checks.forEach(box => {
+    total++;
+    const on = selectedIDs.has(String(box.dataset.id));
+    box.checked = on;
+    if (on) checked++;
+  });
+  const all = document.getElementById('all-check');
+  if (all) { all.checked = total > 0 && checked === total; all.indeterminate = checked > 0 && checked < total; }
+  const info = document.getElementById('sel-info');
+  if (info) info.textContent = '已选 ' + selectedIDs.size + ' 项';
+  const btn = document.getElementById('batch-del');
+  if (btn) { btn.disabled = selectedIDs.size === 0; btn.textContent = selectedIDs.size ? ('批量删除 (' + selectedIDs.size + ')') : '批量删除'; }
+}
+document.getElementById('conversation-rows').addEventListener('change', event => {
+  const box = event.target.closest('.row-check');
+  if (!box) return;
+  const id = String(box.dataset.id);
+  if (box.checked) selectedIDs.add(id); else selectedIDs.delete(id);
+  applySelection();
+});
+document.getElementById('all-check').addEventListener('change', event => {
+  const on = event.target.checked;
+  document.querySelectorAll('#conversation-rows .row-check').forEach(box => {
+    const id = String(box.dataset.id);
+    if (on) selectedIDs.add(id); else selectedIDs.delete(id);
+  });
+  applySelection();
+});
+document.getElementById('batch-del').addEventListener('click', async () => {
+  if (!selectedIDs.size) return;
+  const ids = Array.from(selectedIDs).map(Number).filter(Boolean);
+  if (!confirm('确认删除选中的 ' + ids.length + ' 个会话吗？\\n\\n会话、所有 trace，以及它们启动的 subagent 会话都会被删除，且不可恢复。')) return;
+  const btn = document.getElementById('batch-del');
+  btn.disabled = true;
+  try {
+    const rsp = await fetch('/api/conversations/batch-delete', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ids})});
+    if (!rsp.ok) { alert('批量删除失败：' + await rsp.text()); return; }
+    selectedIDs.clear();
+    await refreshDashboard();
+  } catch (err) {
+    alert('批量删除失败：' + err);
+  } finally {
+    applySelection();
+  }
+});
 function updateLoadStatus(){
   const el = document.getElementById('load-status');
   if (!el) return;
@@ -737,6 +884,7 @@ function syncFilterOptions(options){
   syncSelectOptions(document.getElementById('date-filter'), '全部日期', options.Dates || [], v => v, v => v);
   syncSelectOptions(document.getElementById('agent-filter'), '全部 Agent', options.Agents || [], v => v, v => v);
   syncSelectOptions(document.getElementById('account-filter'), '全部账号', options.AccountAliases || [], v => v.AccountID, v => v.DisplayName);
+  syncSelectOptions(document.getElementById('model-filter'), '全部模型', options.Models || [], v => v, v => v);
 }
 async function editAccount(button){
   const accountID = button.dataset.accountId || '';
@@ -1845,6 +1993,7 @@ const routesHTML = `
     th,td{padding:14px 16px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
     th{font-size:12px;color:#606a7a;font-weight:600;letter-spacing:.04em;background:#fbfcfe}
     tr:last-child td{border-bottom:0}
+    tbody tr.row-link{cursor:pointer}tbody tr.row-link:hover{background:#fafcff}
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
     .muted{color:var(--muted)}
     .pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600;color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}
@@ -1955,7 +2104,7 @@ function renderRows(){
   }
   empty.style.display = 'none';
   tbody.innerHTML = routes.map(r =>
-    '<tr>' +
+    '<tr class="row-link" data-href="/stats/tokens?dim=route&id=' + r.id + '&name=' + encodeURIComponent(r.name || '') + '">' +
       '<td>' + (r.name ? esc(r.name) : '<span class="muted">未命名</span>') + '</td>' +
       '<td class="mono">' + esc(r.base_url || '') + '</td>' +
       '<td>' + (r.api_style ? '<span class="tag">' + esc(styleLabel(r.api_style)) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -2050,7 +2199,10 @@ document.getElementById('route-rows').addEventListener('click', e => {
   const editBtn = e.target.closest('[data-edit]');
   if (editBtn){ const r = routes.find(x => String(x.id) === editBtn.dataset.edit); if (r) openModal(r); return; }
   const delBtn = e.target.closest('[data-delete]');
-  if (delBtn){ deleteRoute(delBtn.dataset.delete).catch(() => {}); }
+  if (delBtn){ deleteRoute(delBtn.dataset.delete).catch(() => {}); return; }
+  if (e.target.closest('a,button,input,select')) return;
+  const row = e.target.closest('tr[data-href]');
+  if (row) location.href = row.dataset.href;
 });
 loadRoutes().catch(() => {});
 </script>

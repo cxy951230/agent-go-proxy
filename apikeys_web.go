@@ -103,6 +103,7 @@ const apiKeysHTML = `
     table{width:100%;border-collapse:collapse}
     th,td{padding:16px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
     tbody tr:last-child td{border-bottom:0}
+    tbody tr.row-link{cursor:pointer}tbody tr.row-link:hover{background:#fafcff}
     th{font-size:12px;color:#606a7a;font-weight:600;letter-spacing:.04em;background:#fbfcfe}
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
     .muted{color:var(--muted)}
@@ -197,7 +198,7 @@ function renderRows(){
   }
   empty.style.display = 'none';
   tbody.innerHTML = keys.map(k =>
-    '<tr>' +
+    '<tr class="row-link" data-href="/stats/tokens?dim=api_key&id=' + k.id + '&name=' + encodeURIComponent(k.name || '') + '">' +
       '<td>' + (k.name ? esc(k.name) : '<span class="muted">未命名</span>') + '</td>' +
       '<td class="mono">' + maskKey(k.api_key) + '</td>' +
       '<td>' +
@@ -255,7 +256,10 @@ document.getElementById('key-rows').addEventListener('click', e => {
   const editBtn = e.target.closest('[data-edit]');
   if (editBtn){ const k = keys.find(x => String(x.id) === editBtn.dataset.edit); if (k) openModal(k); return; }
   const delBtn = e.target.closest('[data-delete]');
-  if (delBtn){ deleteKey(delBtn.dataset.delete).catch(() => {}); }
+  if (delBtn){ deleteKey(delBtn.dataset.delete).catch(() => {}); return; }
+  if (e.target.closest('a,button,input,select')) return;
+  const row = e.target.closest('tr[data-href]');
+  if (row) location.href = row.dataset.href;
 });
 loadKeys().catch(() => {});
 </script>

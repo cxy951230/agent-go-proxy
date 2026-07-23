@@ -53,6 +53,7 @@ type proxyServer struct {
 	store        *Store
 	recorder     *asyncRecorder
 	chains       *chainRouteState
+	accounts     *accountPool
 	openaiLogins *openAILoginManager
 }
 
@@ -81,6 +82,11 @@ type forwardPlan struct {
 	// accountAuth 非空表示走「API Key 直连」:用 OPENAI 菜单里配置的 GPT 账号
 	// 凭证直接打官方 ChatGPT 后端,不经过路由/链式代理。
 	accountAuth *openaiAccountAuth
+	// apiKeyID 是命中的「API Key」页配置 id(account 直连路径),用于 token 明细关联。
+	apiKeyID int64
+	// accountCandidate 是 account 直连路径待尝试的候选账号(负载均衡/容错时逐个尝试)。
+	// 鉴权(刷新+解析 token)延后到真正尝试前再做,避免为用不到的候选浪费刷新。
+	accountCandidate *OpenAIAccount
 	// directJSON:直连时客户端要非流式响应。上游一律流式,拿到 SSE 后聚合成单个 JSON 返回。
 	directJSON bool
 }
@@ -90,6 +96,30 @@ type openaiAccountAuth struct {
 	AccessToken string
 	AccountID   string
 	Label       string
+	// AccountDBID 是 openai_accounts.id,用于负载均衡状态跟踪与 token 明细关联。
+	AccountDBID int64
+}
+
+// planSource 依据最终命中的转发计划算出 token 明细要记录的来源信息(尽量用 id 关联)。
+func planSource(plan forwardPlan) (sourceType string, routeID, chainID, apiKeyID, accountDBID int64) {
+	switch {
+	case plan.accountAuth != nil:
+		sourceType = "account"
+		apiKeyID = plan.apiKeyID
+		accountDBID = plan.accountAuth.AccountDBID
+	case plan.chainID != 0:
+		sourceType = "chain"
+		chainID = plan.chainID
+		if plan.route != nil {
+			routeID = plan.route.ID
+		}
+	case plan.route != nil:
+		sourceType = "route"
+		routeID = plan.route.ID
+	default:
+		sourceType = "direct"
+	}
+	return sourceType, routeID, chainID, apiKeyID, accountDBID
 }
 
 // localError 是代理自己产生的错误(不是上游返回的),带上要回给客户端的状态码。
@@ -272,6 +302,7 @@ func main() {
 		store:        store,
 		recorder:     recorder,
 		chains:       newChainRouteState(),
+		accounts:     newAccountPool(),
 		openaiLogins: openaiLogins,
 	}
 
@@ -311,6 +342,9 @@ func main() {
 	router.Get("/api/conversations", srv.handleAPIConversations)
 	router.Get("/api/conversations/{id}", srv.handleAPIConversationDetail)
 	router.Delete("/api/conversations/{id}", srv.handleAPIConversationDelete)
+	router.Post("/api/conversations/batch-delete", srv.handleAPIConversationsBatchDelete)
+	router.Get("/stats/tokens", srv.handleTokenStatsPage)
+	router.Get("/api/stats/tokens", srv.handleAPITokenStats)
 	router.Post("/api/conversations/{id}/tags", srv.handleAPIConversationTags)
 	router.Post("/api/accounts/{id}/alias", srv.handleAPIAccountAlias)
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -400,7 +434,8 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reqProtocol := detectProtocol(r.URL.Path)
-	plans, chainMode, planErr := p.forwardPlans(r.Context(), routeStyle, upstreamTarget, r, reqProtocol, reqBody, logModel, meta.SessionID)
+	plans, chainMode, accountMode, planErr := p.forwardPlans(r.Context(), routeStyle, upstreamTarget, r, reqProtocol, reqBody, logModel, meta.SessionID)
+	failoverMode := chainMode || accountMode
 	if planErr != nil {
 		// 代理自己产生的错误可以指定状态码(如模型匹配不上用 400,避免 CLI 反复重试)。
 		status := http.StatusServiceUnavailable
@@ -425,6 +460,9 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var adapterInfo map[string]any
 	var lastErr error
 	var lastMismatch string
+	// acquiredAccountID 记录当前持有在途计数的账号,响应彻底结束后释放(least-connections 需要)。
+	var acquiredAccountID int64
+	defer func() { p.accounts.Release(acquiredAccountID) }()
 	for i, candidate := range plans {
 		plan = candidate
 		preparedNative = ""
@@ -437,7 +475,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if chainMode && plan.route != nil {
 				p.chains.MarkFailure(plan.chainID, meta.SessionID, plan.route.ID)
 			}
-			if !chainMode || i == len(plans)-1 {
+			if !failoverMode || i == len(plans)-1 {
 				if chainMode {
 					p.chains.ClearFailures(plan.chainID, meta.SessionID)
 				}
@@ -447,6 +485,34 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Printf("!! chain route failed current=%s next=%s reason=%s\n", chainPlanLabel(plans, i), chainNextLabel(plans, i), plan.mismatch)
 			continue
 		}
+		// account 直连:尝试前解析当前候选账号的鉴权,并接管在途计数(换账号时释放上一个)。
+		if accountMode && plan.accountCandidate != nil {
+			if acquiredAccountID != 0 && acquiredAccountID != plan.accountCandidate.ID {
+				p.accounts.Release(acquiredAccountID)
+				acquiredAccountID = 0
+			}
+			resolved, resolveErr := p.resolveAccountAuth(r.Context(), plan.accountCandidate, plan.apiKeyID)
+			if resolveErr != nil {
+				lastErr = resolveErr
+				p.accounts.MarkFailure(meta.SessionID, plan.accountCandidate.ID)
+				if i == len(plans)-1 {
+					status := http.StatusServiceUnavailable
+					var local *localError
+					if errors.As(resolveErr, &local) {
+						status = local.status
+					}
+					p.finishLocalError(w, r, start, &plan, provider, status, resolveErr.Error(), recordedReqBody, effectiveModel, !isProbe)
+					return
+				}
+				fmt.Printf("!! account auth failed id=%d next id=%d err=%v\n", plan.accountCandidate.ID, accountNextID(plans, i), resolveErr)
+				continue
+			}
+			plan.accountAuth = resolved
+			if acquiredAccountID == 0 {
+				p.accounts.Acquire(plan.accountCandidate.ID)
+				acquiredAccountID = plan.accountCandidate.ID
+			}
+		}
 		accountNote := ""
 		if plan.accountAuth != nil {
 			accountNote = " account=" + plan.accountAuth.Label
@@ -455,17 +521,15 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		resp, err = p.doUpstream(r, plan)
 		if err != nil {
 			lastErr = err
-			if chainMode && plan.route != nil {
-				p.chains.MarkFailure(plan.chainID, meta.SessionID, plan.route.ID)
-			}
-			if !chainMode || i == len(plans)-1 {
+			p.markAttemptFailure(chainMode, accountMode, plan, meta.SessionID)
+			if !failoverMode || i == len(plans)-1 {
 				if chainMode {
 					p.chains.ClearFailures(plan.chainID, meta.SessionID)
 				}
 				p.finishLocalError(w, r, start, &plan, provider, http.StatusBadGateway, err.Error(), recordedReqBody, effectiveModel, !isProbe)
 				return
 			}
-			fmt.Printf("!! chain route failed current=%s next=%s error=%v\n", chainPlanLabel(plans, i), chainNextLabel(plans, i), err)
+			fmt.Printf("!! attempt failed current=%s next=%s error=%v\n", chainPlanLabel(plans, i), chainNextLabel(plans, i), err)
 			continue
 		}
 		// 直连路径的 401 兜底:凭证被上游拒绝时强制刷新并重试一次。
@@ -478,23 +542,25 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				fmt.Printf("== upstream 401, refreshed credentials and retried, status=%d\n", resp.StatusCode)
 			}
 		}
-		if chainMode && resp.StatusCode >= 400 {
-			if plan.route != nil {
-				p.chains.MarkFailure(plan.chainID, meta.SessionID, plan.route.ID)
-			}
+		if failoverMode && resp.StatusCode >= 400 {
+			p.markAttemptFailure(chainMode, accountMode, plan, meta.SessionID)
 			if i < len(plans)-1 {
 				rawFail, _ := io.ReadAll(resp.Body)
 				decodedFail := decodeResponseBody(rawFail, resp.Header.Get("Content-Encoding"))
 				_ = resp.Body.Close()
-				p.writeChainAttemptLog(r, start, plan, resp, recordedReqBody, decodedFail, rawFail, map[string]any{
-					"chain_attempt_result": "status_failure",
-					"chain_current":        chainPlanLabel(plans, i),
-					"chain_next":           chainNextLabel(plans, i),
-				}, !isProbe)
-				fmt.Printf("!! chain route returned current=%s status=%d next=%s\n", chainPlanLabel(plans, i), resp.StatusCode, chainNextLabel(plans, i))
+				if chainMode {
+					p.writeChainAttemptLog(r, start, plan, resp, recordedReqBody, decodedFail, rawFail, map[string]any{
+						"chain_attempt_result": "status_failure",
+						"chain_current":        chainPlanLabel(plans, i),
+						"chain_next":           chainNextLabel(plans, i),
+					}, !isProbe)
+				}
+				fmt.Printf("!! attempt returned current=%s status=%d next=%s\n", chainPlanLabel(plans, i), resp.StatusCode, chainNextLabel(plans, i))
 				continue
 			}
-			p.chains.ClearFailures(plan.chainID, meta.SessionID)
+			if chainMode {
+				p.chains.ClearFailures(plan.chainID, meta.SessionID)
+			}
 		}
 		if chainMode && plan.adaptTarget != "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			rawUp, readErr := io.ReadAll(resp.Body)
@@ -525,8 +591,13 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			preparedReadErr = readErr
 			adapterInfo["chain_attempt_result"] = "selected"
 		}
-		if chainMode && resp.StatusCode < 400 && plan.route != nil {
-			p.chains.MarkSuccess(plan.chainID, meta.SessionID, plan.route.ID)
+		if resp.StatusCode < 400 {
+			if chainMode && plan.route != nil {
+				p.chains.MarkSuccess(plan.chainID, meta.SessionID, plan.route.ID)
+			}
+			if accountMode && plan.accountAuth != nil {
+				p.accounts.MarkSuccess(meta.SessionID, plan.accountAuth.AccountDBID)
+			}
 		}
 		break
 	}
@@ -655,6 +726,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.logs.Write(entry)
 	}
 
+	sourceType, srcRouteID, srcChainID, srcAPIKeyID, srcAccountDBID := planSource(plan)
 	finishRecord := TraceFinishRecord{
 		Provider:      provider,
 		Probe:         isProbe,
@@ -663,6 +735,11 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ResponseBody:  recordedRespBody,
 		ResponseHdrs:  sanitizeHeader(cloneHeader(resp.Header)),
 		ResponseBytes: responseBytes,
+		SourceType:    sourceType,
+		RouteID:       srcRouteID,
+		ChainID:       srcChainID,
+		APIKeyID:      srcAPIKeyID,
+		AccountDBID:   srcAccountDBID,
 	}
 	if copyErr != nil && !errors.Is(copyErr, context.Canceled) {
 		finishRecord.Error = copyErr.Error()
@@ -675,22 +752,17 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *proxyServer) forwardPlans(ctx context.Context, routeStyle string, upstreamTarget *url.URL, r *http.Request, reqProtocol string, reqBody []byte, logModel, sessionID string) ([]forwardPlan, bool, error) {
+// forwardPlans 决定这次请求要依次尝试哪些转发计划,并返回是否处于「可容错重试」的模式:
+// chainMode(链式代理逐路由)/ accountMode(API Key 直连多账号负载均衡)。
+func (p *proxyServer) forwardPlans(ctx context.Context, routeStyle string, upstreamTarget *url.URL, r *http.Request, reqProtocol string, reqBody []byte, logModel, sessionID string) (plans []forwardPlan, chainMode bool, accountMode bool, err error) {
 	// 最高优先级:请求头里的 key 命中「API Key」页配置 → 换成 GPT 账号凭证直连官方上游,
-	// 不走链式代理/路由。没命中则继续下面的老逻辑。
-	auth, ok, authErr := p.accountAuthForRequest(ctx, r, routeStyle, logModel)
+	// 按负载均衡在候选账号里逐个尝试,不走链式代理/路由。没命中则继续下面的老逻辑。
+	accountPlans, ok, authErr := p.accountPlansForRequest(ctx, r, routeStyle, logModel, sessionID, upstreamTarget, reqBody)
 	if authErr != nil {
-		return nil, false, authErr
+		return nil, false, false, authErr
 	}
 	if ok {
-		return []forwardPlan{{
-			upstreamURL:    buildUpstreamURL(upstreamTarget, r.URL),
-			upstreamHost:   upstreamTarget.Host,
-			forwardBody:    p.prepareCodexBackendBody(reqBody),
-			effectiveModel: logModel,
-			accountAuth:    auth,
-			directJSON:     !clientWantsSSE(reqBody),
-		}}, false, nil
+		return accountPlans, false, true, nil
 	}
 
 	chain, chainOK, err := p.store.EnabledChainProxyForStyle(ctx, routeStyle)
@@ -708,7 +780,7 @@ func (p *proxyServer) forwardPlans(ctx context.Context, routeStyle string, upstr
 		for _, route := range routes {
 			plans = append(plans, buildRoutePlan(route, chain.ID, reqProtocol, r.URL, reqBody, logModel))
 		}
-		return plans, true, nil
+		return plans, true, false, nil
 	}
 
 	route, routeOK, err := p.store.EnabledAPIRouteForStyle(ctx, routeStyle)
@@ -717,14 +789,83 @@ func (p *proxyServer) forwardPlans(ctx context.Context, routeStyle string, upstr
 		routeOK = false
 	}
 	if routeOK {
-		return []forwardPlan{buildRoutePlan(route, 0, reqProtocol, r.URL, reqBody, logModel)}, false, nil
+		return []forwardPlan{buildRoutePlan(route, 0, reqProtocol, r.URL, reqBody, logModel)}, false, false, nil
 	}
 	return []forwardPlan{{
 		upstreamURL:    buildUpstreamURL(upstreamTarget, r.URL),
 		upstreamHost:   upstreamTarget.Host,
 		forwardBody:    reqBody,
 		effectiveModel: logModel,
-	}}, false, nil
+	}}, false, false, nil
+}
+
+// accountPlansForRequest 构造「API Key 直连」路径的候选计划集:命中 api_keys 且模型有匹配账号时,
+// 按 accountPool 的会话粘性 + 最少连接排序返回全部候选账号(逐个作为一个 plan),供上层做负载均衡与容错。
+// 每个 plan 只带候选账号,鉴权(刷新+解析 token)延后到真正尝试前再做。
+func (p *proxyServer) accountPlansForRequest(ctx context.Context, r *http.Request, routeStyle, model, sessionID string, upstreamTarget *url.URL, reqBody []byte) ([]forwardPlan, bool, error) {
+	if routeStyle != "openai" {
+		return nil, false, nil
+	}
+	key := clientAPIKey(r)
+	if key == "" {
+		return nil, false, nil
+	}
+	apiKeyID, matched, err := p.store.MatchAPIKeyID(ctx, key)
+	if err != nil {
+		log.Printf("match api key: %v", err)
+		return nil, false, nil
+	}
+	if !matched {
+		return nil, false, nil
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, false, newLocalError(http.StatusBadRequest, "请求里没有 model 字段，无法匹配 GPT 账号")
+	}
+	candidates, err := p.store.OpenAIAccountsForModel(ctx, model)
+	if err != nil {
+		log.Printf("load openai accounts for model %q: %v", model, err)
+		return nil, false, newLocalError(http.StatusServiceUnavailable, "查询 GPT 账号失败: %v", err)
+	}
+	if len(candidates) == 0 {
+		return nil, false, newLocalError(http.StatusBadRequest,
+			"没有账号配置了模型 %s，请在 OPENAI 页面为某个账号选择该模型", model)
+	}
+	ordered := p.accounts.OrderedAccounts(sessionID, candidates)
+	forwardBody := p.prepareCodexBackendBody(reqBody)
+	directJSON := !clientWantsSSE(reqBody)
+	upstreamURL := buildUpstreamURL(upstreamTarget, r.URL)
+	plans := make([]forwardPlan, 0, len(ordered))
+	for i := range ordered {
+		account := ordered[i]
+		plans = append(plans, forwardPlan{
+			upstreamURL:      upstreamURL,
+			upstreamHost:     upstreamTarget.Host,
+			forwardBody:      forwardBody,
+			effectiveModel:   model,
+			apiKeyID:         apiKeyID,
+			accountCandidate: &account,
+			directJSON:       directJSON,
+		})
+	}
+	return plans, true, nil
+}
+
+// resolveAccountAuth 在尝试某个候选账号前解析其鉴权:先按需刷新 access_token,再构造直连凭证。
+func (p *proxyServer) resolveAccountAuth(ctx context.Context, account *OpenAIAccount, apiKeyID int64) (*openaiAccountAuth, error) {
+	acc := *account
+	if refreshed, err := p.openaiLogins.EnsureFreshAuth(ctx, acc); err != nil {
+		log.Printf("refresh openai account %d: %v", acc.ID, err)
+	} else {
+		acc = refreshed
+	}
+	auth, err := newAccountAuth(acc)
+	if err != nil {
+		log.Printf("parse openai account auth (id=%d): %v", acc.ID, err)
+		return nil, newLocalError(http.StatusServiceUnavailable,
+			"账号 %s 的鉴权信息不可用，请重新登录", fallback(acc.Name, acc.AccountID))
+	}
+	return auth, nil
 }
 
 func buildRoutePlan(route APIRoute, chainID int64, reqProtocol string, requestURL *url.URL, reqBody []byte, logModel string) forwardPlan {
@@ -794,7 +935,14 @@ func (p *proxyServer) doUpstream(r *http.Request, plan forwardPlan) (*http.Respo
 // retryDirectWithRefresh 是直连路径的 401 兜底:强制刷新凭证后用新 token 重试一次。
 // 只有拿到新响应才算成功,失败时不动原响应,由调用方把上游的 401 原样返回。
 func (p *proxyServer) retryDirectWithRefresh(r *http.Request, plan *forwardPlan) (*http.Response, bool) {
-	auth, err := p.openaiLogins.ForceRefreshAuth(r.Context(), plan.accountAuth.AccessToken)
+	var auth *openaiAccountAuth
+	var err error
+	if plan.accountAuth != nil && plan.accountAuth.AccountDBID != 0 {
+		// 多账号直连:只刷新当前命中的这个账号,不要动别的账号。
+		auth, err = p.openaiLogins.ForceRefreshAccount(r.Context(), plan.accountAuth.AccountDBID)
+	} else {
+		auth, err = p.openaiLogins.ForceRefreshAuth(r.Context(), plan.accountAuth.AccessToken)
+	}
 	if err != nil {
 		log.Printf("upstream returned 401 but refreshing credentials failed: %v", err)
 		return nil, false
@@ -875,6 +1023,24 @@ func (p *proxyServer) writeChainAttemptLog(r *http.Request, start time.Time, pla
 		ResponseHdrs: sanitizeHeader(cloneHeader(resp.Header)),
 		AdapterInfo:  info,
 	})
+}
+
+// markAttemptFailure 按当前模式给失败的这一跳打上失败标记:链式代理按路由冷却,账号模式按账号熔断。
+func (p *proxyServer) markAttemptFailure(chainMode, accountMode bool, plan forwardPlan, sessionID string) {
+	if chainMode && plan.route != nil {
+		p.chains.MarkFailure(plan.chainID, sessionID, plan.route.ID)
+	}
+	if accountMode && plan.accountCandidate != nil {
+		p.accounts.MarkFailure(sessionID, plan.accountCandidate.ID)
+	}
+}
+
+// accountNextID 返回下一个待尝试候选账号的 id,仅用于日志。
+func accountNextID(plans []forwardPlan, idx int) int64 {
+	if idx+1 >= len(plans) || plans[idx+1].accountCandidate == nil {
+		return 0
+	}
+	return plans[idx+1].accountCandidate.ID
 }
 
 func chainPlanLabel(plans []forwardPlan, idx int) string {
@@ -1259,55 +1425,6 @@ func clientAPIKey(r *http.Request) string {
 		return value
 	}
 	return strings.TrimSpace(r.Header.Get("X-Api-Key"))
-}
-
-// accountAuthForRequest 判断这次请求是否该走「API Key 直连」:
-// 只对 OpenAI 风格(Codex)生效,且请求头里的 key 要命中 api_keys 配置,
-// 同时 OPENAI 菜单里至少有一个可用账号。任一条件不满足都回落老逻辑。
-func (p *proxyServer) accountAuthForRequest(ctx context.Context, r *http.Request, routeStyle, model string) (*openaiAccountAuth, bool, error) {
-	if routeStyle != "openai" {
-		return nil, false, nil
-	}
-	key := clientAPIKey(r)
-	if key == "" {
-		return nil, false, nil
-	}
-	matched, err := p.store.MatchAPIKey(ctx, key)
-	if err != nil {
-		log.Printf("match api key: %v", err)
-		return nil, false, nil
-	}
-	if !matched {
-		return nil, false, nil
-	}
-
-	model = strings.TrimSpace(model)
-	if model == "" {
-		return nil, false, newLocalError(http.StatusBadRequest, "请求里没有 model 字段，无法匹配 GPT 账号")
-	}
-	account, ok, err := p.store.OpenAIAccountForModel(ctx, model)
-	if err != nil {
-		log.Printf("load openai account for model %q: %v", model, err)
-		return nil, false, newLocalError(http.StatusServiceUnavailable, "查询 GPT 账号失败: %v", err)
-	}
-	if !ok {
-		return nil, false, newLocalError(http.StatusBadRequest,
-			"没有账号配置了模型 %s，请在 OPENAI 页面为某个账号选择该模型", model)
-	}
-	// access_token 快过期就先刷新(Bridge 刷新 + 回写库)。刷新失败仍用旧凭证试一次,
-	// 让上游给出真实错误,而不是在本地直接把请求打回。
-	if refreshed, err := p.openaiLogins.EnsureFreshAuth(ctx, account); err != nil {
-		log.Printf("refresh openai account %d: %v", account.ID, err)
-	} else {
-		account = refreshed
-	}
-	auth, err := newAccountAuth(account)
-	if err != nil {
-		log.Printf("parse openai account auth (id=%d): %v", account.ID, err)
-		return nil, false, newLocalError(http.StatusServiceUnavailable,
-			"账号 %s 的鉴权信息不可用，请重新登录", fallback(account.Name, account.AccountID))
-	}
-	return auth, true, nil
 }
 
 // accountAuthFromJSON 从存库的 Codex auth.json 里取出 access token 与 account id。

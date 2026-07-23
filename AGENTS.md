@@ -83,6 +83,8 @@ Web 页面左侧有侧边栏菜单，五项：
 
 各页共用同一套侧边栏，当前页高亮。侧边栏支持收起/展开，状态保存在浏览器 `localStorage.sidebarCollapsed`。
 
+`路由` / `OPENAI` / `API Key` 三个列表页的每一行都可**整行点击跳转**到该条目的「Token 消耗详情」图表页（和 Dashboard 行点击进详情一致）：点行内的按钮/开关/下拉/`详情`链接等交互控件时不跳转，只有点空白区域才跳。跳转地址为 `/stats/tokens?dim=route|account|api_key&id=&name=`，见「Token 消耗统计与图表」。
+
 `API Key` 页是对 `api_keys` 表的增删改查，字段只有名称和 API Key：新增时前端 `crypto.getRandomValues` 自动生成一个 `sk-` 开头的随机 Key（可改），列表里打码显示、编辑时回填完整值。这些 Key 用于「API Key 直连」的命中判定。
 
 `OPENAI` 页除账号摘要/额度/Token 过期外，还有「模型配置」列（模型/推理强度/速度下拉）与「拉取模型」按钮，见「GPT 账号模型配置」。
@@ -147,13 +149,13 @@ OPENAI 页每个账号可配置直连时用的模型/推理强度/速度，逻�
 
 ## API Key 直连（GPT 账号反代）
 
-让任意带 API Key 的客户端（原生 OpenAI SDK / Codex CLI 指向本代理）透明地借用「OPENAI」页里登录的 ChatGPT 账号，直连官方 Codex 后端，不经过路由/链式代理。逻辑在 `accountAuthForRequest`（main.go）。
+让任意带 API Key 的客户端（原生 OpenAI SDK / Codex CLI 指向本代理）透明地借用「OPENAI」页里登录的 ChatGPT 账号，直连官方 Codex 后端，不经过路由/链式代理。逻辑在 `accountPlansForRequest`（main.go）。
 
 命中条件（三者全满足才走直连，否则回落老逻辑）：
 
 1. 请求是 openai 风格（Codex/Responses）；Claude 请求不适用。
-2. 请求头里的 key（`Authorization: Bearer` 或 `X-Api-Key`）命中 `api_keys` 表任意一条（`MatchAPIKey`）。
-3. 按请求体的 `model` 能匹配到账号：查 `selected_model` 相同的账号取 id 最小的一个（`OpenAIAccountForModel`，大小写不敏感）。
+2. 请求头里的 key（`Authorization: Bearer` 或 `X-Api-Key`）命中 `api_keys` 表任意一条（`MatchAPIKeyID`，返回命中的 key id 用于 token 明细关联）。
+3. 按请求体的 `model` 能匹配到账号：查 `selected_model` 相同的**全部**账号作为候选集（`OpenAIAccountsForModel`，大小写不敏感）。
 
 匹配结果与错误码（`localError` 带状态码，避免 CLI 把配置错误当临时故障反复重试）：
 
@@ -161,12 +163,23 @@ OPENAI 页每个账号可配置直连时用的模型/推理强度/速度，逻�
 - 请求无 `model` / 没有账号配置该模型 → **400**，不转发也不回落（回落会用错模型且用户无感）。
 - 查库失败 / 账号凭证损坏 → **503**（可能是临时的，值得重试）。
 
+### 多账号负载均衡 + 会话粘性 + 熔断（account_pool.go）
+
+候选集不再「取 id 最小恒命中第一个」，而是由进程内存里的 `accountPool` 调度（状态不落库）：
+
+- **会话粘性**：同一 `session_id` 优先固定落到上次成功的账号，复用其上下文缓存以提高 `cached_tokens` 命中率。
+- **负载均衡**：无粘性绑定的新会话，在健康候选里按「最少在途请求数」（least-connections）挑选，并发相同时随机打散，避免总打第一个。
+- **熔断兜底**：账号请求失败（传输错误 / HTTP `>=400` / 401 刷新后仍失败 / 凭证不可用）进入 90 秒冷却（`accountCooldown`），并在它是本会话粘性账号时解绑；冷却中的账号排到候选末尾，仅当全部账号都在冷却时才作为最终兜底再试一次。
+- `OrderedAccounts(session, candidates)` 给出本会话的尝试顺序：粘性优先 → 最少在途 → 随机；冷却账号殿后。`Acquire`/`Release` 维护在途计数（响应彻底结束后释放），`MarkSuccess` 绑定粘性、`MarkFailure` 熔断+解绑。
+
+`accountPlansForRequest` 把排序后的候选逐个做成一个 `forwardPlan`（只挂候选账号，鉴权延后），`ServeHTTP` 复用与链式代理同一套 failover 循环（`failoverMode = chainMode || accountMode`）：某账号传输失败或返回 `>=400` 就自动顺位换下一个账号重试，同一请求只落一条 trace，记录的是最终命中账号的来源。每个候选真正尝试前才 `resolveAccountAuth`（按需刷新+解析 token），避免为用不到的候选浪费刷新。
+
 ### Token 自动刷新
 
 账号的 `access_token`（JWT）会过期。存库时同时记录 `token_expires_at`（本地解 JWT 的 `exp`，`accessTokenExpiry`）。
 
 - **主动刷新**：直连转发前 `EnsureFreshAuth` 判断剩余是否 <5 分钟（`tokenRefreshWindow`），是则调 Bridge `tokenRefresh` 刷新、回写完整 `auth.json` 与新过期时间。
-- **401 兜底**：上游真返回 401 时 `retryDirectWithRefresh` 强制刷新一次并用新凭证重试（覆盖时钟偏差、服务端提前失效）。
+- **401 兜底**：上游真返回 401 时 `retryDirectWithRefresh` 强制刷新一次并用新凭证重试（覆盖时钟偏差、服务端提前失效）。多账号直连下按当前命中账号的 `account_db_id` 精确刷新它自己（`ForceRefreshAccount`），不影响其它账号；刷新后仍失败则由 failover 循环换下一个账号。
 - **并发安全**：刷新走 `refreshMu` 串行化，并传入「被拒绝的旧 token」判重——上游刷新会**轮换 refresh_token**，并发或重复刷新会把账号刷成 `refresh_token_reused` 而必须重新登录。
 - **永久失败**：Bridge 返回 `permanent=true`（refresh token 过期/被复用/被吊销）时写 `refresh_error`，页面显示「需重新登录」。
 
@@ -208,6 +221,17 @@ OPENAI 页每个账号可配置直连时用的模型/推理强度/速度，逻�
 - **取舍**：响应是「读完上游再一次性转吐」，不是逐 token 增量流式；客户端拿到的仍是合法原生 SSE。输入 token 取三方返回的 `prompt_tokens`（三方不返回 usage 时为 0）。
 - 只在 2xx 且需适配时走转换;非 2xx 原样透传三方错误。
 
+## Token 消耗统计与图表
+
+基于 `token_usages` 明细表，为路由 / OPENAI 账号 / API Key 提供 token 消耗的图表详情页（`stats_web.go`，模板 `token-stats`）：
+
+- 入口：`路由`/`OPENAI`/`API Key` 三个列表页**整行点击**跳到 `/stats/tokens?dim=route|account|api_key&id=&name=`。`dim` 决定过滤列（`route_id`/`account_db_id`/`api_key_id`），`name` 仅用于页面标题展示。
+- 图表页顶部可切换粒度「按天/按月/按年」，向 `/api/stats/tokens?dim=&id=&granularity=day|month|year` 拉数据。
+- 后端聚合在 store.go：
+  - `TokenSeries(dim, id, granularity)`：按维度过滤 + 按期间列（`date`/`month`/`CAST(year AS CHAR)`）分组，输出每个时间桶的请求数与输入/输出/缓存/合计 token。维度→过滤列、粒度→期间列都走**白名单**映射（`tokenDimColumn`/`tokenGranularityExpr`），防 SQL 注入。
+  - `TokenBreakdownByModel(dim, id)`：同维度下按 `model` 分组的合计 token，用于柱状图对比。
+- 前端图表用**内联 SVG 手绘**，不依赖任何外部图表库/CDN：多序列折线图（输入/输出/缓存/合计随时间）、请求数柱状图、按模型拆分柱状图，外加 5 张汇总卡片；无数据时各面板显示「暂无数据」。
+
 ## 数据库
 
 默认 MySQL：
@@ -222,6 +246,7 @@ OPENAI 页每个账号可配置直连时用的模型/推理强度/速度，逻�
 
 - `conversations`：会话聚合，按 `session_id` 唯一。字段包括 `account_id`、`window_id`、`started_at`、`updated_at`、`first_prompt`、`tags`、`model`、`agent`、`status`、`trace_count`、`error_count`、`total_tokens`、`last_status`、`last_duration_ms`、`last_request_id`。
 - `traces`：每次 `/v1/responses` 请求记录，保存请求/响应 headers、body、SSE events、token、状态、耗时和完成时间。
+- `token_usages`：token 消耗**明细表**，每笔真实产生 token（`total_tokens>0`）的请求在 `FinishTrace` 事务里落一行，用于按维度/时间统计与画图。字段尽量用 id 关联：`trace_id`、`conversation_id`、`session_id`、`provider`、`model`、`source_type`（`direct`/`route`/`chain`/`account`）、`route_id`、`chain_id`、`api_key_id`、`account_db_id`、`account_id`、五个 token 字段，以及冗余的 `year`/`month`（`YYYY-MM`）/`date`（`YYYY-MM-DD`）方便按时间维度查询。来源信息由 `planSource(plan)` 从最终命中的转发计划算出，经 `TraceFinishRecord`→`FinishTraceInput` 传入：命中 API Key 直连记 `source_type=account`+`api_key_id`+`account_db_id`；链式代理记 `source_type=chain`+`chain_id`+命中的 `route_id`（按需求只记链内路由，不记链名）；单路由记 `source_type=route`+`route_id`；官方默认上游记 `direct`。
 - `account_aliases`：`Chatgpt-Account-Id` 到自定义账号名的映射。
 - `api_routes`：路由页配置的第三方 API 供应商。字段 `name`、`base_url`、`model`、`api_style`（openai/anthropic）、`protocol`（chat_completions/responses/messages）、`api_key`、`enabled`。旧库通过 `ensureColumn` 补 `api_style`/`protocol`/`enabled` 三列。
 - `chain_proxies`：链式代理配置。字段 `name`、`api_style`、`route_ids`（JSON 数组，保存点击顺序）、`enabled`、`created_at`、`updated_at`。同一 `api_style` 至多一条启用；`route_ids` 里的路由必须属于同一 API 风格。
@@ -289,7 +314,10 @@ Codex 请求里会混入系统和运行上下文。
 - 状态下拉支持 `LIVE`、`OK`、`ERROR`。
 - Agent 下拉来自实际会话里的 `agent`。
 - 账号下拉只展示有别名的账号。
+- **模型下拉**来自实际会话里的 `conversations.model`，按会话模型过滤。
+- **来源下拉**（直连官方 / 路由 / 链式代理 / APIKey账号反代）按 `token_usages.source_type` 过滤，用 `EXISTS(token_usages)` 判断会话是否有匹配来源的 token 消耗。
 - 搜索框提示为“搜索消息、Session...”，搜索仍覆盖 `session_id`、首条用户 prompt、model、account id 和账号别名。
+- 所有筛选条件归集在 `ConversationFilter` 结构里，由 `conversationFilterFromRequest` 从查询串解析，`conversationWhere`/`ListConversationsPage`/`Stats` 统一消费。
 
 统计：
 
@@ -306,6 +334,7 @@ Codex 请求里会混入系统和运行上下文。
 - 行内还有账号、标签、Trace 数、模型、Agent、状态和删除按钮；进入详情靠点击表格行空白区域。
 - 列表底部显示加载状态：`向下滚动加载更多`、`加载中...` 或 `已加载全部记录`。
 - 删除按钮会先弹出确认框，确认后删除会话；`traces` 依赖外键级联一起删除。
+- **批量删除**：每行首列有复选框，表头有「全选本页」复选框，工具条显示「已选 N 项」与「批量删除」按钮。前端用 `selectedIDs` Set 记录勾选，每次重渲染（含 3 秒自动刷新）后 `applySelection()` 恢复勾选态，保证轮询刷新不丢选择。确认后调 `POST /api/conversations/batch-delete`（`{ids:[...]}`，后端循环复用单删逻辑，含 subagent 级联）。
 
 ## 详情页
 
@@ -374,6 +403,7 @@ log/YYYY-MM-DD-{model}.log
 - `GET /api/conversations`：会话列表 JSON。
 - `GET /api/conversations/{id}`：会话详情 JSON。
 - `DELETE /api/conversations/{id}`：删除会话及其 trace。
+- `POST /api/conversations/batch-delete`：批量删除会话（`{ids:[...]}`，循环复用单删逻辑、含 subagent 级联）。
 - `POST /api/conversations/{id}/tags`：保存会话标签。
 - `POST /api/accounts/{id}/alias`：保存账号别名。
 - `GET /routes`：第三方 API 配置页。
@@ -403,6 +433,8 @@ log/YYYY-MM-DD-{model}.log
 - `POST /api/openai/accounts/{id}/refresh`：刷新该账号：本地补齐 Token 过期时间、按需刷新凭证、异步查额度。
 - `POST /api/openai/accounts/{id}/models`：同步拉取该账号可用模型目录并缓存。
 - `POST /api/openai/accounts/{id}/settings`：保存该账号选的模型/推理强度/速度。
+- `GET /stats/tokens`：Token 消耗详情图表页（`?dim=route|account|api_key&id=&name=`）。
+- `GET /api/stats/tokens`：Token 消耗时间序列与按模型拆分 JSON（`?dim=&id=&granularity=day|month|year`）。
 - `GET /healthz`：健康检查。
 
 ## 当前技术栈

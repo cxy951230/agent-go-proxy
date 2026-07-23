@@ -298,7 +298,24 @@ func newAccountAuth(account OpenAIAccount) (*openaiAccountAuth, error) {
 		return nil, err
 	}
 	auth.Label = fallback(account.Name, account.AccountID)
+	auth.AccountDBID = account.ID
 	return auth, nil
+}
+
+// ForceRefreshAccount 强制刷新指定账号的凭证(按 openai_accounts.id),用于多账号直连路径下
+// 某个账号返回 401 时的兜底:只刷新它自己,不影响别的账号。
+func (m *openAILoginManager) ForceRefreshAccount(ctx context.Context, id int64) (*openaiAccountAuth, error) {
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+	account, err := m.store.GetOpenAIAccount(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	refreshed, err := m.refreshAuth(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+	return newAccountAuth(refreshed)
 }
 
 // refreshAuth 调 Bridge 刷新一次并回写结果。调用方需已持有 refreshMu。

@@ -28,6 +28,12 @@ type TraceFinishRecord struct {
 	ResponseHdrs  map[string][]string
 	ResponseBytes int
 	Error         string
+	// 转发实际命中的链路,透传给 token_usages 明细。
+	SourceType  string
+	RouteID     int64
+	ChainID     int64
+	APIKeyID    int64
+	AccountDBID int64
 }
 
 type traceHandle struct {
@@ -154,6 +160,12 @@ func (r *asyncRecorder) runFinish(job recorderJob) {
 		Usage:         usage,
 		Error:         job.finish.Error,
 		Probe:         job.finish.Probe,
+		Provider:      job.finish.Provider,
+		SourceType:    job.finish.SourceType,
+		RouteID:       job.finish.RouteID,
+		ChainID:       job.finish.ChainID,
+		APIKeyID:      job.finish.APIKeyID,
+		AccountDBID:   job.finish.AccountDBID,
 	}); err != nil {
 		log.Printf("store finish trace: %v", err)
 	}

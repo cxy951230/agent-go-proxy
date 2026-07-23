@@ -65,7 +65,9 @@ func (p *proxyServer) handleAPIOpenAIAccountRefresh(w http.ResponseWriter, r *ht
 		http.Error(w, "bad account id", http.StatusBadRequest)
 		return
 	}
-	go p.openaiLogins.Refresh(id)
+	// 同步刷新(补齐 Token 过期时间→按需刷新凭证→查额度),等完成再返回,
+	// 让前端能像「模型」按钮那样显示加载态、拿到结果后再重载列表。Refresh 内部自带 30s 超时。
+	p.openaiLogins.Refresh(id)
 	writeJSON(w, map[string]any{"ok": true}, nil)
 }
 
@@ -169,6 +171,7 @@ const openAIHTML = `
     .sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;align-self:flex-start;height:100vh;transition:width .16s ease,padding .16s ease}.sidebar .brand-row{display:flex;align-items:center;gap:8px;padding:6px 2px 18px 10px}.sidebar .brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;flex:1;white-space:nowrap;overflow:hidden}.sidebar-toggle{width:30px;height:30px;padding:0;border-radius:7px;border:1px solid var(--line);background:#fff;color:#667284;font-weight:800}.app.sidebar-collapsed .sidebar{width:58px;padding-left:10px;padding-right:10px}.app.sidebar-collapsed .brand{display:none}.app.sidebar-collapsed .nav-item{padding:10px 0;text-align:center;font-size:0}.app.sidebar-collapsed .nav-item::first-letter{font-size:15px}.app.sidebar-collapsed .sidebar-toggle{transform:rotate(180deg)}
     .nav-item{display:block;padding:10px 12px;border-radius:8px;color:var(--text);font-weight:500;margin-bottom:4px;text-decoration:none}.nav-item:hover{background:#eef2fa}.nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}
     .page{flex:1;min-width:0;padding:22px 28px 56px}.top{display:flex;align-items:center;gap:16px}.top h1{font-size:18px;font-weight:600;margin:0;flex:1}button,input{height:42px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:0 14px;font:inherit;color:var(--text)}button{cursor:pointer}.btn-primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}.btn-primary:hover{background:#265fd0}.panel{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05);overflow-x:auto}
+    tbody tr.row-link{cursor:pointer}tbody tr.row-link:hover{background:#fafcff}
     .login-box{display:none;padding:18px 22px;border-bottom:1px solid var(--line);background:#f8fbff}.login-box.show{display:block}.login-title{font-weight:600}.login-url{display:block;margin-top:8px;color:var(--blue);word-break:break-all}.small{font-size:12px;color:var(--muted)}table{width:100%;min-width:1180px;border-collapse:collapse}th,td{padding:16px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;white-space:nowrap}tbody tr:last-child td{border-bottom:0}th{font-size:12px;color:#606a7a;font-weight:600;background:#fbfcfe}.pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600}.plan{color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}.account-id{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#526074;line-height:1.7}.delete-btn{height:32px;color:var(--red);border-color:#f0b3b3;background:#fff6f6}.refresh-btn{height:32px;margin-right:6px}.usage{font-size:12px;line-height:1.5;color:#526074}.empty{padding:28px;color:var(--muted);text-align:center}.notice{margin-top:12px;color:var(--muted)}
     /* 操作列:4 个按钮排成 2×2 等宽网格,比一字排开窄得多,也不会参差换行 */
     td.actions{white-space:nowrap;width:140px;min-width:140px}
@@ -229,7 +232,7 @@ const fmtTime=v=>v?new Date(v).toLocaleString('zh-CN',{hour12:false}):'';
 async function loadAccounts(){
   const rsp=await fetch('/api/openai/accounts',{cache:'no-store'});if(!rsp.ok)throw new Error(await rsp.text());
   const items=await rsp.json();const rows=document.getElementById('account-rows');
-  rows.innerHTML=(items||[]).map(item=>'<tr><td>'+esc(item.name||'-')+'</td><td>'+esc(item.email||'-')+'</td><td><span class="account-id" title="'+esc(item.account_id)+'">'+esc(short(item.account_id))+'</span></td><td><span class="pill plan">'+esc(item.plan_type||'unknown')+'</span></td><td class="usage">'+usageText(item)+'</td><td>'+tokenText(item)+'</td>'+settingsCells(item)+'<td class="actions"><div class="act-grid"><a class="detail-btn" href="/openai/accounts/'+item.id+'">详情</a><button class="refresh-btn" data-refresh-id="'+item.id+'" type="button" title="刷新额度与 Token">额度</button><button class="models-btn" data-models-id="'+item.id+'" type="button" title="重新拉取可用模型">模型</button><button class="delete-btn" data-id="'+item.id+'" type="button">删除</button></div></td></tr>').join('');
+  rows.innerHTML=(items||[]).map(item=>'<tr class="row-link" data-href="/stats/tokens?dim=account&id='+item.id+'&name='+encodeURIComponent(item.name||'')+'"><td>'+esc(item.name||'-')+'</td><td>'+esc(item.email||'-')+'</td><td><span class="account-id" title="'+esc(item.account_id)+'">'+esc(short(item.account_id))+'</span></td><td><span class="pill plan">'+esc(item.plan_type||'unknown')+'</span></td><td class="usage">'+usageText(item)+'</td><td>'+tokenText(item)+'</td>'+settingsCells(item)+'<td class="actions"><div class="act-grid"><a class="detail-btn" href="/openai/accounts/'+item.id+'">详情</a><button class="refresh-btn" data-refresh-id="'+item.id+'" type="button" title="刷新额度与 Token">额度</button><button class="models-btn" data-models-id="'+item.id+'" type="button" title="重新拉取可用模型">模型</button><button class="delete-btn" data-id="'+item.id+'" type="button">删除</button></div></td></tr>').join('');
   document.getElementById('empty').style.display=items&&items.length?'none':'block';
 }
 // tokenText 展示 access_token 过期时间:已过期/即将过期(1小时内)标红或标黄;
@@ -318,7 +321,18 @@ async function pollLogin(id){
 }
 document.getElementById('login-btn').addEventListener('click',beginLogin);
 document.getElementById('account-rows').addEventListener('click',async event=>{const button=event.target.closest('.delete-btn');if(!button||!confirm('确认删除这个 GPT 账号及其数据库鉴权信息吗？'))return;const rsp=await fetch('/api/openai/accounts/'+button.dataset.id,{method:'DELETE'});if(!rsp.ok){alert('删除失败：'+await rsp.text());return}loadAccounts()});
-document.getElementById('account-rows').addEventListener('click',event=>{const button=event.target.closest('.refresh-btn');if(!button)return;button.disabled=true;fetch('/api/openai/accounts/'+button.dataset.refreshId+'/refresh',{method:'POST'}).then(()=>setTimeout(()=>loadAccounts(),1200)).finally(()=>button.disabled=false)});
+// 整行点击跳转到该账号的 token 消耗统计页(点到按钮/链接/下拉等交互控件时不跳转)。
+document.getElementById('account-rows').addEventListener('click',event=>{if(event.target.closest('a,button,input,select'))return;const row=event.target.closest('tr[data-href]');if(row)location.href=row.dataset.href});
+document.getElementById('account-rows').addEventListener('click',async event=>{
+  const button=event.target.closest('.refresh-btn');if(!button)return;
+  const label=button.textContent;button.disabled=true;button.textContent='…';
+  try{
+    const rsp=await fetch('/api/openai/accounts/'+button.dataset.refreshId+'/refresh',{method:'POST'});
+    if(!rsp.ok)throw new Error(await rsp.text());
+    await loadAccounts();
+  }catch(err){alert('刷新额度失败：'+err.message)}
+  finally{button.disabled=false;button.textContent=label}
+});
 // 拉取模型目录:同步等结果,拿到后重渲染以填充三个下拉。
 document.getElementById('account-rows').addEventListener('click',async event=>{
   const button=event.target.closest('.models-btn');if(!button)return;

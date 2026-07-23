@@ -43,6 +43,13 @@ type FinishTraceInput struct {
 	Usage         usageStats
 	Error         string
 	Probe         bool
+	// 以下字段描述这次转发实际命中的链路,用于写入 token_usages 明细表(尽量用 id 关联)。
+	Provider    string
+	SourceType  string // direct / route / chain / account
+	RouteID     int64  // route / chain 命中的具体路由
+	ChainID     int64  // chain 命中的链式代理
+	APIKeyID    int64  // account 路径命中的 API Key
+	AccountDBID int64  // account 路径命中的 openai_accounts.id
 }
 
 type ConversationSummary struct {
@@ -187,6 +194,7 @@ type FilterOptions struct {
 	Months         []string
 	Dates          []string
 	Agents         []string
+	Models         []string
 	AccountAliases []AccountAliasOption
 }
 
@@ -298,6 +306,39 @@ func (s *Store) migrate(ctx context.Context) error {
 			INDEX idx_traces_account (account_id),
 			INDEX idx_traces_session (session_id),
 			CONSTRAINT fk_traces_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS token_usages (
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			trace_id BIGINT NOT NULL,
+			conversation_id BIGINT NOT NULL,
+			session_id VARCHAR(128) NOT NULL DEFAULT '',
+			provider VARCHAR(24) NOT NULL DEFAULT '',
+			model VARCHAR(128) NOT NULL DEFAULT '',
+			source_type VARCHAR(24) NOT NULL DEFAULT 'direct',
+			route_id BIGINT NOT NULL DEFAULT 0,
+			chain_id BIGINT NOT NULL DEFAULT 0,
+			api_key_id BIGINT NOT NULL DEFAULT 0,
+			account_db_id BIGINT NOT NULL DEFAULT 0,
+			account_id VARCHAR(128) NOT NULL DEFAULT '',
+			input_tokens INT NOT NULL DEFAULT 0,
+			output_tokens INT NOT NULL DEFAULT 0,
+			total_tokens INT NOT NULL DEFAULT 0,
+			cached_tokens INT NOT NULL DEFAULT 0,
+			reasoning_tokens INT NOT NULL DEFAULT 0,
+			created_at DATETIME(6) NOT NULL,
+			year SMALLINT NOT NULL DEFAULT 0,
+			month VARCHAR(7) NOT NULL DEFAULT '',
+			date VARCHAR(10) NOT NULL DEFAULT '',
+			INDEX idx_tu_created (created_at),
+			INDEX idx_tu_route (route_id),
+			INDEX idx_tu_chain (chain_id),
+			INDEX idx_tu_apikey (api_key_id),
+			INDEX idx_tu_account (account_db_id),
+			INDEX idx_tu_conv (conversation_id),
+			INDEX idx_tu_model (model),
+			INDEX idx_tu_source (source_type),
+			INDEX idx_tu_date (date),
+			INDEX idx_tu_month (month)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 		`CREATE TABLE IF NOT EXISTS account_aliases (
 			account_id VARCHAR(128) PRIMARY KEY,
@@ -791,45 +832,87 @@ func (s *Store) FinishTrace(ctx context.Context, traceID int64, in FinishTraceIn
 	if err != nil {
 		return err
 	}
+	// token 消耗明细:只在真实产生 token 时落一行,冗余年/月/日方便按时间维度查询与画图。
+	// conversation_id / session_id / model / account_id 直接取自 traces 行,来源字段由转发层传入。
+	if in.Usage.TotalTokens > 0 {
+		sourceType := in.SourceType
+		if sourceType == "" {
+			sourceType = "direct"
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO token_usages
+			(trace_id, conversation_id, session_id, provider, model, source_type, route_id, chain_id, api_key_id, account_db_id, account_id,
+			 input_tokens, output_tokens, total_tokens, cached_tokens, reasoning_tokens, created_at, year, month, date)
+			SELECT t.id, t.conversation_id, t.session_id, ?, t.model, ?, ?, ?, ?, ?, t.account_id,
+			 ?, ?, ?, ?, ?, ?, ?, ?, ?
+			FROM traces t WHERE t.id=?`,
+			in.Provider, sourceType, in.RouteID, in.ChainID, in.APIKeyID, in.AccountDBID,
+			in.Usage.InputTokens, in.Usage.OutputTokens, in.Usage.TotalTokens, in.Usage.CachedInputTokens, in.Usage.ReasoningTokens,
+			now, now.Year(), now.Format("2006-01"), now.Format("2006-01-02"), traceID)
+		if err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
-func conversationWhere(query, status, month, date, agent, accountID string) (string, []any) {
+// ConversationFilter 归集看板顶部所有过滤条件。model 按会话记录的模型过滤;
+// source 按 token_usages 记录的转发来源(direct/route/chain/account)过滤——
+// 来源是 trace 级别的,所以用 EXISTS 判断会话是否有匹配来源的 token 消耗。
+type ConversationFilter struct {
+	Query     string
+	Status    string
+	Month     string
+	Date      string
+	Agent     string
+	AccountID string
+	Model     string
+	Source    string
+}
+
+func conversationWhere(f ConversationFilter) (string, []any) {
 	where := "WHERE 1=1"
 	args := []any{}
-	if status != "" && status != "all" {
+	if f.Status != "" && f.Status != "all" {
 		where += " AND c.status=?"
-		args = append(args, status)
+		args = append(args, f.Status)
 	}
-	if month != "" && month != "all" {
+	if f.Month != "" && f.Month != "all" {
 		where += " AND DATE_FORMAT(c.updated_at, '%Y-%m')=?"
-		args = append(args, month)
+		args = append(args, f.Month)
 	}
-	if date != "" && date != "all" {
+	if f.Date != "" && f.Date != "all" {
 		where += " AND DATE(c.updated_at)=?"
-		args = append(args, date)
+		args = append(args, f.Date)
 	}
-	if agent != "" && agent != "all" {
+	if f.Agent != "" && f.Agent != "all" {
 		where += " AND c.agent=?"
-		args = append(args, agent)
+		args = append(args, f.Agent)
 	}
-	if accountID != "" && accountID != "all" {
+	if f.AccountID != "" && f.AccountID != "all" {
 		where += " AND c.account_id=?"
-		args = append(args, accountID)
+		args = append(args, f.AccountID)
 	}
-	if query != "" {
+	if f.Model != "" && f.Model != "all" {
+		where += " AND c.model=?"
+		args = append(args, f.Model)
+	}
+	if f.Source != "" && f.Source != "all" {
+		where += " AND EXISTS(SELECT 1 FROM token_usages tu WHERE tu.conversation_id=c.id AND tu.source_type=?)"
+		args = append(args, f.Source)
+	}
+	if f.Query != "" {
 		where += " AND (c.session_id LIKE ? OR c.first_prompt LIKE ? OR c.model LIKE ? OR c.account_id LIKE ? OR a.display_name LIKE ?)"
-		like := "%" + query + "%"
+		like := "%" + f.Query + "%"
 		args = append(args, like, like, like, like, like)
 	}
 	return where, args
 }
 
-func (s *Store) ListConversations(ctx context.Context, query, status, month, date, agent, accountID string) ([]ConversationSummary, error) {
-	return s.ListConversationsPage(ctx, query, status, month, date, agent, accountID, 200, 0)
+func (s *Store) ListConversations(ctx context.Context, f ConversationFilter) ([]ConversationSummary, error) {
+	return s.ListConversationsPage(ctx, f, 200, 0)
 }
 
-func (s *Store) ListConversationsPage(ctx context.Context, query, status, month, date, agent, accountID string, limit, offset int) ([]ConversationSummary, error) {
+func (s *Store) ListConversationsPage(ctx context.Context, f ConversationFilter, limit, offset int) ([]ConversationSummary, error) {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -839,7 +922,7 @@ func (s *Store) ListConversationsPage(ctx context.Context, query, status, month,
 	if offset < 0 {
 		offset = 0
 	}
-	where, args := conversationWhere(query, status, month, date, agent, accountID)
+	where, args := conversationWhere(f)
 	args = append(args, limit, offset)
 	rows, err := s.db.QueryContext(ctx, `SELECT pc.id, pc.session_id, pc.account_id, pc.account_name, pc.tags, pc.started_at, pc.updated_at, pc.first_prompt, pc.trace_count,
 		pc.error_count, pc.total_tokens, COALESCE(SUM(t.input_tokens),0), COALESCE(SUM(t.output_tokens),0), COALESCE(SUM(t.cached_tokens),0),
@@ -992,6 +1075,22 @@ func (s *Store) FilterOptions(ctx context.Context) (FilterOptions, error) {
 		return opts, err
 	}
 
+	modelRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT model FROM conversations WHERE model<>'' ORDER BY model ASC`)
+	if err != nil {
+		return opts, err
+	}
+	defer modelRows.Close()
+	for modelRows.Next() {
+		var value string
+		if err := modelRows.Scan(&value); err != nil {
+			return opts, err
+		}
+		opts.Models = append(opts.Models, value)
+	}
+	if err := modelRows.Err(); err != nil {
+		return opts, err
+	}
+
 	aliasRows, err := s.db.QueryContext(ctx, `SELECT account_id, display_name FROM account_aliases WHERE display_name<>'' ORDER BY display_name ASC`)
 	if err != nil {
 		return opts, err
@@ -1046,6 +1145,97 @@ func (s *Store) GetConversation(ctx context.Context, id int64) (ConversationSumm
 		traces = append(traces, t)
 	}
 	return c, traces, rows.Err()
+}
+
+// TokenPoint 是 token 消耗时间序列上的一个时间桶(按天/月/年聚合)。
+type TokenPoint struct {
+	Period       string `json:"period"`
+	Requests     int64  `json:"requests"`
+	InputTokens  int64  `json:"input_tokens"`
+	OutputTokens int64  `json:"output_tokens"`
+	CachedTokens int64  `json:"cached_tokens"`
+	TotalTokens  int64  `json:"total_tokens"`
+}
+
+// TokenModelPoint 是某维度下按模型拆分的 token 消耗汇总。
+type TokenModelPoint struct {
+	Model        string `json:"model"`
+	Requests     int64  `json:"requests"`
+	InputTokens  int64  `json:"input_tokens"`
+	OutputTokens int64  `json:"output_tokens"`
+	CachedTokens int64  `json:"cached_tokens"`
+	TotalTokens  int64  `json:"total_tokens"`
+}
+
+// tokenDimColumn 把维度名安全映射到 token_usages 的过滤列(白名单,防注入)。
+var tokenDimColumn = map[string]string{
+	"route":   "route_id",
+	"chain":   "chain_id",
+	"api_key": "api_key_id",
+	"account": "account_db_id",
+}
+
+// tokenGranularityExpr 把粒度名映射到分组用的期间列(白名单)。
+var tokenGranularityExpr = map[string]string{
+	"day":   "date",
+	"month": "month",
+	"year":  "CAST(year AS CHAR)",
+}
+
+// TokenSeries 按维度(路由/链式/API Key/账号)与粒度(天/月/年)聚合 token 消耗时间序列。
+func (s *Store) TokenSeries(ctx context.Context, dim string, id int64, granularity string) ([]TokenPoint, error) {
+	column, ok := tokenDimColumn[dim]
+	if !ok {
+		return nil, errors.New("不支持的统计维度")
+	}
+	periodExpr, ok := tokenGranularityExpr[granularity]
+	if !ok {
+		periodExpr = tokenGranularityExpr["day"]
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+periodExpr+` AS period,
+		COUNT(*) requests, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+		COALESCE(SUM(cached_tokens),0), COALESCE(SUM(total_tokens),0)
+		FROM token_usages WHERE `+column+`=?
+		GROUP BY period ORDER BY period ASC`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]TokenPoint, 0)
+	for rows.Next() {
+		var p TokenPoint
+		if err := rows.Scan(&p.Period, &p.Requests, &p.InputTokens, &p.OutputTokens, &p.CachedTokens, &p.TotalTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// TokenBreakdownByModel 返回某维度下按模型拆分的 token 消耗,用于柱状图对比。
+func (s *Store) TokenBreakdownByModel(ctx context.Context, dim string, id int64) ([]TokenModelPoint, error) {
+	column, ok := tokenDimColumn[dim]
+	if !ok {
+		return nil, errors.New("不支持的统计维度")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(NULLIF(model,''),'unknown') model,
+		COUNT(*) requests, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+		COALESCE(SUM(cached_tokens),0), COALESCE(SUM(total_tokens),0)
+		FROM token_usages WHERE `+column+`=?
+		GROUP BY model ORDER BY SUM(total_tokens) DESC`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]TokenModelPoint, 0)
+	for rows.Next() {
+		var p TokenModelPoint
+		if err := rows.Scan(&p.Model, &p.Requests, &p.InputTokens, &p.OutputTokens, &p.CachedTokens, &p.TotalTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) SetAccountAlias(ctx context.Context, accountID, displayName string) error {
@@ -1133,8 +1323,8 @@ func (s *Store) DeleteConversation(ctx context.Context, id int64) error {
 	return tx.Commit()
 }
 
-func (s *Store) Stats(ctx context.Context, query, status, month, date, agent, accountID string) (conversationCount, traceCount int, inputTokens, outputTokens, cachedTokens int64, err error) {
-	where, args := conversationWhere(query, status, month, date, agent, accountID)
+func (s *Store) Stats(ctx context.Context, f ConversationFilter) (conversationCount, traceCount int, inputTokens, outputTokens, cachedTokens int64, err error) {
+	where, args := conversationWhere(f)
 	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(c.trace_count),0)
 		FROM conversations c
 		LEFT JOIN account_aliases a ON a.account_id=c.account_id `+where, args...).
@@ -1286,17 +1476,21 @@ func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	return out, rows.Err()
 }
 
-// MatchAPIKey 判断客户端带来的 key 是否命中「API Key」页里配置的任意一条。
-func (s *Store) MatchAPIKey(ctx context.Context, key string) (bool, error) {
+// MatchAPIKeyID 判断客户端带来的 key 是否命中「API Key」页配置,命中返回其 id(用于 token 明细关联)。
+func (s *Store) MatchAPIKeyID(ctx context.Context, key string) (int64, bool, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return false, nil
+		return 0, false, nil
 	}
-	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM api_keys WHERE api_key=?`, key).Scan(&count); err != nil {
-		return false, err
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM api_keys WHERE api_key=? ORDER BY id LIMIT 1`, key).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
 	}
-	return count > 0, nil
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
 }
 
 // DefaultOpenAIAccount 取用于直连反代的 GPT 账号。当前按 id 取第一个(只配了一个),
@@ -1313,6 +1507,40 @@ func (s *Store) OpenAIAccountForModel(ctx context.Context, model string) (OpenAI
 		return OpenAIAccount{}, false, nil
 	}
 	return s.queryOpenAIAccount(ctx, "WHERE LOWER(selected_model)=LOWER(?)", model)
+}
+
+// OpenAIAccountsForModel 返回所有把 selected_model 设为该模型的账号(含 AuthJSON),
+// 供负载均衡在候选集里挑选。空模型或无候选返回空切片。按 id 升序,保证候选顺序稳定。
+func (s *Store) OpenAIAccountsForModel(ctx context.Context, model string) ([]OpenAIAccount, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, email, account_id, plan_type, auth_json, token_expires_at, refresh_error,
+		selected_model, selected_reasoning_effort, selected_service_tier
+		FROM openai_accounts WHERE LOWER(selected_model)=LOWER(?) ORDER BY id`, model)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OpenAIAccount
+	for rows.Next() {
+		var account OpenAIAccount
+		var expiresAt sql.NullTime
+		var refreshError sql.NullString
+		if err := rows.Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.AuthJSON, &expiresAt, &refreshError,
+			&account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier); err != nil {
+			return nil, err
+		}
+		if expiresAt.Valid {
+			account.TokenExpiresAt = expiresAt.Time
+		}
+		if refreshError.Valid {
+			account.RefreshError = refreshError.String
+		}
+		out = append(out, account)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) queryOpenAIAccount(ctx context.Context, where string, args ...any) (OpenAIAccount, bool, error) {
