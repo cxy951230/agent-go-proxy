@@ -1157,8 +1157,10 @@ type TokenPoint struct {
 	TotalTokens  int64  `json:"total_tokens"`
 }
 
-// TokenModelPoint 是某维度下按模型拆分的 token 消耗汇总。
-type TokenModelPoint struct {
+// TokenModelSeriesPoint 是「时间桶 × 模型」二维聚合的一格:某个时间点上某个模型的消耗。
+// 前端据此画分组柱状图(同一时间点内各模型的柱子并排)。
+type TokenModelSeriesPoint struct {
+	Period       string `json:"period"`
 	Model        string `json:"model"`
 	Requests     int64  `json:"requests"`
 	InputTokens  int64  `json:"input_tokens"`
@@ -1212,25 +1214,31 @@ func (s *Store) TokenSeries(ctx context.Context, dim string, id int64, granulari
 	return out, rows.Err()
 }
 
-// TokenBreakdownByModel 返回某维度下按模型拆分的 token 消耗,用于柱状图对比。
-func (s *Store) TokenBreakdownByModel(ctx context.Context, dim string, id int64) ([]TokenModelPoint, error) {
+// TokenSeriesByModel 按维度与粒度做「时间桶 × 模型」二维聚合:每个时间点上每个模型各一行。
+// 用于请求数/ token 消耗的分组柱状图(同一时间点内各模型并排)。
+func (s *Store) TokenSeriesByModel(ctx context.Context, dim string, id int64, granularity string) ([]TokenModelSeriesPoint, error) {
 	column, ok := tokenDimColumn[dim]
 	if !ok {
 		return nil, errors.New("不支持的统计维度")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(NULLIF(model,''),'unknown') model,
+	periodExpr, ok := tokenGranularityExpr[granularity]
+	if !ok {
+		periodExpr = tokenGranularityExpr["day"]
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+periodExpr+` AS period,
+		COALESCE(NULLIF(model,''),'unknown') model,
 		COUNT(*) requests, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
 		COALESCE(SUM(cached_tokens),0), COALESCE(SUM(total_tokens),0)
 		FROM token_usages WHERE `+column+`=?
-		GROUP BY model ORDER BY SUM(total_tokens) DESC`, id)
+		GROUP BY period, model ORDER BY period ASC, SUM(total_tokens) DESC`, id)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := make([]TokenModelPoint, 0)
+	out := make([]TokenModelSeriesPoint, 0)
 	for rows.Next() {
-		var p TokenModelPoint
-		if err := rows.Scan(&p.Model, &p.Requests, &p.InputTokens, &p.OutputTokens, &p.CachedTokens, &p.TotalTokens); err != nil {
+		var p TokenModelSeriesPoint
+		if err := rows.Scan(&p.Period, &p.Model, &p.Requests, &p.InputTokens, &p.OutputTokens, &p.CachedTokens, &p.TotalTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

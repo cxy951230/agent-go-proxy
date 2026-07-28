@@ -308,17 +308,17 @@ func (p *proxyServer) handleAPITokenStats(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	byModel, err := p.store.TokenBreakdownByModel(r.Context(), dim, id)
+	byPeriodModel, err := p.store.TokenSeriesByModel(r.Context(), dim, id, granularity)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	writeJSON(w, map[string]any{
-		"dim":         dim,
-		"id":          id,
-		"granularity": granularity,
-		"series":      series,
-		"by_model":    byModel,
+		"dim":             dim,
+		"id":              id,
+		"granularity":     granularity,
+		"series":          series,
+		"by_period_model": byPeriodModel,
 	}, nil)
 }
 

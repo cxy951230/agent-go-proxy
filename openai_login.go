@@ -402,7 +402,51 @@ func (m *openAILoginManager) RefreshModels(ctx context.Context, id int64) error 
 	if err := m.store.UpdateOpenAIAccountModels(ctx, id, raw); err != nil {
 		return fmt.Errorf("保存模型列表失败: %w", err)
 	}
+	// 首次拉取(还没手动选过)时,把默认模型落库,避免页面下拉「显示了第一个但没存」的假象——
+	// 否则直连匹配 selected_model 时查不到账号,报「没有账号配置了模型」。
+	if strings.TrimSpace(account.SelectedModel) == "" {
+		if model, effort := defaultModelFromCatalog(raw); model != "" {
+			if err := m.store.UpdateOpenAIAccountSettings(ctx, id, model, effort, "default"); err != nil {
+				log.Printf("persist default model for account %d: %v", id, err)
+			}
+		}
+	}
 	return nil
+}
+
+type catalogModel struct {
+	Model                  string `json:"model"`
+	IsDefault              bool   `json:"is_default"`
+	ShowInPicker           *bool  `json:"show_in_picker"`
+	DefaultReasoningEffort string `json:"default_reasoning_effort"`
+}
+
+// defaultModelFromCatalog 从 Bridge 模型目录里挑「默认选中」的模型,规则与前端 currentModel 一致:
+// 只看 picker 可见项,优先 is_default,否则取第一项;返回模型 slug 与其默认推理强度。
+func defaultModelFromCatalog(raw string) (string, string) {
+	var catalog struct {
+		Models []catalogModel `json:"models"`
+	}
+	if err := json.Unmarshal([]byte(raw), &catalog); err != nil {
+		return "", ""
+	}
+	var first *catalogModel
+	for i := range catalog.Models {
+		mdl := &catalog.Models[i]
+		if mdl.Model == "" || (mdl.ShowInPicker != nil && !*mdl.ShowInPicker) {
+			continue
+		}
+		if mdl.IsDefault {
+			return mdl.Model, mdl.DefaultReasoningEffort
+		}
+		if first == nil {
+			first = mdl
+		}
+	}
+	if first != nil {
+		return first.Model, first.DefaultReasoningEffort
+	}
+	return "", ""
 }
 
 func (m *openAILoginManager) Refresh(id int64) {

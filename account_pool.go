@@ -19,9 +19,9 @@ const accountCooldown = 90 * time.Second
 //   - 熔断兜底:账号失败进入冷却期,粘性账号失败时解除绑定,下次请求重新选健康账号。
 type accountPool struct {
 	mu       sync.Mutex
-	sticky   map[string]int64     // session_id -> account_db_id
-	inflight map[int64]int        // account_db_id -> 在途请求数
-	cooldown map[int64]time.Time  // account_db_id -> 冷却截止
+	sticky   map[string]int64    // session_id|model -> account_db_id
+	inflight map[int64]int       // account_db_id -> 在途请求数
+	cooldown map[int64]time.Time // account_db_id -> 冷却截止
 }
 
 func newAccountPool() *accountPool {
@@ -32,10 +32,17 @@ func newAccountPool() *accountPool {
 	}
 }
 
+// stickyKey 把会话粘性按 (session_id, model) 绑定:同一会话换模型时命中不同的 key,
+// 天然重新匹配账号;换回原模型还能复用原账号的上下文缓存(cached_tokens)。
+// 候选集本身已按模型过滤,这里的 model 维度只影响「粘哪个账号」,不影响候选范围。
+func stickyKey(sessionID, model string) string {
+	return sessionID + "\x00" + model
+}
+
 // OrderedAccounts 返回该会话应依次尝试的账号顺序:
 // 粘性账号(健康时)排最前,其余健康账号按在途数升序,冷却中的账号排在最后作为最终兜底
 // (全部账号都在冷却时仍要给一次机会,而不是直接放弃)。
-func (p *accountPool) OrderedAccounts(sessionID string, candidates []OpenAIAccount) []OpenAIAccount {
+func (p *accountPool) OrderedAccounts(sessionID, model string, candidates []OpenAIAccount) []OpenAIAccount {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -43,7 +50,7 @@ func (p *accountPool) OrderedAccounts(sessionID string, candidates []OpenAIAccou
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	stickyID := p.sticky[sessionID]
+	stickyID := p.sticky[stickyKey(sessionID, model)]
 	type scored struct {
 		account  OpenAIAccount
 		inflight int
@@ -113,28 +120,29 @@ func (p *accountPool) Release(accountID int64) {
 	p.mu.Unlock()
 }
 
-// MarkSuccess 请求成功:绑定会话粘性到该账号,并清掉它的冷却标记。
-func (p *accountPool) MarkSuccess(sessionID string, accountID int64) {
+// MarkSuccess 请求成功:按 (session, model) 绑定会话粘性到该账号,并清掉它的冷却标记。
+func (p *accountPool) MarkSuccess(sessionID, model string, accountID int64) {
 	if accountID == 0 {
 		return
 	}
 	p.mu.Lock()
 	if sessionID != "" {
-		p.sticky[sessionID] = accountID
+		p.sticky[stickyKey(sessionID, model)] = accountID
 	}
 	delete(p.cooldown, accountID)
 	p.mu.Unlock()
 }
 
-// MarkFailure 请求失败:账号进入冷却期;若它正是本会话的粘性账号则解绑,促使下次重新选。
-func (p *accountPool) MarkFailure(sessionID string, accountID int64) {
+// MarkFailure 请求失败:账号进入冷却期;若它正是本会话该模型的粘性账号则解绑,促使下次重新选。
+func (p *accountPool) MarkFailure(sessionID, model string, accountID int64) {
 	if accountID == 0 {
 		return
 	}
 	p.mu.Lock()
 	p.cooldown[accountID] = time.Now().Add(accountCooldown)
-	if sessionID != "" && p.sticky[sessionID] == accountID {
-		delete(p.sticky, sessionID)
+	key := stickyKey(sessionID, model)
+	if sessionID != "" && p.sticky[key] == accountID {
+		delete(p.sticky, key)
 	}
 	p.mu.Unlock()
 }

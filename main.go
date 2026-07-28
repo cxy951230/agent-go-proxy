@@ -494,7 +494,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resolved, resolveErr := p.resolveAccountAuth(r.Context(), plan.accountCandidate, plan.apiKeyID)
 			if resolveErr != nil {
 				lastErr = resolveErr
-				p.accounts.MarkFailure(meta.SessionID, plan.accountCandidate.ID)
+				p.accounts.MarkFailure(meta.SessionID, plan.effectiveModel, plan.accountCandidate.ID)
 				if i == len(plans)-1 {
 					status := http.StatusServiceUnavailable
 					var local *localError
@@ -596,7 +596,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				p.chains.MarkSuccess(plan.chainID, meta.SessionID, plan.route.ID)
 			}
 			if accountMode && plan.accountAuth != nil {
-				p.accounts.MarkSuccess(meta.SessionID, plan.accountAuth.AccountDBID)
+				p.accounts.MarkSuccess(meta.SessionID, plan.effectiveModel, plan.accountAuth.AccountDBID)
 			}
 		}
 		break
@@ -831,7 +831,7 @@ func (p *proxyServer) accountPlansForRequest(ctx context.Context, r *http.Reques
 		return nil, false, newLocalError(http.StatusBadRequest,
 			"没有账号配置了模型 %s，请在 OPENAI 页面为某个账号选择该模型", model)
 	}
-	ordered := p.accounts.OrderedAccounts(sessionID, candidates)
+	ordered := p.accounts.OrderedAccounts(sessionID, model, candidates)
 	forwardBody := p.prepareCodexBackendBody(reqBody)
 	directJSON := !clientWantsSSE(reqBody)
 	upstreamURL := buildUpstreamURL(upstreamTarget, r.URL)
@@ -1031,7 +1031,7 @@ func (p *proxyServer) markAttemptFailure(chainMode, accountMode bool, plan forwa
 		p.chains.MarkFailure(plan.chainID, sessionID, plan.route.ID)
 	}
 	if accountMode && plan.accountCandidate != nil {
-		p.accounts.MarkFailure(sessionID, plan.accountCandidate.ID)
+		p.accounts.MarkFailure(sessionID, plan.effectiveModel, plan.accountCandidate.ID)
 	}
 }
 
