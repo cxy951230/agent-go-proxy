@@ -113,13 +113,13 @@ type AccountAliasOption struct {
 // OpenAIAccount 是通过 Codex Bridge 登录的 ChatGPT 账号。AuthJSON 只在写入数据库时
 // 使用，列表 API 不返回该字段，避免浏览器页面接触 access/refresh token。
 type OpenAIAccount struct {
-	ID          int64     `json:"id"`
-	Name        string    `json:"name"`
-	Email       string    `json:"email"`
-	AccountID   string    `json:"account_id"`
-	PlanType    string    `json:"plan_type"`
-	AuthJSON    string    `json:"-"`
-	CodexCommit string    `json:"codex_commit"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Email       string `json:"email"`
+	AccountID   string `json:"account_id"`
+	PlanType    string `json:"plan_type"`
+	AuthJSON    string `json:"-"`
+	CodexCommit string `json:"codex_commit"`
 	// TokenExpiresAt 是 access_token(JWT)的 exp,登录与每次刷新后写入,
 	// 转发前据此判断是否需要提前刷新。零值表示未知。
 	TokenExpiresAt time.Time `json:"token_expires_at,omitempty"`
@@ -131,14 +131,14 @@ type OpenAIAccount struct {
 	Models   any       `json:"models,omitempty"`
 	ModelsAt time.Time `json:"models_at,omitempty"`
 	// 以下三项是用户在页面上选的配置。
-	SelectedModel           string `json:"selected_model"`
-	SelectedReasoningEffort string `json:"selected_reasoning_effort"`
-	SelectedServiceTier     string `json:"selected_service_tier"`
-	Status      any       `json:"status,omitempty"`
-	StatusError string    `json:"status_error,omitempty"`
-	StatusAt    time.Time `json:"status_at,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	SelectedModel           string    `json:"selected_model"`
+	SelectedReasoningEffort string    `json:"selected_reasoning_effort"`
+	SelectedServiceTier     string    `json:"selected_service_tier"`
+	Status                  any       `json:"status,omitempty"`
+	StatusError             string    `json:"status_error,omitempty"`
+	StatusAt                time.Time `json:"status_at,omitempty"`
+	CreatedAt               time.Time `json:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at"`
 }
 
 // APIRoute 是「路由」页配置的第三方 API 供应商,保存 Base URL / Model / API Key。
@@ -393,6 +393,45 @@ func (s *Store) migrate(ctx context.Context) error {
 			UNIQUE KEY uk_openai_accounts_account_id (account_id),
 		INDEX idx_openai_accounts_updated_at (updated_at)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		// outlook_login_tokens 的权威 schema 归 outlook-login-automation skill 所有;
+		// 这里用同样的 IF NOT EXISTS DDL 兜底,保证代理单独启动(skill 从未跑过)时
+		// OUTLOOK 页面查询不因表缺失而报错。skill 已建表时这里是空操作。
+		`CREATE TABLE IF NOT EXISTS outlook_login_tokens (
+			id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			email VARCHAR(320) NOT NULL,
+			password VARCHAR(512) NOT NULL DEFAULT '',
+			display_name VARCHAR(255) DEFAULT NULL,
+			client_id VARCHAR(80) NOT NULL,
+			tenant_id VARCHAR(80) DEFAULT NULL,
+			account_oid VARCHAR(80) DEFAULT NULL,
+			home_account_id VARCHAR(180) DEFAULT NULL,
+			scope TEXT DEFAULT NULL,
+			token_type VARCHAR(40) DEFAULT NULL,
+			access_token LONGTEXT DEFAULT NULL,
+			refresh_token LONGTEXT DEFAULT NULL,
+			id_token LONGTEXT DEFAULT NULL,
+			client_info LONGTEXT DEFAULT NULL,
+			expires_in INT DEFAULT NULL,
+			ext_expires_in INT DEFAULT NULL,
+			refresh_token_expires_in INT DEFAULT NULL,
+			token_issued_at DATETIME DEFAULT NULL,
+			access_token_expires_at DATETIME DEFAULT NULL,
+			refresh_token_expires_at DATETIME DEFAULT NULL,
+			cookies_json LONGTEXT DEFAULT NULL,
+			cookie_count INT DEFAULT NULL,
+			user_agent TEXT DEFAULT NULL,
+			session_id VARCHAR(80) DEFAULT NULL,
+			session_file TEXT DEFAULT NULL,
+			profile_dir TEXT DEFAULT NULL,
+			run_dir TEXT DEFAULT NULL,
+			final_url TEXT DEFAULT NULL,
+			last_refresh_status VARCHAR(80) DEFAULT NULL,
+			last_refresh_error TEXT DEFAULT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			PRIMARY KEY (id),
+			UNIQUE KEY uniq_email_client_scope (email, client_id, scope(255))
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -459,6 +498,16 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := s.ensureColumn(ctx, "openai_accounts", col[0], col[1]); err != nil {
 			return err
 		}
+	}
+	// outlook_login_tokens 存明文登录密码(手动新增/编辑账号用,供后续自动登录复用)。
+	// skill 的 upsert 列表不含 password,登录时不会覆盖它。
+	if err := s.ensureColumn(ctx, "outlook_login_tokens", "password", "VARCHAR(512) NOT NULL DEFAULT '' AFTER email"); err != nil {
+		return err
+	}
+	// has_gpt_account 落库缓存「该邮箱是否已配置 GPT 账号」。列表查询只对该列为 0 的行
+	// 再去关联 openai_accounts,一旦关联到就把该列刷成 1,后续不再重复关联。
+	if err := s.ensureColumn(ctx, "outlook_login_tokens", "has_gpt_account", "TINYINT(1) NOT NULL DEFAULT 0"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1932,4 +1981,356 @@ func nullJSON(raw []byte) any {
 		return nil
 	}
 	return string(raw)
+}
+
+// OutlookAccount 是 OUTLOOK 页面展示用的一行 outlook_login_tokens 记录。
+// 出于安全考虑,列表接口不返回 access_token / refresh_token / id_token / cookies 等敏感明文,
+// 只返回过期时间、状态等元数据(与 OPENAI 页面 API 不返回 token 的约定一致)。
+type OutlookAccount struct {
+	ID                    int64     `json:"id"`
+	Email                 string    `json:"email"`
+	DisplayName           string    `json:"display_name"`
+	TenantID              string    `json:"tenant_id"`
+	Scope                 string    `json:"scope"`
+	TokenType             string    `json:"token_type"`
+	AccessTokenLen        int       `json:"access_token_len"`
+	RefreshTokenLen       int       `json:"refresh_token_len"`
+	ExpiresIn             int64     `json:"expires_in"`
+	RefreshTokenExpiresIn int64     `json:"refresh_token_expires_in"`
+	CookieCount           int64     `json:"cookie_count"`
+	TokenIssuedAt         time.Time `json:"token_issued_at"`
+	AccessTokenExpiresAt  time.Time `json:"access_token_expires_at"`
+	RefreshTokenExpiresAt time.Time `json:"refresh_token_expires_at"`
+	LastRefreshStatus     string    `json:"last_refresh_status"`
+	LastRefreshError      string    `json:"last_refresh_error"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+	// HasGPTAccount 是否在 OPENAI 菜单里存在同邮箱的 GPT 账号,存在
+	// outlook_login_tokens.has_gpt_account 列里。为 0 的行每次列表查询仍会关联
+	// openai_accounts 复算一次,一旦算出 1 就回写该列(只 0→1,不回退)。
+	HasGPTAccount bool `json:"has_gpt_account"`
+}
+
+// ListOutlookAccounts 列出所有已登录的 Outlook 账号(不含任何 token/cookie 明文)。
+// GPT 账号标记以 has_gpt_account 列为准;该列为 0 的行才按邮箱关联 openai_accounts 复算一次
+// (CASE 短路,已是 1 的行不做子查询),复算出 1 的行在返回前回写该列,下次直接读列。
+func (s *Store) ListOutlookAccounts(ctx context.Context) ([]OutlookAccount, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT t.id, t.email, COALESCE(t.display_name,''), COALESCE(t.tenant_id,''), COALESCE(t.scope,''),
+		COALESCE(t.token_type,''), COALESCE(CHAR_LENGTH(t.access_token),0), COALESCE(CHAR_LENGTH(t.refresh_token),0),
+		COALESCE(t.expires_in,0), COALESCE(t.refresh_token_expires_in,0), COALESCE(t.cookie_count,0),
+		t.token_issued_at, t.access_token_expires_at, t.refresh_token_expires_at,
+		COALESCE(t.last_refresh_status,''), COALESCE(t.last_refresh_error,''), t.created_at, t.updated_at,
+		t.has_gpt_account,
+		CASE WHEN t.has_gpt_account=1 THEN 1
+			ELSE EXISTS(SELECT 1 FROM openai_accounts oa WHERE oa.email = t.email AND oa.email <> '') END
+		FROM outlook_login_tokens t ORDER BY t.updated_at DESC, t.id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]OutlookAccount, 0)
+	var backfill []int64 // 列里是 0、但刚关联到 GPT 账号的行,查完统一回写
+	for rows.Next() {
+		var a OutlookAccount
+		var issuedAt, accessExp, refreshExp sql.NullTime
+		var storedGPT, hasGPT int64
+		if err := rows.Scan(&a.ID, &a.Email, &a.DisplayName, &a.TenantID, &a.Scope,
+			&a.TokenType, &a.AccessTokenLen, &a.RefreshTokenLen,
+			&a.ExpiresIn, &a.RefreshTokenExpiresIn, &a.CookieCount,
+			&issuedAt, &accessExp, &refreshExp,
+			&a.LastRefreshStatus, &a.LastRefreshError, &a.CreatedAt, &a.UpdatedAt, &storedGPT, &hasGPT); err != nil {
+			return nil, err
+		}
+		a.HasGPTAccount = hasGPT != 0
+		if storedGPT == 0 && a.HasGPTAccount {
+			backfill = append(backfill, a.ID)
+		}
+		if issuedAt.Valid {
+			a.TokenIssuedAt = issuedAt.Time
+		}
+		if accessExp.Valid {
+			a.AccessTokenExpiresAt = accessExp.Time
+		}
+		if refreshExp.Valid {
+			a.RefreshTokenExpiresAt = refreshExp.Time
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if err := s.markOutlookHasGPT(ctx, backfill); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// markOutlookHasGPT 把这些行的 has_gpt_account 刷成 1。显式写 updated_at=updated_at,
+// 避免 ON UPDATE CURRENT_TIMESTAMP 把「更新时间」刷新、导致列表排序乱跳。
+func (s *Store) markOutlookHasGPT(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, 0, len(ids))
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE outlook_login_tokens SET has_gpt_account=1, updated_at=updated_at
+		WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	return err
+}
+
+// ListOutlookRefreshableIDs 列出「有 access token」的账号主键,供一键刷新全部 Token 用。
+// 顺序与列表页一致(最近更新在前),便于前端进度和页面顺序对得上。
+func (s *Store) ListOutlookRefreshableIDs(ctx context.Context) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM outlook_login_tokens
+		WHERE COALESCE(access_token,'') <> '' ORDER BY updated_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// GetOutlookAccountEmail 按主键取邮箱,供刷新时定位 skill 要刷的账号。
+func (s *Store) GetOutlookAccountEmail(ctx context.Context, id int64) (string, error) {
+	var email string
+	err := s.db.QueryRowContext(ctx, `SELECT email FROM outlook_login_tokens WHERE id=?`, id).Scan(&email)
+	return email, err
+}
+
+// GetOutlookAccountByID 取单行元数据(刷新完成后回读返回给前端)。
+func (s *Store) GetOutlookAccountByID(ctx context.Context, id int64) (OutlookAccount, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, email, COALESCE(display_name,''), COALESCE(tenant_id,''), COALESCE(scope,''),
+		COALESCE(token_type,''), COALESCE(CHAR_LENGTH(access_token),0), COALESCE(CHAR_LENGTH(refresh_token),0),
+		COALESCE(expires_in,0), COALESCE(refresh_token_expires_in,0), COALESCE(cookie_count,0),
+		token_issued_at, access_token_expires_at, refresh_token_expires_at,
+		COALESCE(last_refresh_status,''), COALESCE(last_refresh_error,''), created_at, updated_at, has_gpt_account
+		FROM outlook_login_tokens WHERE id=?`, id)
+	if err != nil {
+		return OutlookAccount{}, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return OutlookAccount{}, err
+		}
+		return OutlookAccount{}, sql.ErrNoRows
+	}
+	var a OutlookAccount
+	var issuedAt, accessExp, refreshExp sql.NullTime
+	var hasGPT int64
+	if err := rows.Scan(&a.ID, &a.Email, &a.DisplayName, &a.TenantID, &a.Scope,
+		&a.TokenType, &a.AccessTokenLen, &a.RefreshTokenLen,
+		&a.ExpiresIn, &a.RefreshTokenExpiresIn, &a.CookieCount,
+		&issuedAt, &accessExp, &refreshExp,
+		&a.LastRefreshStatus, &a.LastRefreshError, &a.CreatedAt, &a.UpdatedAt, &hasGPT); err != nil {
+		return OutlookAccount{}, err
+	}
+	a.HasGPTAccount = hasGPT != 0
+	if issuedAt.Valid {
+		a.TokenIssuedAt = issuedAt.Time
+	}
+	if accessExp.Valid {
+		a.AccessTokenExpiresAt = accessExp.Time
+	}
+	if refreshExp.Valid {
+		a.RefreshTokenExpiresAt = refreshExp.Time
+	}
+	return a, nil
+}
+
+// DeleteOutlookAccount 删除一条 Outlook 登录记录(含其 token/cookie)。
+func (s *Store) DeleteOutlookAccount(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM outlook_login_tokens WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// GetOutlookRefreshInput 取免登录刷新所需的输入:邮箱、已保存的 cookie(JSON)、User-Agent、scope。
+func (s *Store) GetOutlookRefreshInput(ctx context.Context, id int64) (email, cookiesJSON, userAgent, scope string, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT email, COALESCE(cookies_json,''), COALESCE(user_agent,''), COALESCE(scope,'')
+		FROM outlook_login_tokens WHERE id=?`, id).Scan(&email, &cookiesJSON, &userAgent, &scope)
+	return
+}
+
+// outlookTokenUpdate 是刷新成功后要写回 outlook_login_tokens 的一组字段。
+// 指针字段为 nil 时写 NULL;display_name/tenant_id/account_oid/home_account_id 为空时保留原值。
+type outlookTokenUpdate struct {
+	TokenType             string
+	Scope                 string
+	AccessToken           string
+	RefreshToken          string
+	IDToken               string
+	ClientInfo            string
+	UserAgent             string
+	DisplayName           string
+	TenantID              string
+	AccountOID            string
+	HomeAccountID         string
+	ExpiresIn             *int64
+	ExtExpiresIn          *int64
+	RefreshTokenExpiresIn *int64
+	TokenIssuedAt         time.Time
+	AccessTokenExpiresAt  time.Time
+	RefreshTokenExpiresAt *time.Time
+	CookiesJSON           string
+	CookieCount           int
+}
+
+// UpdateOutlookTokens 把刷新拿到的新 token 与续期后的 cookie 写回指定行。
+func (s *Store) UpdateOutlookTokens(ctx context.Context, id int64, u outlookTokenUpdate) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE outlook_login_tokens SET
+			token_type=?, scope=?, access_token=?, refresh_token=?, id_token=?, client_info=?,
+			expires_in=?, ext_expires_in=?, refresh_token_expires_in=?,
+			token_issued_at=?, access_token_expires_at=?, refresh_token_expires_at=?,
+			cookies_json=?, cookie_count=?, user_agent=?,
+			display_name=IF(?='', display_name, ?),
+			tenant_id=IF(?='', tenant_id, ?),
+			account_oid=IF(?='', account_oid, ?),
+			home_account_id=IF(?='', home_account_id, ?),
+			last_refresh_status='refreshed', last_refresh_error=NULL
+		WHERE id=?`,
+		u.TokenType, u.Scope, u.AccessToken, u.RefreshToken, u.IDToken, u.ClientInfo,
+		nullInt(u.ExpiresIn), nullInt(u.ExtExpiresIn), nullInt(u.RefreshTokenExpiresIn),
+		u.TokenIssuedAt, u.AccessTokenExpiresAt, nullTime(u.RefreshTokenExpiresAt),
+		u.CookiesJSON, u.CookieCount, u.UserAgent,
+		u.DisplayName, u.DisplayName,
+		u.TenantID, u.TenantID,
+		u.AccountOID, u.AccountOID,
+		u.HomeAccountID, u.HomeAccountID,
+		id)
+	if err != nil {
+		return err
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// MarkOutlookRefreshError 记录一次刷新失败的原因(供页面显示「失败」并提示重新登录)。
+func (s *Store) MarkOutlookRefreshError(ctx context.Context, id int64, msg string) error {
+	if len(msg) > 2000 {
+		msg = msg[:2000]
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE outlook_login_tokens SET last_refresh_status='error', last_refresh_error=? WHERE id=?`, msg, id)
+	return err
+}
+
+func nullInt(v *int64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func nullTime(v *time.Time) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+// CreateOutlookAccount 手动新增一个待登录的 Outlook 账号:只存邮箱 + 明文密码。
+// client_id/scope 与 skill 登录后写入的保持一致(uniq_email_client_scope),
+// 这样之后 skill 用同一邮箱登录时命中同一行、补上 token/cookie,而不会新建重复行、也不会覆盖密码。
+func (s *Store) CreateOutlookAccount(ctx context.Context, email, password string) (int64, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return 0, errors.New("邮箱不能为空")
+	}
+	if len(email) > 320 {
+		return 0, errors.New("邮箱过长")
+	}
+	if len(password) > 512 {
+		return 0, errors.New("密码过长")
+	}
+	now := time.Now()
+	res, err := s.db.ExecContext(ctx, `INSERT INTO outlook_login_tokens
+			(email, password, client_id, scope, cookie_count, created_at, updated_at)
+			VALUES (?, ?, ?, ?, 0, ?, ?)`,
+		email, password, outlookClientID, outlookScopeStored, now, now)
+	if err != nil {
+		if isDuplicateKeyErr(err) {
+			return 0, errors.New("该邮箱已存在")
+		}
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// GetOutlookCredentials 取某行的邮箱 + 明文密码(仅供编辑弹窗回填,不进列表接口)。
+func (s *Store) GetOutlookCredentials(ctx context.Context, id int64) (email, password string, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT email, COALESCE(password,'') FROM outlook_login_tokens WHERE id=?`, id).Scan(&email, &password)
+	return
+}
+
+// UpdateOutlookCredentials 修改某行的邮箱与明文密码。
+func (s *Store) UpdateOutlookCredentials(ctx context.Context, id int64, email, password string) error {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return errors.New("邮箱不能为空")
+	}
+	if len(email) > 320 {
+		return errors.New("邮箱过长")
+	}
+	if len(password) > 512 {
+		return errors.New("密码过长")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE outlook_login_tokens SET email=?, password=?, updated_at=? WHERE id=?`,
+		email, password, time.Now(), id)
+	if err != nil {
+		if isDuplicateKeyErr(err) {
+			return errors.New("该邮箱已存在")
+		}
+		return err
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// outlookScopeStored 是 skill 登录后实际写入 scope 列的值(token 响应返回的 scope),
+// 手动新增时对齐它,保证 uniq_email_client_scope 命中同一行。
+const outlookScopeStored = "service::outlook.office.com::MBI_SSL"
+
+func isDuplicateKeyErr(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1062
+}
+
+// GetOutlookAccessToken 取某行的 access_token 与邮箱,用于构造 Outlook Web 邮件 API 的
+// MSAuth1.0 鉴权头(usertoken=access_token)与 x-anchormailbox。
+func (s *Store) GetOutlookAccessToken(ctx context.Context, id int64) (accessToken, email string, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT COALESCE(access_token,''), email FROM outlook_login_tokens WHERE id=?`, id).Scan(&accessToken, &email)
+	return
+}
+
+// GetOutlookIDByEmail 按邮箱定位账号主键(取最近更新的一条),供「按邮箱取验证码」接口用。
+func (s *Store) GetOutlookIDByEmail(ctx context.Context, email string) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM outlook_login_tokens WHERE email=? ORDER BY updated_at DESC, id DESC LIMIT 1`, email).Scan(&id)
+	return id, err
 }

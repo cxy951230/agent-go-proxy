@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -67,8 +70,78 @@ func (p *proxyServer) handleAPIOpenAIAccountRefresh(w http.ResponseWriter, r *ht
 	}
 	// 同步刷新(补齐 Token 过期时间→按需刷新凭证→查额度),等完成再返回,
 	// 让前端能像「模型」按钮那样显示加载态、拿到结果后再重载列表。Refresh 内部自带 30s 超时。
-	p.openaiLogins.Refresh(id)
+	_ = p.openaiLogins.Refresh(id)
 	writeJSON(w, map[string]any{"ok": true}, nil)
+}
+
+// openaiQuotaRefreshConcurrency 是批量刷额度的并发账号数。每个账号要过 Bridge 打一次
+// /wham/usage,并发太高容易触发上游限流,和 OUTLOOK 那边一样取 3。
+const openaiQuotaRefreshConcurrency = 3
+
+// handleAPIOpenAIRefreshAllQuota 一键刷新全部账号的额度:立即返回,刷新在后台并发跑
+// (等价于逐行点「额度」),前端轮询 GET /api/openai/refresh-all 看进度。已有任务在跑返回 409。
+func (p *proxyServer) handleAPIOpenAIRefreshAllQuota(w http.ResponseWriter, r *http.Request) {
+	accounts, err := p.store.ListOpenAIAccounts(r.Context())
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	ids := make([]int64, 0, len(accounts))
+	labels := make(map[int64]string, len(accounts))
+	for _, a := range accounts {
+		ids = append(ids, a.ID)
+		labels[a.ID] = firstNonEmpty(a.Name, a.Email, a.AccountID)
+	}
+	// Refresh 内部自带 30s 超时,这里给 60s 兜底(含按需刷凭证 + 查额度两步)。
+	total, started := startBatchRefresh(p.openaiJob, ids, openaiQuotaRefreshConcurrency, 60*time.Second,
+		func(_ context.Context, id int64) error {
+			if err := p.openaiLogins.Refresh(id); err != nil {
+				return fmt.Errorf("%s：%w", orDefaultStr(labels[id], "?"), err)
+			}
+			return nil
+		})
+	if !started {
+		http.Error(w, "已有刷新任务在进行中", http.StatusConflict)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "total": total}, nil)
+}
+
+func (p *proxyServer) handleAPIOpenAIRefreshAllQuotaStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, p.openaiJob.snapshot(), nil)
+}
+
+// handleAPIOpenAIModelsAll 一键拉取全部账号的模型目录:立即返回,拉取在后台并发跑
+// (等价于逐行点「模型」),前端轮询 GET /api/openai/models-all 看进度。已有任务在跑返回 409。
+func (p *proxyServer) handleAPIOpenAIModelsAll(w http.ResponseWriter, r *http.Request) {
+	accounts, err := p.store.ListOpenAIAccounts(r.Context())
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	ids := make([]int64, 0, len(accounts))
+	labels := make(map[int64]string, len(accounts))
+	for _, a := range accounts {
+		ids = append(ids, a.ID)
+		labels[a.ID] = firstNonEmpty(a.Name, a.Email, a.AccountID)
+	}
+	// RefreshModels 内部会按需刷凭证再打 Bridge modelsList,给 60s 上限。
+	total, started := startBatchRefresh(p.openaiModelsJob, ids, openaiQuotaRefreshConcurrency, 60*time.Second,
+		func(ctx context.Context, id int64) error {
+			if err := p.openaiLogins.RefreshModels(ctx, id); err != nil {
+				return fmt.Errorf("%s：%w", orDefaultStr(labels[id], "?"), err)
+			}
+			return nil
+		})
+	if !started {
+		http.Error(w, "已有拉取任务在进行中", http.StatusConflict)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "total": total}, nil)
+}
+
+func (p *proxyServer) handleAPIOpenAIModelsAllStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, p.openaiModelsJob.snapshot(), nil)
 }
 
 // handleAPIOpenAIAccountModels 同步拉取模型目录:调用方要立刻拿到结果填下拉框,
@@ -170,7 +243,7 @@ const openAIHTML = `
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}.app{display:flex;min-height:100vh}
     .sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;align-self:flex-start;height:100vh;transition:width .16s ease,padding .16s ease}.sidebar .brand-row{display:flex;align-items:center;gap:8px;padding:6px 2px 18px 10px}.sidebar .brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;flex:1;white-space:nowrap;overflow:hidden}.sidebar-toggle{width:30px;height:30px;padding:0;border-radius:7px;border:1px solid var(--line);background:#fff;color:#667284;font-weight:800}.app.sidebar-collapsed .sidebar{width:58px;padding-left:10px;padding-right:10px}.app.sidebar-collapsed .brand{display:none}.app.sidebar-collapsed .nav-item{padding:10px 0;text-align:center;font-size:0}.app.sidebar-collapsed .nav-item::first-letter{font-size:15px}.app.sidebar-collapsed .sidebar-toggle{transform:rotate(180deg)}
     .nav-item{display:block;padding:10px 12px;border-radius:8px;color:var(--text);font-weight:500;margin-bottom:4px;text-decoration:none}.nav-item:hover{background:#eef2fa}.nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}
-    .page{flex:1;min-width:0;padding:22px 28px 56px}.top{display:flex;align-items:center;gap:16px}.top h1{font-size:18px;font-weight:600;margin:0;flex:1}button,input{height:42px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:0 14px;font:inherit;color:var(--text)}button{cursor:pointer}.btn-primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}.btn-primary:hover{background:#265fd0}.panel{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05);overflow-x:auto}
+    .page{flex:1;min-width:0;padding:22px 28px 56px}.top{display:flex;align-items:center;gap:16px}.top h1{font-size:18px;font-weight:600;margin:0;flex:1}button,input{height:42px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:0 14px;font:inherit;color:var(--text)}button{cursor:pointer;transition:transform .06s ease,box-shadow .12s ease,background .12s ease}button:active:not(:disabled){transform:translateY(1px) scale(.985);box-shadow:inset 0 2px 7px rgba(20,30,50,.16)}button:disabled{opacity:.6;cursor:not-allowed}button.busy::before{content:'';display:inline-block;width:11px;height:11px;margin-right:7px;vertical-align:-1px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.btn-primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}.btn-primary:hover{background:#265fd0}.panel{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05);overflow-x:auto}
     tbody tr.row-link{cursor:pointer}tbody tr.row-link:hover{background:#fafcff}
     .login-box{display:none;padding:18px 22px;border-bottom:1px solid var(--line);background:#f8fbff}.login-box.show{display:block}.login-title{font-weight:600}.login-url{display:block;margin-top:8px;color:var(--blue);word-break:break-all}.small{font-size:12px;color:var(--muted)}table{width:100%;min-width:1180px;border-collapse:collapse}th,td{padding:16px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;white-space:nowrap}tbody tr:last-child td{border-bottom:0}th{font-size:12px;color:#606a7a;font-weight:600;background:#fbfcfe}.pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600}.plan{color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}.account-id{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#526074;line-height:1.7}.delete-btn{height:32px;color:var(--red);border-color:#f0b3b3;background:#fff6f6}.refresh-btn{height:32px;margin-right:6px}.usage{font-size:12px;line-height:1.5;color:#526074}.empty{padding:28px;color:var(--muted);text-align:center}.notice{margin-top:12px;color:var(--muted)}
     /* 操作列:4 个按钮排成 2×2 等宽网格,比一字排开窄得多,也不会参差换行 */
@@ -190,7 +263,7 @@ const openAIHTML = `
     .cfg-stack>.cfg-select{font-size:13px;height:32px}
     .cfg-select:hover{border-color:#b8c7dc}
     .token-ok{color:#137a4d}.token-warn{color:#b06d12;font-weight:600}.token-bad{color:var(--red);font-weight:600}
-    .mini-quota{min-width:200px}.mini-line{font-size:12px;font-weight:600;white-space:nowrap}.mini-label{display:inline-block;color:#4b5563;font-weight:600;font-size:11px;padding:1px 8px;margin-right:6px;border-radius:999px;background:#eef1f6}.mini-progress{height:7px;border-radius:5px;background:#e8edf5;overflow:hidden;margin:8px 0 0;max-width:200px}.mini-progress:last-child{margin-bottom:0}.mini-progress span{display:block;height:100%;background:var(--blue)}.detail-btn{display:inline-flex;height:32px;align-items:center;padding:0 12px;margin-right:6px;border:1px solid var(--line);border-radius:7px;color:var(--text);text-decoration:none;background:#fff}
+    .mini-quota{min-width:200px}.mini-line{font-size:12px;font-weight:600;white-space:nowrap}.mini-label{display:inline-block;color:#4b5563;font-weight:600;font-size:11px;padding:1px 8px;margin-right:6px;border-radius:999px;background:#eef1f6}.mini-progress{height:7px;border-radius:5px;background:#e8edf5;overflow:hidden;margin:8px 0 0;max-width:200px}.mini-progress:last-child{margin-bottom:0}.mini-progress span{display:block;height:100%;background:var(--blue)}.mini-reset{font-size:11px;color:var(--muted);margin-top:4px}.mini-line+.mini-progress+.mini-reset+.mini-line{margin-top:10px}.detail-btn{display:inline-flex;height:32px;align-items:center;padding:0 12px;margin-right:6px;border:1px solid var(--line);border-radius:7px;color:var(--text);text-decoration:none;background:#fff}
   </style>
 </head>
 <body>
@@ -202,12 +275,13 @@ const openAIHTML = `
       <a class="nav-item" href="/routes">路由</a>
       <a class="nav-item" href="/chains">链式代理</a>
       <a class="nav-item active" href="/openai">OPENAI</a>
+      <a class="nav-item" href="/outlook">OUTLOOK</a>
       <a class="nav-item" href="/api-keys">API Key</a>
     </nav>
   </aside>
   <main class="page">
-    <div class="top"><h1>OPENAI · GPT 账号</h1><button class="btn-primary" id="login-btn" type="button">+ 登录 GPT 账号</button></div>
-    <div class="notice">登录由 Codex Bridge 发起。鉴权信息直接保存到 MySQL，页面和列表 API 不返回 token。</div>
+    <div class="top"><h1>OPENAI · GPT 账号</h1><button class="btn-primary" id="login-btn" type="button">+ 登录 GPT 账号</button><button id="refresh-all-btn" type="button" title="逐个刷新所有账号的额度(后台异步执行)">刷新全部额度</button><button id="models-all-btn" type="button" title="逐个拉取所有账号的可用模型目录(后台异步执行)">拉取全部模型</button></div>
+    <div class="notice">登录由 Codex Bridge 发起。鉴权信息直接保存到 MySQL，页面和列表 API 不返回 token。右上角「刷新全部额度」「拉取全部模型」等于对每个账号各点一次「额度」「模型」，后台异步执行、互不影响，页面可继续操作。</div>
     <section class="panel">
       <div class="login-box" id="login-box">
         <div class="login-title" id="login-title">等待浏览器登录</div>
@@ -297,7 +371,26 @@ function usageText(item){
   const status=item.status||{};const usage=status.usage||status;const rate=usage.rate_limit||usage.rate_limits||status.rate_limit||status.rate_limits||{};const primary=rate.primary_window||rate.primaryWindow||{};
   const secondary=rate.secondary_window||rate.secondaryWindow;const windows=[primary,secondary].filter(window=>window&&window.used_percent!==undefined);
   if(!windows.length)return '<span class="small">未查询</span>';
-  return '<div class="mini-quota">'+windows.map(window=>{const used=Number(window.used_percent??0);return '<div class="mini-line"><span class="mini-label">'+esc(windowLabel(window))+'</span><span>已用 '+esc(used)+'% · 剩余 '+esc(Math.max(0,100-used))+'%</span></div><div class="mini-progress"><span style="width:'+Math.min(100,Math.max(0,used))+'%"></span></div>'}).join('')+'</div>';
+  const tip=item.status_at?'额度数据拉取于 '+fmtTime(item.status_at):'';
+  return '<div class="mini-quota"'+(tip?' title="'+esc(tip)+'"':'')+'>'+windows.map(window=>{
+    const used=Number(window.used_percent??0);
+    return '<div class="mini-line"><span class="mini-label">'+esc(windowLabel(window))+'</span><span>已用 '+esc(used)+'% · 剩余 '+esc(Math.max(0,100-used))+'%</span></div>'+
+      '<div class="mini-progress"><span style="width:'+Math.min(100,Math.max(0,used))+'%"></span></div>'+
+      resetLine(window,item.status_at);
+  }).join('')+'</div>';
+}
+// resetLine 显示该额度窗口的重置日期,例如「8月28日 17:58 重置 · 29 天后」。
+// 优先用上游给的绝对时间 reset_at(秒);没有就用「拉取额度的时刻 + reset_after_seconds」推算。
+function resetLine(window,statusAt){
+  let at=null;
+  if(window.reset_at)at=new Date(Number(window.reset_at)*1000);
+  else if(window.reset_after_seconds){const base=statusAt?new Date(statusAt):new Date();at=new Date(base.getTime()+Number(window.reset_after_seconds)*1000)}
+  if(!at||isNaN(at.getTime()))return '';
+  const pad=n=>String(n).padStart(2,'0');
+  const when=(at.getMonth()+1)+'月'+at.getDate()+'日 '+pad(at.getHours())+':'+pad(at.getMinutes());
+  const left=at.getTime()-Date.now();
+  const rest=left<=0?'可重置':(left>=86400000?Math.round(left/86400000)+' 天后':(left>=3600000?Math.round(left/3600000)+' 小时后':Math.max(1,Math.round(left/60000))+' 分钟后'));
+  return '<div class="mini-reset">'+esc(when)+' 重置 · '+esc(rest)+'</div>';
 }
 function windowLabel(window){const seconds=Number(window.limit_window_seconds);if(seconds>=2419200&&seconds<=2764800)return '月';if(seconds>=518400&&seconds<=691200)return '周';if(seconds>=14400&&seconds<=21600)return '5小时';if(seconds>=3600&&seconds%3600===0)return seconds/3600+'小时';if(seconds>=86400&&seconds%86400===0)return seconds/86400+'天';return seconds?Math.round(seconds/3600)+'小时':'-'}
 async function beginLogin(){
@@ -320,6 +413,51 @@ async function pollLogin(id){
   }catch(err){document.getElementById('login-btn').disabled=false;document.getElementById('login-status').textContent='查询登录状态失败：'+err.message}
 }
 document.getElementById('login-btn').addEventListener('click',beginLogin);
+// ===== 顶部批量按钮(刷新全部额度 / 拉取全部模型):后台异步 + 轮询进度,页面不卡住 =====
+// 两个按钮后端各是一个独立任务,可以同时跑,所以这里做成工厂,各持各的定时器。
+function setupBatchButton(opts){
+  const btn=document.getElementById(opts.btnId);
+  if(!btn)return;
+  let timer=null;
+  const setLabel=(text,busy)=>{btn.textContent=text;btn.disabled=!!busy;btn.classList.toggle('busy',!!busy)};
+  // 每 2s 拉一次进度,同时重载列表让数据边刷边更新;跑完只在有失败时弹清单。
+  async function poll(announce){
+    let st;
+    try{
+      const rsp=await fetch(opts.statusURL,{cache:'no-store'});
+      if(!rsp.ok)throw new Error(await rsp.text());
+      st=await rsp.json();
+    }catch(err){timer=null;setLabel(opts.label,false);return}
+    await loadAccounts().catch(()=>{});
+    if(st.running){
+      setLabel(opts.busyLabel+' '+st.done+'/'+st.total+'…',true);
+      timer=setTimeout(()=>poll(announce),2000);
+      return;
+    }
+    timer=null;
+    setLabel(opts.label,false);
+    if(announce&&st.total&&st.failed)alert(opts.doneLabel+'：成功 '+st.ok+' 个，失败 '+st.failed+' 个。\n\n'+(st.errors||[]).join('\n'));
+  }
+  btn.addEventListener('click',async()=>{
+    if(timer)return;
+    setLabel('启动中…',true);
+    try{
+      const rsp=await fetch(opts.startURL,{method:'POST'});
+      if(!rsp.ok&&rsp.status!==409)throw new Error(await rsp.text());
+      if(rsp.ok){
+        const r=await rsp.json();
+        if(!r.total){setLabel(opts.label,false);alert('暂无 GPT 账号可操作。');return}
+      }
+    }catch(err){setLabel(opts.label,false);alert('发起失败：'+err.message);return}
+    poll(true);
+  });
+  // 页面打开时若已有任务在跑(比如刚刷新过页面),接上进度继续轮询。
+  fetch(opts.statusURL,{cache:'no-store'}).then(r=>r.json()).then(st=>{
+    if(st&&st.running){setLabel(opts.busyLabel+' '+st.done+'/'+st.total+'…',true);timer=setTimeout(()=>poll(false),2000)}
+  }).catch(()=>{});
+}
+setupBatchButton({btnId:'refresh-all-btn',startURL:'/api/openai/accounts/refresh-all',statusURL:'/api/openai/refresh-all',label:'刷新全部额度',busyLabel:'刷新中',doneLabel:'刷新完成'});
+setupBatchButton({btnId:'models-all-btn',startURL:'/api/openai/accounts/models-all',statusURL:'/api/openai/models-all',label:'拉取全部模型',busyLabel:'拉取中',doneLabel:'拉取完成'});
 document.getElementById('account-rows').addEventListener('click',async event=>{const button=event.target.closest('.delete-btn');if(!button||!confirm('确认删除这个 GPT 账号及其数据库鉴权信息吗？'))return;const rsp=await fetch('/api/openai/accounts/'+button.dataset.id,{method:'DELETE'});if(!rsp.ok){alert('删除失败：'+await rsp.text());return}loadAccounts()});
 // 整行点击跳转到该账号的 token 消耗统计页(点到按钮/链接/下拉等交互控件时不跳转)。
 document.getElementById('account-rows').addEventListener('click',event=>{if(event.target.closest('a,button,input,select'))return;const row=event.target.closest('tr[data-href]');if(row)location.href=row.dataset.href});
@@ -379,7 +517,7 @@ const openAIAccountHTML = `
     :root{--bg:#f6f7fb;--panel:#fff;--line:#dfe5ee;--text:#20242c;--muted:#6f7787;--blue:#2f6fed;--red:#c94040;--purple:#6750d8}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}.app{display:flex;min-height:100vh}.sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;height:100vh}.brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;padding:12px}.nav-item{display:block;padding:10px 12px;border-radius:8px;color:var(--text);font-weight:500;margin-bottom:4px;text-decoration:none}.nav-item:hover{background:#eef2fa}.nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}.page{flex:1;min-width:0;padding:22px 28px 56px}.top{display:flex;align-items:center;gap:14px}.top h1{font-size:18px;margin:0;flex:1}.back{color:var(--blue);text-decoration:none}.account-summary{margin-top:18px;padding:16px 18px;background:#fff;border:1px solid var(--line);border-radius:8px;display:flex;gap:28px;flex-wrap:wrap}.summary-item span{display:block;font-size:12px;color:var(--muted)}.summary-item strong{display:block;margin-top:3px}.quota-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:16px}.quota-card{border:1px solid var(--line);border-radius:8px;padding:15px 17px;background:#fff;min-width:0}.quota-card h2{font-size:14px;margin:0 0 10px}.kv{display:grid;grid-template-columns:minmax(105px,auto) minmax(0,1fr);gap:6px 12px;font-size:12px}.kv .key{color:var(--muted)}.kv div:nth-child(even){overflow-wrap:anywhere}.progress{height:9px;border-radius:6px;background:#e5eaf3;overflow:hidden;margin:10px 0}.progress span{display:block;height:100%;background:var(--blue)}.window-title{font-size:17px;font-weight:700}.window-label{float:right;font-size:12px;color:var(--muted);font-weight:600}.credit{padding:10px 0;border-top:1px solid #e8ebf1}.credit:first-of-type{border-top:0}.raw-status{margin-top:16px;background:#fff;border:1px solid var(--line);border-radius:8px;padding:14px 16px}.raw-status summary{cursor:pointer;color:var(--blue);font-weight:600}.raw-status pre{white-space:pre-wrap;word-break:break-word;max-height:520px;overflow:auto;background:#111827;color:#d7e0ee;padding:14px;border-radius:7px;font-size:11px}.error{color:var(--red)}
   </style>
 </head>
-<body><div class="app"><aside class="sidebar"><div class="brand">AGENT-GO-PROXY</div><nav><a class="nav-item" href="/">Dashboard</a><a class="nav-item" href="/routes">路由</a><a class="nav-item" href="/chains">链式代理</a><a class="nav-item active" href="/openai">OPENAI</a><a class="nav-item" href="/api-keys">API Key</a></nav></aside><main class="page"><div class="top"><a class="back" href="/openai">← 返回账号列表</a><h1>GPT 账号额度详情</h1></div><div id="content"></div></main></div>
+<body><div class="app"><aside class="sidebar"><div class="brand">AGENT-GO-PROXY</div><nav><a class="nav-item" href="/">Dashboard</a><a class="nav-item" href="/routes">路由</a><a class="nav-item" href="/chains">链式代理</a><a class="nav-item active" href="/openai">OPENAI</a><a class="nav-item" href="/outlook">OUTLOOK</a><a class="nav-item" href="/api-keys">API Key</a></nav></aside><main class="page"><div class="top"><a class="back" href="/openai">← 返回账号列表</a><h1>GPT 账号额度详情</h1></div><div id="content"></div></main></div>
 <script>
 const account={{toJSON .}};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));

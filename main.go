@@ -55,6 +55,10 @@ type proxyServer struct {
 	chains       *chainRouteState
 	accounts     *accountPool
 	openaiLogins *openAILoginManager
+	outlookJob   *batchRefreshJob // OUTLOOK 页「刷新全部 Token」
+	openaiJob    *batchRefreshJob // OPENAI 页「刷新全部额度」
+
+	openaiModelsJob *batchRefreshJob // OPENAI 页「拉取全部模型」
 }
 
 const chainRouteCooldown = 2 * time.Minute
@@ -304,6 +308,10 @@ func main() {
 		chains:       newChainRouteState(),
 		accounts:     newAccountPool(),
 		openaiLogins: openaiLogins,
+		outlookJob:   &batchRefreshJob{},
+		openaiJob:    &batchRefreshJob{},
+
+		openaiModelsJob: &batchRefreshJob{},
 	}
 
 	router := chi.NewRouter()
@@ -313,6 +321,7 @@ func main() {
 	router.Get("/api-keys", srv.handleAPIKeysPage)
 	router.Get("/openai", srv.handleOpenAI)
 	router.Get("/openai/accounts/{id}", srv.handleOpenAIAccount)
+	router.Get("/outlook", srv.handleOutlook)
 	router.Get("/conversations/{id}", srv.handleConversationDetail)
 	router.Get("/favicon.ico", srv.handleFavicon)
 	router.Get("/assets/favicon.jpg", srv.handleFavicon)
@@ -337,8 +346,26 @@ func main() {
 	router.Get("/api/openai/logins/{id}", srv.handleAPIOpenAILoginStatus)
 	router.Post("/api/openai/logins/{id}/cancel", srv.handleAPIOpenAILoginCancel)
 	router.Post("/api/openai/accounts/{id}/refresh", srv.handleAPIOpenAIAccountRefresh)
+	router.Post("/api/openai/accounts/refresh-all", srv.handleAPIOpenAIRefreshAllQuota)
+	router.Get("/api/openai/refresh-all", srv.handleAPIOpenAIRefreshAllQuotaStatus)
+	router.Post("/api/openai/accounts/models-all", srv.handleAPIOpenAIModelsAll)
+	router.Get("/api/openai/models-all", srv.handleAPIOpenAIModelsAllStatus)
 	router.Post("/api/openai/accounts/{id}/models", srv.handleAPIOpenAIAccountModels)
 	router.Post("/api/openai/accounts/{id}/settings", srv.handleAPIOpenAIAccountSettings)
+	router.Get("/outlook/accounts/{id}", srv.handleOutlookAccountMail)
+	router.Get("/api/outlook/accounts", srv.handleAPIOutlookAccounts)
+	router.Get("/api/outlook/valid-emails", srv.handleAPIOutlookValidEmails)
+	router.Get("/api/outlook/unregistered-emails", srv.handleAPIOutlookUnregisteredEmails)
+	router.Post("/api/outlook/accounts", srv.handleAPIOutlookAccountCreate)
+	router.Get("/api/outlook/accounts/{id}/credentials", srv.handleAPIOutlookAccountCredentials)
+	router.Get("/api/outlook/accounts/{id}/messages", srv.handleAPIOutlookMailList)
+	router.Get("/api/outlook/accounts/{id}/message", srv.handleAPIOutlookMailMessage)
+	router.Get("/api/outlook/mail/code", srv.handleAPIOutlookMailCode)
+	router.Put("/api/outlook/accounts/{id}", srv.handleAPIOutlookAccountUpdate)
+	router.Post("/api/outlook/accounts/{id}/refresh", srv.handleAPIOutlookAccountRefresh)
+	router.Post("/api/outlook/accounts/refresh-all", srv.handleAPIOutlookRefreshAll)
+	router.Get("/api/outlook/refresh-all", srv.handleAPIOutlookRefreshAllStatus)
+	router.Delete("/api/outlook/accounts/{id}", srv.handleAPIOutlookAccountDelete)
 	router.Get("/api/conversations", srv.handleAPIConversations)
 	router.Get("/api/conversations/{id}", srv.handleAPIConversationDetail)
 	router.Delete("/api/conversations/{id}", srv.handleAPIConversationDelete)

@@ -63,7 +63,7 @@ var baseTemplate = template.Must(template.New("base").Funcs(template.FuncMap{
 			return "ok"
 		}
 	},
-}).Parse(indexHTML + detailHTML + routesHTML + chainsHTML + apiKeysHTML + openAIHTML + openAIAccountHTML + tokenStatsHTML))
+}).Parse(indexHTML + detailHTML + routesHTML + chainsHTML + apiKeysHTML + openAIHTML + openAIAccountHTML + outlookHTML + outlookMailHTML + tokenStatsHTML))
 
 func conversationFilterFromRequest(r *http.Request) ConversationFilter {
 	q := r.URL.Query()
@@ -622,6 +622,7 @@ const indexHTML = `
       <a class="nav-item" href="/routes">路由</a>
       <a class="nav-item" href="/chains">链式代理</a>
       <a class="nav-item" href="/openai">OPENAI</a>
+      <a class="nav-item" href="/outlook">OUTLOOK</a>
       <a class="nav-item" href="/api-keys">API Key</a>
     </nav>
   </aside>
@@ -1071,6 +1072,7 @@ const chainsHTML = `
       <a class="nav-item" href="/routes">路由</a>
       <a class="nav-item active" href="/chains">链式代理</a>
       <a class="nav-item" href="/openai">OPENAI</a>
+      <a class="nav-item" href="/outlook">OUTLOOK</a>
       <a class="nav-item" href="/api-keys">API Key</a>
     </nav>
   </aside>
@@ -2027,6 +2029,7 @@ const routesHTML = `
       <a class="nav-item active" href="/routes">路由</a>
       <a class="nav-item" href="/chains">链式代理</a>
       <a class="nav-item" href="/openai">OPENAI</a>
+      <a class="nav-item" href="/outlook">OUTLOOK</a>
       <a class="nav-item" href="/api-keys">API Key</a>
     </nav>
   </aside>

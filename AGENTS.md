@@ -73,12 +73,13 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
 
 ## 左侧菜单、路由页与链式代理页
 
-Web 页面左侧有侧边栏菜单，五项：
+Web 页面左侧有侧边栏菜单，六项：
 
 - `Dashboard`：原会话列表页（`/`）。
 - `路由`：第三方 API 配置页（`/routes`）。
 - `链式代理`：按顺序组合多个路由的配置页（`/chains`）。
 - `OPENAI`：通过 Codex Bridge 登录和管理 GPT 账号（`/openai`）。
+- `OUTLOOK`：管理 Outlook 邮箱账号、刷新其 Token、读邮件取验证码（`/outlook`，`outlook_web.go`），见「OUTLOOK 邮箱账号」。
 - `API Key`：管理直连用的 API Key（`/api-keys`，`apikeys_web.go`）。
 
 各页共用同一套侧边栏，当前页高亮。侧边栏支持收起/展开，状态保存在浏览器 `localStorage.sidebarCollapsed`。
@@ -87,7 +88,7 @@ Web 页面左侧有侧边栏菜单，五项：
 
 `API Key` 页是对 `api_keys` 表的增删改查，字段只有名称和 API Key：新增时前端 `crypto.getRandomValues` 自动生成一个 `sk-` 开头的随机 Key（可改），列表里打码显示、编辑时回填完整值。这些 Key 用于「API Key 直连」的命中判定。
 
-`OPENAI` 页除账号摘要/额度/Token 过期外，还有「模型配置」列（模型/推理强度/速度下拉）与「拉取模型」按钮，见「GPT 账号模型配置」。
+`OPENAI` 页除账号摘要/额度/Token 过期外，还有「模型配置」列（模型/推理强度/速度下拉）与「拉取模型」按钮，见「GPT 账号模型配置」；右上角有「刷新全部额度」，见「一键刷新全部额度」。
 
 路由页是对 `api_routes` 表的增删改查：
 
@@ -112,6 +113,77 @@ OPENAI 页每个账号可配置直连时用的模型/推理强度/速度，逻�
 - 「拉取模型」调 Bridge `modelsList`（`codex_bridge_models_list` ABI，等价 CLI 的 `/model`），把该账号可用的模型目录缓存到 `openai_accounts.models_json`。目录**按账号套餐过滤**，free 账号看不到 plus 才有的模型。
 - 三个下拉的可选项**由目录里每个模型各自携带**：模型（`display_name`/slug）、推理强度（`supported_reasoning_efforts`，`none|minimal|low|medium|high|xhigh|max|ultra`）、速度（`service_tiers`，外加一个固定的 `default`=标准）。换模型后推理强度/速度选项会变，前端换模型时清空另两项回落新模型默认值。
 - 下拉改动即存（`selected_model` / `selected_reasoning_effort` / `selected_service_tier`）。当前这三项**只存库**，「API Key 直连」目前只按 `selected_model` 匹配账号，推理强度/速度尚未回写进转发请求体。
+
+### 一键刷新全部额度 / 拉取全部模型
+
+OPENAI 页右上角两个批量按钮 = 对每个账号各点一次操作列的「额度」「模型」，**后台异步执行，前端不阻塞**。两者是各自独立的任务（`openaiJob` / `openaiModelsJob`），可以同时跑、互不阻塞；前端 `setupBatchButton` 工厂各持各的定时器，共用同一套「轮询 → 显示 `刷新中 3/7…` → 重载列表 → 有失败才弹清单」逻辑。
+
+- 「拉取全部模型」：`POST /api/openai/accounts/models-all` + `GET /api/openai/models-all`，逐个调 `RefreshModels`（按需刷凭证 → Bridge `modelsList` → 写 `models_json`，首次拉取还会把默认模型落 `selected_model`）。并发同为 3，单账号 60s 上限。
+
+「刷新全部额度」细节：
+
+- 列表「额度使用」列按窗口渲染：`windowLabel` 把 `limit_window_seconds` 翻成 5小时/周/月，进度条下面一行是**重置时间**（`resetLine`：优先用上游的绝对时间 `reset_at`，没有就用「拉取时刻 `status_at` + `reset_after_seconds`」推算，并显示「N 天/小时/分钟后」）；hover 整块能看到额度数据是什么时候拉的。窗口有几个由上游决定——free 账号只返回一个月窗口（`primary_window`，2592000 秒），5 小时/周窗口是 plus/pro 才有（落在 `primary_window`/`secondary_window`）。账号详情页另有完整的「周期/距离重置/重置时间」。
+- 行内「额度」按钮走 `POST /api/openai/accounts/{id}/refresh` → `Refresh(id)`：① 从 `auth_json` 的 JWT 补齐 `token_expires_at`；② `EnsureFreshAuth` **按需**刷凭证（只有剩余不足 5 分钟才真刷）；③ 调 Bridge 查额度写 `status_json`。所以它主要是刷额度，不是强制刷 token。
+- `POST /api/openai/accounts/refresh-all`：列出全部账号，立即返回 `{ok,total}`，刷新在后台跑；`GET /api/openai/refresh-all` 拉进度。前端每 2s 轮询、按钮显示「刷新中 3/12…」并顺带重载列表，跑完有失败才弹清单。
+- 并发 `openaiQuotaRefreshConcurrency=3`（每个账号要过 Bridge 打一次 `/wham/usage`，防上游限流），单账号 60s 兜底超时（`Refresh` 内部自带 30s）。
+- `Refresh` 返回 error 只为批量统计失败条数；单账号接口仍忽略它（失败原因已写进 `status_error`，页面能看到）。
+
+任务状态类型 `batchRefreshJob` / `startBatchRefresh` 在 **`batch_refresh.go`**，OPENAI 的批量刷额度、批量拉模型与 OUTLOOK 的批量刷 Token 共用同一套（各持一个实例）：进程内存不落库、同一实例同时只跑一个任务、重复发起 409、失败原因最多留 10 条、任务用 `context.Background()` 不随请求取消。
+
+## OUTLOOK 邮箱账号
+
+`OUTLOOK` 页（`/outlook`，`outlook_web.go` + `outlook_refresh.go` + `outlook_mail.go`）管理注册 GPT 账号用的 Outlook 邮箱：读 `outlook_login_tokens` 表、免登录刷新 Token、直接看邮件和取验证码。**这块与代理转发无关**，纯配套工具。
+
+表的权威 schema 归 `outlook-login-automation` skill（登录自动化）所有；本工程 `migrate` 里用同样的 `CREATE TABLE IF NOT EXISTS` 兜底，保证 skill 从没跑过时页面查询不因缺表报错，skill 建过表时是空操作。
+
+### 账号列表
+
+- 列：账号（邮箱 + display_name）、GPT 账号、套餐/租户、Access Token 过期、Refresh Token 过期、Cookie 数、刷新状态、更新时间、操作。
+- 过期时间按剩余时长着色：已过期红、1 小时内到期黄、其余绿；零值/空显示「未知」。
+- **列表接口不返回任何 token/cookie 明文**（与 OPENAI 页一致），只返回长度和过期时间等元数据。例外是 `credentials` 接口，见下。
+- 整行点击进该账号的邮件页 `/outlook/accounts/{id}`。
+- 「+ 新增账号」/「修改」只维护邮箱 + 密码两项。**密码明文存 `outlook_login_tokens.password`**，供后续自动登录复用；编辑弹窗回填时 `GET /api/outlook/accounts/{id}/credentials` 会明文返回密码。这是本地工具下的有意例外，和「列表不返回敏感字段」的约定相反。skill 的 upsert 列表不含 `password`，登录不会覆盖它。
+- `GET /api/outlook/valid-emails` 返回「有 access token 且未过期」的邮箱列表，供外部脚本挑可用邮箱。过期判断放在 Go 里用 `time.Now()` 比，不走 MySQL `NOW()`（避开时区坑）。
+- `GET /api/outlook/unregistered-emails` 返回「还没注册 GPT 账号」的邮箱列表（`has_gpt_account=0`），供批量注册流程挑下一个邮箱。判定复用 `ListOutlookAccounts`，所以标记为 0 的行会先关联 `openai_accounts` 复算并回写——刚注册完的邮箱下一次调用立刻消失。同一邮箱可能有多行（唯一键是 `email+client_id+scope`），这里按邮箱去重保留最近更新的一条；带 `?valid=1` 时再叠加「token 未过期」条件。两个接口返回结构一致：`{ok,count,emails}`。
+
+### GPT 账号标记（has_gpt_account）
+
+「GPT 账号」列表示该邮箱在 OPENAI 菜单里是否已有同邮箱的 GPT 账号，**存在 `outlook_login_tokens.has_gpt_account` 列里**（`ensureColumn` 补的 TINYINT，默认 0）：
+
+- 列表查询用 `CASE WHEN t.has_gpt_account=1 THEN 1 ELSE EXISTS(SELECT 1 FROM openai_accounts oa WHERE oa.email=t.email …) END`：已经是 1 的行靠 CASE 短路**不再做关联子查询**，只有 0 的行才关联 `openai_accounts` 复算一次。
+- 复算出 1 的行在返回前由 `markOutlookHasGPT` 批量回写该列，下次直接读列。
+- 回写语句显式带 `updated_at=updated_at`，避免 `ON UPDATE CURRENT_TIMESTAMP` 刷新「更新时间」导致列表排序乱跳（同路由页 toggle 的坑）。
+- 只做 0→1，不回退：删掉 GPT 账号不会把标记刷回「否」。
+
+### 免登录静默刷新 Token
+
+`refreshOutlookToken`（`outlook_refresh.go`）纯 Go 实现，不打开浏览器、不调外部脚本：
+
+- 用库里存的登录会话 cookie 跑 `login.microsoftonline.com/consumers/oauth2/v2.0/authorize?prompt=none` 的 PKCE 静默授权，拿 `#code=` 换 token，同时刷新 access / refresh / id token。
+- **不依赖 refresh_token**：该 token 是 24h 固定窗口，滚动刷新并不延长；靠 cookie 走授权才能让会话窗口真正往后滚。
+- 手动跟重定向（`CheckRedirect` 返回 `ErrUseLastResponse`），逐跳收集 `Set-Cookie` 并回写 `cookies_json`，让微软续期后的 cookie 生效。
+- 复用代理出站 transport（含系统代理/TLS 配置），整体 45s 超时。
+- 失败写 `last_refresh_error`，页面「刷新状态」列显示失败并 hover 看原因。
+
+### 一键刷新全部 Token（异步）
+
+页面右上角「刷新全部 Token」= 对所有有 token 的账号各点一次「刷新 Token」，**后台异步执行，前端不阻塞**：
+
+- `POST /api/outlook/accounts/refresh-all`：取 `access_token` 非空的账号（`ListOutlookRefreshableIDs`），立即返回 `{ok,total}`，刷新在 goroutine 里跑。
+- 并发度 `outlookRefreshConcurrency=3`（微软端点限流 + 本地出站代理考虑），每账号独立 90s 超时；任务用 `context.Background()`，不受发起请求的生命周期影响（handler 早返回了）。
+- 状态在进程内存 `batchRefreshJob`（`batch_refresh.go`，和 OPENAI 页「刷新全部额度」共用同一套，各持一个实例，不落库）：`running/total/done/ok/failed/errors`，同一时刻只允许一个任务，重复发起返回 **409**；失败原因带邮箱、最多留 10 条。
+- `GET /api/outlook/refresh-all` 返回进度快照。前端每 2s 轮询，按钮文案变「刷新中 3/12…」并顺带重载列表（过期时间边刷边更新），跑完恢复按钮、有失败弹清单；刷新页面后会接上仍在跑的任务继续显示进度。
+- 按钮点击反馈：所有按钮 `:active` 下沉+缩放+内阴影，忙碌时加 `.busy` 类在左侧转圈（单行「刷新 Token」同款）。
+
+### 邮件与验证码
+
+`outlook_mail.go` 直接调 Outlook Web 的 REST（`https://outlook.live.com/api/beta`），鉴权头复刻真实浏览器：`Authorization: MSAuth1.0 usertoken="<access_token>", type="MSACT"` + `x-anchormailbox: <邮箱>`。
+
+- `outlookMailFetch` 遇 401 自动静默刷新一次再重试。
+- 列表 `GET /api/outlook/accounts/{id}/messages?folder=&top=&next=`：文件夹走白名单（inbox/sentitems/drafts/deleteditems/junkemail/archive，防路径注入），翻页用上游 `@odata.nextLink`，`next` 校验 host 必须是 `outlook.live.com`（防 SSRF）。
+- 详情 `GET /api/outlook/accounts/{id}/message?mid=&bodyType=html|text`：`mid` 走查询参数（消息 Id 含 `=`/`+`，不适合放 path）。
+- **按邮箱取验证码** `GET /api/outlook/mail/code?email=`：定位账号 → 取收件箱最新一封 → 拉纯文本正文 → `extractVerificationCode` 按 `outlookCodePatterns` 顺序匹配（security code / 安全代码 / 验证码 / verification-temporary-one-time code / code: / 独立 6 位数字兜底），返回 `{ok,code,subject,from,received}`。
+- 已知取舍：固定取**最新一封**、不按发件人或时间窗过滤，兜底正则也宽（订单号之类可能误命中）。用在自动注册流程里要注意这点。
 
 ## 路由与第三方 API 转发
 
@@ -252,6 +324,8 @@ OPENAI 页每个账号可配置直连时用的模型/推理强度/速度，逻�
 - `chain_proxies`：链式代理配置。字段 `name`、`api_style`、`route_ids`（JSON 数组，保存点击顺序）、`enabled`、`created_at`、`updated_at`。同一 `api_style` 至多一条启用；`route_ids` 里的路由必须属于同一 API 风格。
 - `api_keys`：「API Key 直连」用的 Key 配置，字段 `name`、`api_key`。请求头 key 命中其中任意一条即触发直连。
 - `openai_accounts`：通过 `libcodex_bridge` 动态库登录的 GPT 账号。账号摘要单独分列，完整 Codex `auth.json` 保存在 `auth_json`，额度结果保存在 `status_json`，列表 API 不返回鉴权字段。后续通过 `ensureColumn` 补的列：`token_expires_at`（access_token JWT 的 exp，用于主动刷新）、`refresh_error`（刷新永久失败原因）、`models_json`/`models_at`（缓存的模型目录）、`selected_model`/`selected_reasoning_effort`/`selected_service_tier`（页面选的模型配置）。
+
+- `outlook_login_tokens`：Outlook 邮箱登录态。**权威 schema 归 `outlook-login-automation` skill**，本工程只用 `CREATE TABLE IF NOT EXISTS` 兜底建表（skill 没跑过时页面也能查）。主要列：`email`、`display_name`、`client_id`/`tenant_id`/`account_oid`/`home_account_id`、`scope`、`access_token`/`refresh_token`/`id_token`/`client_info`、各种过期时间（`token_issued_at`/`access_token_expires_at`/`refresh_token_expires_at`）、`cookies_json`/`cookie_count`/`user_agent`（静默刷新要用）、`last_refresh_status`/`last_refresh_error`。唯一键 `uniq_email_client_scope (email, client_id, scope(255))`。本工程通过 `ensureColumn` 补的列：`password`（手动新增/编辑填的明文登录密码，skill 的 upsert 不含此列不会覆盖）、`has_gpt_account`（是否已有同邮箱 GPT 账号，见「GPT 账号标记」）。
 
 迁移会确保历史数据补齐 `account_id`、`tags` 等字段，并尝试修复旧数据里误保存为注入上下文的 `first_prompt`。
 
@@ -431,8 +505,27 @@ log/YYYY-MM-DD-{model}.log
 - `GET /api/openai/logins/{id}`：查询登录状态。
 - `POST /api/openai/logins/{id}/cancel`：取消登录。
 - `POST /api/openai/accounts/{id}/refresh`：刷新该账号：本地补齐 Token 过期时间、按需刷新凭证、异步查额度。
+- `POST /api/openai/accounts/refresh-all`：异步刷新全部账号的额度，立即返回 `{ok,total}`；已有任务在跑返回 409。
+- `GET /api/openai/refresh-all`：批量刷额度任务的进度快照（`running/total/done/ok/failed/errors`）。
 - `POST /api/openai/accounts/{id}/models`：同步拉取该账号可用模型目录并缓存。
+- `POST /api/openai/accounts/models-all`：异步拉取全部账号的模型目录，立即返回 `{ok,total}`；已有任务在跑返回 409。
+- `GET /api/openai/models-all`：批量拉模型任务的进度快照。
 - `POST /api/openai/accounts/{id}/settings`：保存该账号选的模型/推理强度/速度。
+- `GET /outlook`：Outlook 邮箱账号管理页。
+- `GET /outlook/accounts/{id}`：该邮箱的邮件页。
+- `GET /api/outlook/accounts`：Outlook 账号列表（不含 token/cookie 明文）。
+- `POST /api/outlook/accounts`：手动新增账号（邮箱 + 密码）。
+- `PUT /api/outlook/accounts/{id}`：修改邮箱 + 密码。
+- `DELETE /api/outlook/accounts/{id}`：删除该行（含 token 与 cookie）。
+- `GET /api/outlook/accounts/{id}/credentials`：读邮箱 + **明文密码**，供编辑弹窗回填。
+- `GET /api/outlook/valid-emails`：有 access token 且未过期的邮箱列表。
+- `GET /api/outlook/unregistered-emails`：还没注册 GPT 账号（`has_gpt_account=0`）的邮箱列表，按邮箱去重；`?valid=1` 只保留 token 未过期的。
+- `POST /api/outlook/accounts/{id}/refresh`：静默刷新该账号的 access + refresh token（同步，成功后回读该行）。
+- `POST /api/outlook/accounts/refresh-all`：异步刷新全部有 token 的账号，立即返回 `{ok,total}`；已有任务在跑返回 409。
+- `GET /api/outlook/refresh-all`：一键刷新任务的进度快照（`running/total/done/ok/failed/errors`）。
+- `GET /api/outlook/accounts/{id}/messages`：邮件分页列表（`?folder=&top=&next=`）。
+- `GET /api/outlook/accounts/{id}/message`：单封邮件正文（`?mid=&bodyType=html|text`）。
+- `GET /api/outlook/mail/code`：按邮箱取最新一封邮件里的验证码（`?email=`）。
 - `GET /stats/tokens`：Token 消耗详情图表页（`?dim=route|account|api_key&id=&name=`）。
 - `GET /api/stats/tokens`：Token 消耗时间序列与按模型拆分 JSON（`?dim=&id=&granularity=day|month|year`）。
 - `GET /healthz`：健康检查。

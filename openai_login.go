@@ -130,7 +130,7 @@ func (m *openAILoginManager) finish(process *openAILoginProcess) {
 		return
 	}
 	m.complete(process.status.ID, "completed", &account, "")
-	go m.Refresh(accountID)
+	go func() { _ = m.Refresh(accountID) }()
 }
 
 func accountFromCredentials(name, credentialsJSON string) OpenAIAccount {
@@ -449,12 +449,14 @@ func defaultModelFromCatalog(raw string) (string, string) {
 	return "", ""
 }
 
-func (m *openAILoginManager) Refresh(id int64) {
+// Refresh 刷新单个账号:补齐 Token 过期时间 → 按需刷新凭证 → 查额度并写 status_json。
+// 返回 error 只为批量刷新能统计失败条数,单账号接口仍忽略它(失败原因已写进 status_error 由页面展示)。
+func (m *openAILoginManager) Refresh(id int64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	account, err := m.store.GetOpenAIAccount(ctx, id)
 	if err != nil {
-		return
+		return err
 	}
 	// 先按已存的 access_token 本地补齐过期时间(历史记录该字段为空),
 	// 再按需刷新凭证,最后才查额度。
@@ -473,9 +475,9 @@ func (m *openAILoginManager) Refresh(id int64) {
 	statusJSON, err := m.bridge.status([]byte(account.AuthJSON), []byte(m.baseURL))
 	if err != nil {
 		_ = m.store.UpdateOpenAIAccountStatus(ctx, id, "", err.Error())
-		return
+		return err
 	}
-	_ = m.store.UpdateOpenAIAccountStatus(ctx, id, statusJSON, "")
+	return m.store.UpdateOpenAIAccountStatus(ctx, id, statusJSON, "")
 }
 
 func (m *openAILoginManager) complete(id, state string, account *OpenAIAccount, message string) {
