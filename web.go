@@ -63,7 +63,7 @@ var baseTemplate = template.Must(template.New("base").Funcs(template.FuncMap{
 			return "ok"
 		}
 	},
-}).Parse(indexHTML + detailHTML + routesHTML + chainsHTML + apiKeysHTML + openAIHTML + openAIAccountHTML + outlookHTML + outlookMailHTML + tokenStatsHTML))
+}).Parse(indexHTML + detailHTML + routesHTML + chainsHTML + apiKeysHTML + openAIHTML + openAIAccountHTML + outlookHTML + outlookMailHTML + tokenStatsHTML + herosmsHTML))
 
 func conversationFilterFromRequest(r *http.Request) ConversationFilter {
 	q := r.URL.Query()
@@ -624,6 +624,7 @@ const indexHTML = `
       <a class="nav-item" href="/openai">OPENAI</a>
       <a class="nav-item" href="/outlook">OUTLOOK</a>
       <a class="nav-item" href="/api-keys">API Key</a>
+      <a class="nav-item" href="/herosms">HeroSMS</a>
     </nav>
   </aside>
   <main class="page">
@@ -1074,6 +1075,7 @@ const chainsHTML = `
       <a class="nav-item" href="/openai">OPENAI</a>
       <a class="nav-item" href="/outlook">OUTLOOK</a>
       <a class="nav-item" href="/api-keys">API Key</a>
+      <a class="nav-item" href="/herosms">HeroSMS</a>
     </nav>
   </aside>
   <main class="page">
@@ -2031,6 +2033,7 @@ const routesHTML = `
       <a class="nav-item" href="/openai">OPENAI</a>
       <a class="nav-item" href="/outlook">OUTLOOK</a>
       <a class="nav-item" href="/api-keys">API Key</a>
+      <a class="nav-item" href="/herosms">HeroSMS</a>
     </nav>
   </aside>
   <main class="page">

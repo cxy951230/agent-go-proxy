@@ -133,6 +133,7 @@ const apiKeysHTML = `
       <a class="nav-item" href="/openai">OPENAI</a>
       <a class="nav-item" href="/outlook">OUTLOOK</a>
       <a class="nav-item active" href="/api-keys">API Key</a>
+      <a class="nav-item" href="/herosms">HeroSMS</a>
     </nav>
   </aside>
   <main class="page">

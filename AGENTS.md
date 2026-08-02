@@ -79,8 +79,9 @@ Web 页面左侧有侧边栏菜单，六项：
 - `路由`：第三方 API 配置页（`/routes`）。
 - `链式代理`：按顺序组合多个路由的配置页（`/chains`）。
 - `OPENAI`：通过 Codex Bridge 登录和管理 GPT 账号（`/openai`）。
-- `OUTLOOK`：管理 Outlook 邮箱账号、刷新其 Token、读邮件取验证码（`/outlook`，`outlook_web.go`），见「OUTLOOK 邮箱账号」。
+- `OUTLOOK`：登录 Outlook 邮箱（顶部按钮手动登录 / 行内按钮自动登录）、管理账号、刷新其 Token、读邮件取验证码（`/outlook`，`outlook_web.go`），见「OUTLOOK 邮箱账号」。
 - `API Key`：管理直连用的 API Key（`/api-keys`，`apikeys_web.go`）。
+- `HeroSMS`：接码（`/herosms`，`herosms.go` + `herosms_web.go`），见「HeroSMS 接码」。
 
 各页共用同一套侧边栏，当前页高亮。侧边栏支持收起/展开，状态保存在浏览器 `localStorage.sidebarCollapsed`。
 
@@ -146,6 +147,44 @@ OPENAI 页右上角两个批量按钮 = 对每个账号各点一次操作列的�
 - `GET /api/outlook/valid-emails` 返回「有 access token 且未过期」的邮箱列表，供外部脚本挑可用邮箱。过期判断放在 Go 里用 `time.Now()` 比，不走 MySQL `NOW()`（避开时区坑）。
 - `GET /api/outlook/unregistered-emails` 返回「还没注册 GPT 账号」的邮箱列表（`has_gpt_account=0`），供批量注册流程挑下一个邮箱。判定复用 `ListOutlookAccounts`，所以标记为 0 的行会先关联 `openai_accounts` 复算并回写——刚注册完的邮箱下一次调用立刻消失。同一邮箱可能有多行（唯一键是 `email+client_id+scope`），这里按邮箱去重保留最近更新的一条；带 `?valid=1` 时再叠加「token 未过期」条件。两个接口返回结构一致：`{ok,count,emails}`。
 
+### 页面手动登录（拉起独立 Chrome）
+
+右上角「+ 登录账号」走 `outlook_login.go` + `cdp.go`，纯 Go，不依赖 skill、不调用外部脚本：
+
+- 代理拉起一个**独立临时 profile** 的 Chrome 窗口打开 `login.live.com`，用户自己在窗口里输账号密码、过验证码；代理只轮询状态，不做任何自动填表（这点和 skill 的自动登录不同）。
+- 通信走 Chrome 的 `--remote-debugging-pipe`（fd3 读 / fd4 写、NUL 分隔 JSON），不是 `--remote-debugging-port`。端口模式的命令通道是 websocket，纯 Go 要么引依赖要么手写 RFC6455；管道模式只是两个 `os.Pipe`。只用**浏览器级**方法，不 attach 页面 session：`Target.getTargets`（看标签页 URL 判断登录到哪一步）、`Storage.getCookies`（取全域 cookie，含 HttpOnly 的会话 cookie）、`Browser.getVersion`（取真实 UA）、`Browser.close`。
+- 登录成功判据与 skill 状态机一致：URL 命中 `outlook.live.com/mail`、`outlook.office.com/mail` 或 `account.microsoft.com`。随后再开一次邮箱页，让 Outlook Web 建立自己的会话（顺带拿到 `outlook.live.com` 域 cookie），失败不致命——静默授权只依赖 `login.*` 域的会话 cookie。
+- 抓到 cookie 后**复用静默刷新那条链路**：`newOutlookCookieStore` → `silentAuthorizeOutlook`（authorize?prompt=none + PKCE）→ `outlookTokenUpdateFromResponse` → 落库。和行内「刷新 Token」按钮走同一份代码，字段口径必然一致。
+- 弹窗里邮箱、密码都可留空：邮箱留空则从 `id_token` 的 `email` / `preferred_username` 等 claim 解析；密码只在非空时写 `password` 列（留空不会清掉已存的）。
+- 落库用 `SaveOutlookLogin`，按三级定位决定写哪一行：①同邮箱 + 同 `client_id` 的行（同账号重新登录）→ ②同邮箱、但还没有 `access_token` 的行 → ③新插一行。第二级专门用来**认领「新增账号」建的空行**：那种行的 `client_id`/`scope` 是空/NULL，和唯一键 `uniq_email_client_scope` 对不上，直接 INSERT 会让同一邮箱出现两行（库里已有这种历史数据）。`last_refresh_status` 写 `login_captured`，与 skill 的取值一致。
+- 同一时刻只允许一个登录任务，重复发起返回 **409**；任务超时 10 分钟；用户手动关掉 Chrome 窗口会立即判失败，不干等到超时。
+- 进程退出时 `outlookLoginManager.Close()` 会**等**任务收尾再返回（内部一个 WaitGroup，上限 15 秒）。只发取消信号就返回的话，Chrome 会变成孤儿进程、临时 profile 也留在磁盘上——这是实测踩到过的。
+- **为什么不能用用户日常的 Chrome**：本进程读不到它的 cookie；而且 Chrome 已在运行时再传 `--remote-debugging-*` 参数会被完全忽略（新进程只把请求转给已有实例），必须先彻底退出浏览器；Chrome 136+ 还禁止默认 profile 开调试通道，绕过去仍然只能用隔离 profile。
+
+### 行内自动登录（DOM 状态机）
+
+列表每行操作列的「登录」按钮走 `outlook_automation.go`：用该行存的邮箱 + 明文密码，在同一个独立 Chrome 窗口里自动填表登录。状态判定与交互策略**移植自 outlook-login-automation skill 的 Python 实现**，逐条对齐、不自创。
+
+- **只在需要时才显示这个按钮**：健康账号（有 access token + 未过期 + 最近一次刷新没失败）不显示，因为重新登录只在静默刷新救不回来时才有意义。刷新失败会写 `last_refresh_error`，所以刷失败的行会自动冒出「登录」按钮，正好接上下一步操作。
+- 只有该行存了密码才能点（列表接口返回 `has_password` 布尔值，**不返回密码本身**）；没存密码时按钮置灰，提示先去「修改」补密码。
+- 每轮往页面注入 `outlookHelperJS` 取一次 DOM 快照（href/title/ready/headings/inputs/buttons/bodyText），`classifyOutlookLoginState` 归类成 `loading` / `email` / `password` / `password_choice` / `stay_signed_in` / `account_picker` / `captcha` / `mfa_or_protection` / `problem` / `success` / `unknown`，再按状态执行动作，最多 25 步。
+- **判定顺序不能改**，两个坑照搬自 skill：`password_choice` 必须排在 `captcha` 之前（「Verify your email」页同时含两类关键词）；captcha 判定必须用显式短语正则，不能用宽泛的 `prove you` 子串——cookie 横幅那句 `improve your experience` 里就含它。这两条与其它硬规则由 `outlook_automation_test.go` 的离线用例钉住。
+- **开工前按 DOM 就绪度等待，不用固定时长**（`waitReady`）：每 250ms 拍一次快照，直到 `readyState=complete`、状态不是 `loading`、且**连续两次判定一致**才动手，上限 20 秒。skill 是固定睡 6 秒，页面早好了也得干等。
+  - ⚠️ 与之配套改了 `loading` 的判据：**空文档一律算没加载完，不能看 `readyState`**。实测微软登录页在表单渲染出来之前，会先给出一个 `readyState` 已经是 `complete`、但 DOM 里 0 个 input / 0 个 button 的中间文档。skill 的判据带了 `ready != complete`，靠那 6 秒盖过去了；改成 DOM 判定后如果照抄，空文档会一路落到 `unknown`，自动流程刚开始就误判成「未识别页面」。`outlook_ready_probe_test.go`（需 `PROBE_OUTLOOK=1`，会真开一次浏览器）就是拿真实页面测这一点的探针。
+  - 聚焦输入框用 `clickToFocus`（点完等 120–260ms），只有点按钮才用 `click`（等 700–1300ms 让页面反应）。
+- **三级点击降级**（Fluent 控件有一部分吃不到 CDP 鼠标事件）：页面内 JS `focus()+click()` → Tab 走焦点最多 12 次后回车（`data-testid` 含 `primarybutton` 的控件要按空格不是回车）→ 鼠标事件。输入则是逐字符 `Input.insertText`，且**值已正确就不重打**。
+- `Stay signed in` 默认选 **Yes**：隔离 profile 要保住会话，cookie 才会持久化落盘，后续静默刷新完全依赖这份 cookie。
+- **卡住不算失败，转人工**：撞到 `captcha` / `mfa_or_protection` / 找不到按钮 / `unknown` / 步数耗尽时，不关窗口、不结束任务，只把原因写进任务状态显示到页面，然后回落到手动登录那套轮询，由用户在窗口里接管完成，之后照常抓 cookie 换 token。只有 `problem`（密码错误、账号被锁、尝试过多、**账号不存在**）才直接判失败并关窗口。这一条同时抵消了「不做指纹伪装」带来的更高挑战概率。
+- **账号有问题必须自己结束**，三层兜底（这三条一起修的是「账号登不上就永远卡在页面上不动」）：
+  - `problem` 关键词补了「找不到这个账号」一组（`outlookProblemPhrases`：`couldn't find a microsoft account` / `couldn't find an account` / `no account found` / `does not exist` / `enter a valid email address`）。这类报错的坑在于**邮箱输入框还在页面上**，不认它就会被判回 `email` 状态，于是重填邮箱 → 点 Next → 等满 35s 转场 → 键盘兜底再等 12s，一步一分半地磨到任务 10 分钟超时。
+  - DOM 快照新增 `errors` 字段（`role=alert` / `[id$=Error]` / `aria-live=assertive` 等可见报错块）。`bodyText` 截断在 2500 字，长页面会把报错切掉，所以报错块单拎出来参与 `problem` 判定，同时作为回报文案（`outlookSnapshotError`）。`outlookProblemReason` 关键词都不命中时直接返回页面原话，不再是一句「未知原因」。
+  - 通用兜底：**同一状态连续出现 3 次**（`outlookAutoMaxSameState=2`）就收工（`stuckResult`）——页面上有报错块判 `Fatal`（账号有问题，留着窗口也没人能救），没有报错才转人工。没有这层的话，任何没被关键词覆盖的新报错文案都会重演上面那个磨到超时的过程。
+- **页面 target 失效要重新附着**：登录过程中微软会换 target、用户也可能关标签页，CDP 会一直回 `Session with given id not found.`。`snapshot` 拿到错误后先 `ActivePageTarget` + `AttachPage` 重附一次再拍；重附也救不回来且 Chrome 已退出时直接判 `Fatal`（不再回落到手动等待干等满 10 分钟）。`waitReady` / `waitStateChange` 都吞快照错误只管轮询，所以这层必须做在 `snapshot` 里，做在调用方会漏。
+- **不落任何诊断产物**：skill 会写 `log.jsonl` / `dom_snapshot.jsonl` / `model_review.jsonl` / 截图 / `report.md`，这里一概不写，出问题只把原因回报给页面状态框。注入脚本也相应裁掉了只服务于诊断的 `links` / `iframes` / `candidates` 三个字段（`candidates` 一次要序列化 350 个节点）。
+- **没有移植**的是 skill 的指纹伪装（`launch-fingerprint-chrome`，独立 583 行：出口 IP 探测 → locale/timezone 匹配 → 动态生成 Chrome 扩展注入 canvas/WebGL/userAgentData 伪装）。我们的窗口是裸的临时 profile + 系统代理，所以更容易被要求人机验证——靠上面的「转人工」兜底。
+
+CDP 侧为此在 `cdp.go` 增加了**页面级会话**：`Target.attachToTarget{flatten:true}` 拿 sessionId，之后 `Runtime.evaluate` / `Input.insertText` / `Input.dispatchKeyEvent` / `Input.dispatchMouseEvent` / `Page.bringToFront` 都带上它。应答仍按全局自增 id 路由，不需要按 sessionId 分发。
+
 ### GPT 账号标记（has_gpt_account）
 
 「GPT 账号」列表示该邮箱在 OPENAI 菜单里是否已有同邮箱的 GPT 账号，**存在 `outlook_login_tokens.has_gpt_account` 列里**（`ensureColumn` 补的 TINYINT，默认 0）：
@@ -163,7 +202,7 @@ OPENAI 页右上角两个批量按钮 = 对每个账号各点一次操作列的�
 - **不依赖 refresh_token**：该 token 是 24h 固定窗口，滚动刷新并不延长；靠 cookie 走授权才能让会话窗口真正往后滚。
 - 手动跟重定向（`CheckRedirect` 返回 `ErrUseLastResponse`），逐跳收集 `Set-Cookie` 并回写 `cookies_json`，让微软续期后的 cookie 生效。
 - 复用代理出站 transport（含系统代理/TLS 配置），整体 45s 超时。
-- 失败写 `last_refresh_error`，页面「刷新状态」列显示失败并 hover 看原因。
+- 失败写 `last_refresh_error`，页面「刷新状态」列显示失败并 hover 看原因。**每一条失败路径都会写**：`refreshOutlookToken` 外面包了一层，只要内层返回 error 就标记，标记用独立的 `context.Background()`（请求可能已取消/超时，但原因照样要记下来）。早先只有「静默授权失败」那一处会标记，最常见的「没有已保存的 cookie/会话」直接 return，页面上刷新状态一直停在 `-`，看不出点过刷新也看不出为什么没成。
 
 ### 一键刷新全部 Token（异步）
 
@@ -184,6 +223,33 @@ OPENAI 页右上角两个批量按钮 = 对每个账号各点一次操作列的�
 - 详情 `GET /api/outlook/accounts/{id}/message?mid=&bodyType=html|text`：`mid` 走查询参数（消息 Id 含 `=`/`+`，不适合放 path）。
 - **按邮箱取验证码** `GET /api/outlook/mail/code?email=`：定位账号 → 取收件箱最新一封 → 拉纯文本正文 → `extractVerificationCode` 按 `outlookCodePatterns` 顺序匹配（security code / 安全代码 / 验证码 / verification-temporary-one-time code / code: / 独立 6 位数字兜底），返回 `{ok,code,subject,from,received}`。
 - 已知取舍：固定取**最新一封**、不按发件人或时间窗过滤，兜底正则也宽（订单号之类可能误命中）。用在自动注册流程里要注意这点。
+
+### 发邮件
+
+发信**必须走 OWA 原生端点 `POST /owa/service.svc?action=CreateItem`**（`outlookMailSendOWA`），不能走 REST 的 `/api/beta/me/sendmail`。
+
+- **踩坑记录**：`/api/beta/me/sendmail` 对我们这套 token 只有读权限——实测全部 18 个账号一律**读 200 / 写 403 `ErrorAccessDenied`**（sendmail、建草稿 `POST /me/messages`、标记已读 `PATCH` 都 403），与账号无关，是 scope `service::outlook.office.com::MBI_SSL` 的写权限限制。同一个 token 打 OWA `service.svc` 就发信成功（`ResponseCode: NoError`），因为那是浏览器 OWA 自己发信用的端点。
+- **协议**：请求 JSON（`CreateItemJsonRequest`，`MessageDisposition=SendAndSaveCopy`）URL 编码后塞进 `x-owa-urlpostdata` 头，body 为空。**不需要**抓包脚本里那些 `x-owa-sessionid` / `x-client-version` / `prefer` 页面态头（去掉照样通，实测），只需 `Authorization: MSAuth1.0 usertoken=...` + `x-anchormailbox` + `action`/`x-owa-actionsource: CreateItem`。
+- **响应判定：必须拿到 `ResponseCode=NoError` 才算真发出去，不能只看 HTTP 2xx**。正常成功是 `200` + `ResponseMessages.Items[].ResponseCode=NoError`；`owaResponseCode` 从 `Body.ResponseCode` 或 `Body.ResponseMessages.Items[].ResponseCode` 里挖。token 失效时回 401（保留自动刷新）。
+  - **踩坑（假成功）**：新注册未验证账号（`signup_captured`）外发会被微软**静默拦截**——CreateItem 返回 `HTTP 204 空 body`、邮件不进「已发送」、收件人收不到，但 HTTP 是 2xx。最初只按 2xx 判成功，页面就报「已发送」误导人。现在拿不到 `NoError`（含 204 空 body / 200 无回执）一律报「发送未被确认，账号可能被限制外发」。判断这类号有没有被限：查它自己的 `sentitems` 是否真多出这封。老号（正常登录过、非新注册）实测 `200 + NoError` 且收件人确实收到。
+
+两个入口共用 `buildOutlookSendPayload`（拆收件人 → 拼 `CreateItemJsonRequest`，返回 URL 编码后的 `x-owa-urlpostdata` 值 + 收件人列表），正文**默认按纯文本发**（`body_type:"html"` 才发 HTML，`BodyType` 字段）：弹窗里是 textarea，当 HTML 发会把换行吃掉还要额外转义。收件人支持逗号/分号/空白分隔多个，不含 `@` 直接 400。
+
+- 行内「发邮件」按钮 → `POST /api/outlook/accounts/{id}/send`：用该行的 token，**遇 401 静默刷新一次再重试**（与读邮件同一套口径）。没有 access token 的行按钮置灰。
+- 无状态接口 → `POST /api/outlook/mail/send`：给外部脚本用，发送方凭证由入参 `token` 提供，代理不查库。`email` 作为 `x-anchormailbox`（可留空）。**`token` 留空且给了 `email` 时回落到按邮箱查库取 token**——只有这条路径才有 401 自动刷新，裸 token 路径失效了就直接把上游错误返回，代理无从知道它属于哪一行。
+
+## HeroSMS 接码
+
+`HeroSMS` 页（`/herosms`，`herosms.go` + `herosms_web.go`）把 `gpt-login-automation` skill 里用到的接码功能搬进代理，接 OpenAI 手机验证（service 固定 `dr`）。**与转发无关**，是配套账号工厂的一环（signup/login 两个 skill 靠 `/api/outlook/mail/code`、`/api/openai/logins` 走本代理，接码这块原来在 skill 内独立跑）。
+
+- **两套上游 base**：`handler_api.php`（SMS-Activate 兼容，**纯文本**返回 `ACCESS_NUMBER:..` / `STATUS_OK:..` / `ACCESS_BALANCE:..`）+ `/api/v1/activations/offers`（**JSON**，鉴权头 `Authorization: ApiKey <key>`）。`herosmsGet` 封装前者，offers 单独走后者。
+- **API Key**：先用 skill 内置默认值 `herosmsDefaultKey` 兜底，页面可配置、持久化在 `app_settings.herosms_api_key`（留空=回落默认）。本地工具，config 接口明文返回 key。
+- **国家名**：offers 只给 country_id，用 `getCountries` 结果关联中文名，进程内缓存 1 小时（`herosmsCountryNames`）。
+- **页面完整流程**（4 步）：① **选服务**（`getServicesList`，811 个，搜索框过滤，默认 `dr`=OpenAI，`go`=Google）→ ② **查价选国家**（offers，按价格升序、库存降序，点「选择」定一行）→ ③ **选数量购买**（前端按数量循环调 `/api/herosms/number`，每个号进激活列表）→ ④ **轮询验证码 + 取消**。
+- **offers 口径**对齐 skill：默认 `max_price=0.2`、`min_count=2000`；service 由页面选择传入（不再写死 dr）。
+- **买号会真实扣费**：`getNumber`（fixedPrice）→ `ACCESS_NUMBER:<id>:<phone>`；`getStatus` 每 3 秒轮询 `STATUS_OK:<code>` 拿验证码；`cancelActivation` 取消。**取消按钮满 120s（HeroSMS 最小激活期）才可点**——前端按 `bought_at` 倒计时禁用，到点即启用，点击只调取消接口（不到 120s 上游会 `EARLY_CANCEL_DENIED`）。`finishActivation` 也有接口但页面当前不自动调（收到码后由使用方决定）。
+- 接口：`GET /herosms`(页) + `GET/POST /api/herosms/config`、`GET /api/herosms/balance`、`GET /api/herosms/services`、`GET /api/herosms/offers?service=&max_price=&min_count=`、`POST /api/herosms/number {service,country,max_price}`、`GET /api/herosms/status?id=`、`POST /api/herosms/cancel {id}`、`POST /api/herosms/finish {id}`、`GET /api/herosms/active`。
+- **注意**：HeroSMS 的手机验证**编排**（多国轮换、blocked 国家、E.164 输入、React Aria 国家选择器等踩坑）仍在 skill 的 Python 里，这里搬的是单步接码原语 + 页面手动编排（选服务/查价/买/轮询/取消），不含把验证码自动填进 OpenAI 登录页那段。
 
 ## 路由与第三方 API 转发
 
@@ -234,15 +300,26 @@ OPENAI 页右上角两个批量按钮 = 对每个账号各点一次操作列的�
 - 命中 → 用账号凭证直连，`applyAccountAuth` 注入 `Authorization: Bearer <access_token>` + `ChatGPT-Account-ID`，剥掉客户端自带认证头。
 - 请求无 `model` / 没有账号配置该模型 → **400**，不转发也不回落（回落会用错模型且用户无感）。
 - 查库失败 / 账号凭证损坏 → **503**（可能是临时的，值得重试）。
+- 匹配到账号但全部已用满(100%)时**不报错**，保留候选兜底尝试（见下「已用满(100%)才剔除」的全满兜底）。
 
 ### 多账号负载均衡 + 会话粘性 + 熔断（account_pool.go）
 
 候选集不再「取 id 最小恒命中第一个」，而是由进程内存里的 `accountPool` 调度（状态不落库）：
 
 - **会话粘性**：同一 `session_id` 优先固定落到上次成功的账号，复用其上下文缓存以提高 `cached_tokens` 命中率。
-- **负载均衡**：无粘性绑定的新会话，在健康候选里按「最少在途请求数」（least-connections）挑选，并发相同时随机打散，避免总打第一个。
-- **熔断兜底**：账号请求失败（传输错误 / HTTP `>=400` / 401 刷新后仍失败 / 凭证不可用）进入 90 秒冷却（`accountCooldown`），并在它是本会话粘性账号时解绑；冷却中的账号排到候选末尾，仅当全部账号都在冷却时才作为最终兜底再试一次。
-- `OrderedAccounts(session, candidates)` 给出本会话的尝试顺序：粘性优先 → 最少在途 → 随机；冷却账号殿后。`Acquire`/`Release` 维护在途计数（响应彻底结束后释放），`MarkSuccess` 绑定粘性、`MarkFailure` 熔断+解绑。
+- **启用开关**：`openai_accounts.enabled`（页面「启用」列，默认 1）。关掉的账号在 `OpenAIAccountsForModel` 里就被 SQL 过滤掉，**根本不进候选集**。页面标题旁另有一个总开关：全开显示「是」、全关「否」、混合「部分」；点击时全开就全关、否则一律全开（三态里只有这一种映射不会有歧义），全关方向有二次确认。
+- **已用满(100%)才剔除**：账号最近一次拉取的额度里任一窗口 `used_percent >= 100`（`quotaExhausted`）时，**不进候选集**——新对话、进行中的对话、会话粘性账号一视同仁，在 `accountPlansForRequest` 里过滤。**只卡 100%**，90%/99% 之类的中间占用不再限制（早先加过 90% 硬阈值，已按需求撤掉）。
+  - **全满兜底**：如果匹配该模型的账号**全部**都用满了，则保留原候选、照常尝试（不报错）——避免月度重置后额度数据还没刷、一个都不敢试导致请求永久发不出。
+  - **额度靠两条更新**：① **定时刷新**（`runQuotaAutoRefresh`，每 5 分钟，可在 OPENAI 页开关，见下）；② **429 触发异步补刷**（上游返回 429 时顺手异步 `Refresh` 命中账号，同账号 60s 内只刷一次）。刚打满的账号很快被标记为 `exhausted`、进而在选择时被剔除。
+  - `OrderedAccounts` 里仍保留 `QuotaExhausted` 沉底排序,作为「全满兜底」时的次序兜底(正常路径 100% 账号已被上面过滤掉、到不了这里)。
+- **定时刷新额度开关**（`quotaAutoRefresh` 原子标志 + `app_settings.quota_auto_refresh` 持久化，默认开）：OPENAI 页工具条「定时刷额度」开关控制 `runQuotaAutoRefresh` 是否真去刷。goroutine 常驻,每次 tick 读标志——关着就只保留心跳、不刷,所以开关**点一下即生效、无需重启**；开着时进程启动也立即先刷一次。接口 `GET/POST /api/openai/quota-auto-refresh`。关掉后额度就只靠 429 异步补刷更新。
+- **429 后异步补刷额度**：定时刷新关掉后额度就只靠这条更新——上游返回 429 时顺手异步调一次 `Refresh(accountID)`。靠这一下它才能自己变成「已用满」、进而在下次选择时被剔除，不然会被反复选中。同一账号 60 秒内只刷一次（`ShouldRefreshQuota`），防止并发 429 把它刷爆。
+- **负载均衡**：无粘性绑定的新会话，在健康候选里先按「最少在途请求数」（least-connections），再按「**最久未使用优先**」（`lastUsed`，进程内存，重启清零），完全并列才随机打散。空闲时所有账号在途数都是 0，所以新会话实际上是靠 LRU 在账号间轮转，消耗自然摊平。
+  - `lastUsed` 在 `Acquire`（**开始尝试**时）就更新，不是等成功才更新：否则失败的账号会一直是「最久未使用」的那个，下一个请求又优先撞上去。
+  - **刻意没有按额度排序**：额度（`status_json`）只在页面上手动点「额度」/「刷新全部额度」时才更新，没有后台定时刷新。拿可能是几天前的数据排序，会持续把新会话堆到那个「看起来最空」的账号上，反而不如轮转。LRU 长期效果与「均摊额度」一致，且不依赖这份数据的新鲜度。
+- **熔断兜底**：账号被上游拒绝（HTTP `>=400` / 401 刷新后仍失败 / 凭证不可用）进入冷却，并在它是本会话粘性账号时解绑；冷却中的账号排到候选末尾，仅当全部账号都在冷却时才作为最终兜底再试一次。额度/限流类失败（`429`）**按响应的 `Retry-After` 定冷却时长**（实测 ChatGPT 后端基本给 60 秒，上下限 60 秒 ~ 30 分钟，见 `accountFailureCooldown`），其余失败沿用 90 秒（`accountCooldown`）。一刀切 90 秒的问题是：限流刚解除的账号还在被跳过，而额度耗尽的账号 90 秒后又变回「健康」、因在途数为 0 反而被优先选中，每个新会话都要白撞一次。
+- **传输层错误不换账号、也不熔断**：EOF / 连接失败意味着到上游的网络路径断了，而所有账号打的是同一个地址，换账号只换鉴权头。逐个试只会让客户端多等 N×3 次徒劳重试（`doUpstream` 内部还有 3 次），还会把全部账号打进冷却、把会话粘性全解绑，网络恢复后缓存命中率归零。所以账号模式下传输错误直接返回 502。链式代理相反——不同路由是不同的上游主机，换一个确实可能通，那边照旧逐个尝试。
+- `OrderedAccounts(session, candidates)` 给出本会话的尝试顺序：粘性优先 → 最少在途 → 最久未使用 → 随机；冷却账号殿后，额度用满的再殿后一层。`Acquire`/`Release` 维护在途计数（响应彻底结束后释放），`MarkSuccess` 绑定粘性、`MarkFailure` 熔断+解绑。
 
 `accountPlansForRequest` 把排序后的候选逐个做成一个 `forwardPlan`（只挂候选账号，鉴权延后），`ServeHTTP` 复用与链式代理同一套 failover 循环（`failoverMode = chainMode || accountMode`）：某账号传输失败或返回 `>=400` 就自动顺位换下一个账号重试，同一请求只落一条 trace，记录的是最终命中账号的来源。每个候选真正尝试前才 `resolveAccountAuth`（按需刷新+解析 token），避免为用不到的候选浪费刷新。
 
@@ -323,7 +400,7 @@ OPENAI 页右上角两个批量按钮 = 对每个账号各点一次操作列的�
 - `api_routes`：路由页配置的第三方 API 供应商。字段 `name`、`base_url`、`model`、`api_style`（openai/anthropic）、`protocol`（chat_completions/responses/messages）、`api_key`、`enabled`。旧库通过 `ensureColumn` 补 `api_style`/`protocol`/`enabled` 三列。
 - `chain_proxies`：链式代理配置。字段 `name`、`api_style`、`route_ids`（JSON 数组，保存点击顺序）、`enabled`、`created_at`、`updated_at`。同一 `api_style` 至多一条启用；`route_ids` 里的路由必须属于同一 API 风格。
 - `api_keys`：「API Key 直连」用的 Key 配置，字段 `name`、`api_key`。请求头 key 命中其中任意一条即触发直连。
-- `openai_accounts`：通过 `libcodex_bridge` 动态库登录的 GPT 账号。账号摘要单独分列，完整 Codex `auth.json` 保存在 `auth_json`，额度结果保存在 `status_json`，列表 API 不返回鉴权字段。后续通过 `ensureColumn` 补的列：`token_expires_at`（access_token JWT 的 exp，用于主动刷新）、`refresh_error`（刷新永久失败原因）、`models_json`/`models_at`（缓存的模型目录）、`selected_model`/`selected_reasoning_effort`/`selected_service_tier`（页面选的模型配置）。
+- `openai_accounts`：通过 `libcodex_bridge` 动态库登录的 GPT 账号。账号摘要单独分列，完整 Codex `auth.json` 保存在 `auth_json`，额度结果保存在 `status_json`，列表 API 不返回鉴权字段。后续通过 `ensureColumn` 补的列：`token_expires_at`（access_token JWT 的 exp，用于主动刷新）、`refresh_error`（刷新永久失败原因）、`models_json`/`models_at`（缓存的模型目录）、`selected_model`/`selected_reasoning_effort`/`selected_service_tier`（页面选的模型配置）、`enabled`（页面「启用」开关，默认 1，关掉后不进转发候选集）。
 
 - `outlook_login_tokens`：Outlook 邮箱登录态。**权威 schema 归 `outlook-login-automation` skill**，本工程只用 `CREATE TABLE IF NOT EXISTS` 兜底建表（skill 没跑过时页面也能查）。主要列：`email`、`display_name`、`client_id`/`tenant_id`/`account_oid`/`home_account_id`、`scope`、`access_token`/`refresh_token`/`id_token`/`client_info`、各种过期时间（`token_issued_at`/`access_token_expires_at`/`refresh_token_expires_at`）、`cookies_json`/`cookie_count`/`user_agent`（静默刷新要用）、`last_refresh_status`/`last_refresh_error`。唯一键 `uniq_email_client_scope (email, client_id, scope(255))`。本工程通过 `ensureColumn` 补的列：`password`（手动新增/编辑填的明文登录密码，skill 的 upsert 不含此列不会覆盖）、`has_gpt_account`（是否已有同邮箱 GPT 账号，见「GPT 账号标记」）。
 
@@ -500,7 +577,7 @@ log/YYYY-MM-DD-{model}.log
 - `GET /openai`：GPT 账号管理页。
 - `GET /openai/accounts/{id}`：GPT 账号额度详情页。
 - `GET /api/openai/accounts`：GPT 账号列表，不包含鉴权 JSON。
-- `DELETE /api/openai/accounts/{id}`：删除 GPT 账号及其鉴权信息。
+- `DELETE /api/openai/accounts/{id}`：删除 GPT 账号及其鉴权信息，并**级联删掉 OUTLOOK 里同邮箱的邮箱记录**（含 token 与 cookie），返回 `outlook_deleted` 条数。两边本是同一个号的两半，留着孤儿邮箱记录只会让列表越攒越脏。邮箱为空时不级联——空串匹配不出「同一个人」，按空串删会把所有没邮箱的行全清掉。
 - `POST /api/openai/logins`：启动一次 Codex Bridge 动态库浏览器登录。
 - `GET /api/openai/logins/{id}`：查询登录状态。
 - `POST /api/openai/logins/{id}/cancel`：取消登录。
@@ -511,6 +588,8 @@ log/YYYY-MM-DD-{model}.log
 - `POST /api/openai/accounts/models-all`：异步拉取全部账号的模型目录，立即返回 `{ok,total}`；已有任务在跑返回 409。
 - `GET /api/openai/models-all`：批量拉模型任务的进度快照。
 - `POST /api/openai/accounts/{id}/settings`：保存该账号选的模型/推理强度/速度。
+- `POST /api/openai/accounts/{id}/toggle`：切换该账号的「启用」状态，返回切换后的值；停用的账号不进转发候选集。
+- `POST /api/openai/accounts/toggle-all`：顶部总开关，一次把所有账号设成启用或停用（`{"enabled":true|false}`），返回真正改动的行数。
 - `GET /outlook`：Outlook 邮箱账号管理页。
 - `GET /outlook/accounts/{id}`：该邮箱的邮件页。
 - `GET /api/outlook/accounts`：Outlook 账号列表（不含 token/cookie 明文）。
@@ -518,14 +597,20 @@ log/YYYY-MM-DD-{model}.log
 - `PUT /api/outlook/accounts/{id}`：修改邮箱 + 密码。
 - `DELETE /api/outlook/accounts/{id}`：删除该行（含 token 与 cookie）。
 - `GET /api/outlook/accounts/{id}/credentials`：读邮箱 + **明文密码**，供编辑弹窗回填。
+- `POST /api/outlook/logins`：拉起独立 Chrome 窗口开始手动登录，立即返回任务 id；已有任务在跑返回 409。
+- `GET /api/outlook/logins/{id}`：登录任务状态（`waiting` / `capturing` / `completed` / `failed` / `cancelled`）。
+- `POST /api/outlook/logins/{id}/cancel`：取消登录并关掉那个 Chrome 窗口。
 - `GET /api/outlook/valid-emails`：有 access token 且未过期的邮箱列表。
 - `GET /api/outlook/unregistered-emails`：还没注册 GPT 账号（`has_gpt_account=0`）的邮箱列表，按邮箱去重；`?valid=1` 只保留 token 未过期的。
 - `POST /api/outlook/accounts/{id}/refresh`：静默刷新该账号的 access + refresh token（同步，成功后回读该行）。
+- `POST /api/outlook/accounts/{id}/login`：行内「登录」，用该行存的邮箱 + 密码自动登录；没存密码返回 400，已有登录任务在跑返回 409。
 - `POST /api/outlook/accounts/refresh-all`：异步刷新全部有 token 的账号，立即返回 `{ok,total}`；已有任务在跑返回 409。
 - `GET /api/outlook/refresh-all`：一键刷新任务的进度快照（`running/total/done/ok/failed/errors`）。
 - `GET /api/outlook/accounts/{id}/messages`：邮件分页列表（`?folder=&top=&next=`）。
 - `GET /api/outlook/accounts/{id}/message`：单封邮件正文（`?mid=&bodyType=html|text`）。
 - `GET /api/outlook/mail/code`：按邮箱取最新一封邮件里的验证码（`?email=`）。
+- `POST /api/outlook/accounts/{id}/send`：用该账号发信（`{to,subject,body,body_type?}`），401 自动刷新一次重试。
+- `POST /api/outlook/mail/send`：无状态发信（`{to,subject,body,token,email?,body_type?}`），凭证由入参给；`token` 留空且有 `email` 时按邮箱查库。
 - `GET /stats/tokens`：Token 消耗详情图表页（`?dim=route|account|api_key&id=&name=`）。
 - `GET /api/stats/tokens`：Token 消耗时间序列与按模型拆分 JSON（`?dim=&id=&granularity=day|month|year`）。
 - `GET /healthz`：健康检查。

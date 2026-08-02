@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -51,7 +52,8 @@ func (p *proxyServer) handleAPIOpenAIAccountDelete(w http.ResponseWriter, r *htt
 		http.Error(w, "bad account id", http.StatusBadRequest)
 		return
 	}
-	if err := p.store.DeleteOpenAIAccount(r.Context(), id); err != nil {
+	outlookDeleted, err := p.store.DeleteOpenAIAccount(r.Context(), id)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "account not found", http.StatusNotFound)
 			return
@@ -59,7 +61,7 @@ func (p *proxyServer) handleAPIOpenAIAccountDelete(w http.ResponseWriter, r *htt
 		writeJSON(w, nil, err)
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true}, nil)
+	writeJSON(w, map[string]any{"ok": true, "outlook_deleted": outlookDeleted}, nil)
 }
 
 func (p *proxyServer) handleAPIOpenAIAccountRefresh(w http.ResponseWriter, r *http.Request) {
@@ -78,13 +80,13 @@ func (p *proxyServer) handleAPIOpenAIAccountRefresh(w http.ResponseWriter, r *ht
 // /wham/usage,并发太高容易触发上游限流,和 OUTLOOK 那边一样取 3。
 const openaiQuotaRefreshConcurrency = 3
 
-// handleAPIOpenAIRefreshAllQuota 一键刷新全部账号的额度:立即返回,刷新在后台并发跑
-// (等价于逐行点「额度」),前端轮询 GET /api/openai/refresh-all 看进度。已有任务在跑返回 409。
-func (p *proxyServer) handleAPIOpenAIRefreshAllQuota(w http.ResponseWriter, r *http.Request) {
-	accounts, err := p.store.ListOpenAIAccounts(r.Context())
+// startRefreshAllQuota 列出全部账号并在后台并发刷新它们的额度(等价于逐行点「额度」)。
+// 手动「刷新全部额度」和定时轮询共用这一份;同一时刻只跑一个任务(p.openaiJob 互斥),
+// 重叠触发时 started=false,调用方按需处理(手动→409,定时→跳过本次)。
+func (p *proxyServer) startRefreshAllQuota(ctx context.Context) (total int, started bool, err error) {
+	accounts, err := p.store.ListOpenAIAccounts(ctx)
 	if err != nil {
-		writeJSON(w, nil, err)
-		return
+		return 0, false, err
 	}
 	ids := make([]int64, 0, len(accounts))
 	labels := make(map[int64]string, len(accounts))
@@ -93,13 +95,80 @@ func (p *proxyServer) handleAPIOpenAIRefreshAllQuota(w http.ResponseWriter, r *h
 		labels[a.ID] = firstNonEmpty(a.Name, a.Email, a.AccountID)
 	}
 	// Refresh 内部自带 30s 超时,这里给 60s 兜底(含按需刷凭证 + 查额度两步)。
-	total, started := startBatchRefresh(p.openaiJob, ids, openaiQuotaRefreshConcurrency, 60*time.Second,
+	total, started = startBatchRefresh(p.openaiJob, ids, openaiQuotaRefreshConcurrency, 60*time.Second,
 		func(_ context.Context, id int64) error {
 			if err := p.openaiLogins.Refresh(id); err != nil {
 				return fmt.Errorf("%s：%w", orDefaultStr(labels[id], "?"), err)
 			}
 			return nil
 		})
+	return total, started, nil
+}
+
+// quotaAutoRefreshInterval 是定时刷新全部账号额度的间隔。让 100% 用满的账号能被及时标记,
+// 进而在账号选择时被剔除(见 accountPlansForRequest)。
+const quotaAutoRefreshInterval = 5 * time.Minute
+
+// settingQuotaAutoRefresh 是「定时刷新额度是否开启」的 app_settings 键("1"/"0")。
+const settingQuotaAutoRefresh = "quota_auto_refresh"
+
+// runQuotaAutoRefresh 后台每 quotaAutoRefreshInterval 刷新一次全部账号额度,直到 ctx 取消。
+// goroutine 常驻,每次 tick 先看开关(p.quotaAutoRefresh):关着就跳过本次、只保留心跳,
+// 这样开关一点就生效、不用重启。开着时启动后也立即先刷一次。
+// 与手动「刷新全部额度」共用一个任务实例,撞上手动任务在跑就跳过本次(started=false)。
+func (p *proxyServer) runQuotaAutoRefresh(ctx context.Context) {
+	ticker := time.NewTicker(quotaAutoRefreshInterval)
+	defer ticker.Stop()
+	for {
+		if p.quotaAutoRefresh.Load() {
+			if _, started, err := p.startRefreshAllQuota(ctx); err != nil {
+				log.Printf("定时刷新额度失败: %v", err)
+			} else if !started {
+				log.Printf("定时刷新额度: 已有刷新任务在进行中，跳过本次")
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// handleAPIOpenAIQuotaAutoRefresh 返回定时刷新开关的当前状态。
+func (p *proxyServer) handleAPIOpenAIQuotaAutoRefresh(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{"enabled": p.quotaAutoRefresh.Load()}, nil)
+}
+
+// handleAPIOpenAIQuotaAutoRefreshToggle 设置定时刷新开关(body {enabled:bool}),持久化到 app_settings。
+func (p *proxyServer) handleAPIOpenAIQuotaAutoRefreshToggle(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "invalid json body", http.StatusBadRequest)
+		return
+	}
+	p.quotaAutoRefresh.Store(in.Enabled)
+	val := "0"
+	if in.Enabled {
+		val = "1"
+	}
+	if err := p.store.SetSetting(r.Context(), settingQuotaAutoRefresh, val); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "enabled": in.Enabled}, nil)
+}
+
+// handleAPIOpenAIRefreshAllQuota 一键刷新全部账号的额度:立即返回,刷新在后台并发跑
+// (等价于逐行点「额度」),前端轮询 GET /api/openai/refresh-all 看进度。已有任务在跑返回 409。
+func (p *proxyServer) handleAPIOpenAIRefreshAllQuota(w http.ResponseWriter, r *http.Request) {
+	total, started, err := p.startRefreshAllQuota(r.Context())
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
 	if !started {
 		http.Error(w, "已有刷新任务在进行中", http.StatusConflict)
 		return
@@ -162,6 +231,42 @@ func (p *proxyServer) handleAPIOpenAIAccountModels(w http.ResponseWriter, r *htt
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "models": account.Models, "models_at": account.ModelsAt}, nil)
+}
+
+// handleAPIOpenAIAccountToggle 切换账号的启用状态。停用后该账号不再进入转发时的候选集。
+func (p *proxyServer) handleAPIOpenAIAccountToggle(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad account id", http.StatusBadRequest)
+		return
+	}
+	enabled, err := p.store.ToggleOpenAIAccount(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "account not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "enabled": enabled}, nil)
+}
+
+// handleAPIOpenAIAccountsToggleAll 顶部的总开关:一次把所有账号设成启用或停用。
+func (p *proxyServer) handleAPIOpenAIAccountsToggleAll(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	affected, err := p.store.SetAllOpenAIAccountsEnabled(r.Context(), input.Enabled)
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "enabled": input.Enabled, "affected": affected}, nil)
 }
 
 // handleAPIOpenAIAccountSettings 保存页面选择的模型 / 推理强度 / 速度档位。
@@ -263,6 +368,13 @@ const openAIHTML = `
     .cfg-stack>.cfg-select{font-size:13px;height:32px}
     .cfg-select:hover{border-color:#b8c7dc}
     .token-ok{color:#137a4d}.token-warn{color:#b06d12;font-weight:600}.token-bad{color:var(--red);font-weight:600}
+    .count-badge{margin-left:10px;font-size:13px;font-weight:600;color:var(--muted);background:#eef1f6;border-radius:999px;padding:3px 11px;vertical-align:2px}
+    .master-toggle{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--muted)}
+    .switch.mixed{background:#fff6e8;border-color:#f0cf9a;color:#a56b12}
+    /* 启用开关,与路由/链式代理页同款 */
+    .switch{display:inline-flex;align-items:center;justify-content:center;min-width:52px;height:30px;padding:0 14px;border-radius:16px;border:1px solid var(--line);background:#fff;color:var(--muted);font-weight:700;font-size:12px;cursor:pointer}
+    .switch:hover{border-color:#b8c7dc}.switch.on{background:var(--green);border-color:var(--green);color:#fff}.switch.on:hover{background:#0f8548}
+    tbody tr.off td{opacity:.55}tbody tr.off td:last-child,tbody tr.off td.switch-cell{opacity:1}
     .mini-quota{min-width:200px}.mini-line{font-size:12px;font-weight:600;white-space:nowrap}.mini-label{display:inline-block;color:#4b5563;font-weight:600;font-size:11px;padding:1px 8px;margin-right:6px;border-radius:999px;background:#eef1f6}.mini-progress{height:7px;border-radius:5px;background:#e8edf5;overflow:hidden;margin:8px 0 0;max-width:200px}.mini-progress:last-child{margin-bottom:0}.mini-progress span{display:block;height:100%;background:var(--blue)}.mini-reset{font-size:11px;color:var(--muted);margin-top:4px}.mini-line+.mini-progress+.mini-reset+.mini-line{margin-top:10px}.detail-btn{display:inline-flex;height:32px;align-items:center;padding:0 12px;margin-right:6px;border:1px solid var(--line);border-radius:7px;color:var(--text);text-decoration:none;background:#fff}
   </style>
 </head>
@@ -277,10 +389,11 @@ const openAIHTML = `
       <a class="nav-item active" href="/openai">OPENAI</a>
       <a class="nav-item" href="/outlook">OUTLOOK</a>
       <a class="nav-item" href="/api-keys">API Key</a>
+      <a class="nav-item" href="/herosms">HeroSMS</a>
     </nav>
   </aside>
   <main class="page">
-    <div class="top"><h1>OPENAI · GPT 账号</h1><button class="btn-primary" id="login-btn" type="button">+ 登录 GPT 账号</button><button id="refresh-all-btn" type="button" title="逐个刷新所有账号的额度(后台异步执行)">刷新全部额度</button><button id="models-all-btn" type="button" title="逐个拉取所有账号的可用模型目录(后台异步执行)">拉取全部模型</button></div>
+    <div class="top"><h1>OPENAI · GPT 账号<span class="count-badge" id="account-count"></span></h1><span class="master-toggle" title="每 5 分钟自动刷新一次全部账号额度；关掉后只在请求返回 429 时才补刷">定时刷额度<button class="switch" id="auto-refresh-toggle" type="button" disabled>-</button></span><span class="master-toggle">全部启用<button class="switch" id="toggle-all" type="button" disabled>-</button></span><button class="btn-primary" id="login-btn" type="button">+ 登录 GPT 账号</button><button id="refresh-all-btn" type="button" title="逐个刷新所有账号的额度(后台异步执行)">刷新全部额度</button><button id="models-all-btn" type="button" title="逐个拉取所有账号的可用模型目录(后台异步执行)">拉取全部模型</button></div>
     <div class="notice">登录由 Codex Bridge 发起。鉴权信息直接保存到 MySQL，页面和列表 API 不返回 token。右上角「刷新全部额度」「拉取全部模型」等于对每个账号各点一次「额度」「模型」，后台异步执行、互不影响，页面可继续操作。</div>
     <section class="panel">
       <div class="login-box" id="login-box">
@@ -289,7 +402,7 @@ const openAIHTML = `
         <div class="small" id="login-status"></div>
       </div>
       <table>
-        <thead><tr><th>名称</th><th>邮箱</th><th>ChatGPT Account ID</th><th>套餐</th><th>额度使用</th><th>Token 过期</th><th>模型配置</th><th>操作</th></tr></thead>
+        <thead><tr><th>名称</th><th>邮箱</th><th>ChatGPT Account ID</th><th>套餐</th><th>额度使用</th><th>Token 过期</th><th>模型配置</th><th>创建时间</th><th>启用</th><th>操作</th></tr></thead>
         <tbody id="account-rows"></tbody>
       </table>
       <div class="empty" id="empty">暂无 GPT 账号，点击右上角开始登录。</div>
@@ -306,8 +419,32 @@ const fmtTime=v=>v?new Date(v).toLocaleString('zh-CN',{hour12:false}):'';
 async function loadAccounts(){
   const rsp=await fetch('/api/openai/accounts',{cache:'no-store'});if(!rsp.ok)throw new Error(await rsp.text());
   const items=await rsp.json();const rows=document.getElementById('account-rows');
-  rows.innerHTML=(items||[]).map(item=>'<tr class="row-link" data-href="/stats/tokens?dim=account&id='+item.id+'&name='+encodeURIComponent(item.name||'')+'"><td>'+esc(item.name||'-')+'</td><td>'+esc(item.email||'-')+'</td><td><span class="account-id" title="'+esc(item.account_id)+'">'+esc(short(item.account_id))+'</span></td><td><span class="pill plan">'+esc(item.plan_type||'unknown')+'</span></td><td class="usage">'+usageText(item)+'</td><td>'+tokenText(item)+'</td>'+settingsCells(item)+'<td class="actions"><div class="act-grid"><a class="detail-btn" href="/openai/accounts/'+item.id+'">详情</a><button class="refresh-btn" data-refresh-id="'+item.id+'" type="button" title="刷新额度与 Token">额度</button><button class="models-btn" data-models-id="'+item.id+'" type="button" title="重新拉取可用模型">模型</button><button class="delete-btn" data-id="'+item.id+'" type="button">删除</button></div></td></tr>').join('');
+  rows.innerHTML=(items||[]).map(item=>'<tr class="row-link'+(item.enabled===false?' off':'')+'" data-href="/stats/tokens?dim=account&id='+item.id+'&name='+encodeURIComponent(item.name||'')+'"><td>'+esc(item.name||'-')+'</td><td>'+esc(item.email||'-')+'</td><td><span class="account-id" title="'+esc(item.account_id)+'">'+esc(short(item.account_id))+'</span></td><td><span class="pill plan">'+esc(item.plan_type||'unknown')+'</span></td><td class="usage">'+usageText(item)+'</td><td>'+tokenText(item)+'</td>'+settingsCells(item)+'<td class="small">'+esc(fmtTime(item.created_at))+'</td>'+enabledCell(item)+'<td class="actions"><div class="act-grid"><a class="detail-btn" href="/openai/accounts/'+item.id+'">详情</a><button class="refresh-btn" data-refresh-id="'+item.id+'" type="button" title="刷新额度与 Token">额度</button><button class="models-btn" data-models-id="'+item.id+'" type="button" title="重新拉取可用模型">模型</button><button class="delete-btn" data-id="'+item.id+'" type="button">删除</button></div></td></tr>').join('');
   document.getElementById('empty').style.display=items&&items.length?'none':'block';
+  const total=(items||[]).length;
+  document.getElementById('account-count').textContent=total?'共 '+total+' 个账号':'';
+  syncMasterToggle(items||[]);
+}
+// syncMasterToggle 让顶部总开关跟随当前列表:全开显示「是」、全关显示「否」、
+// 混合显示「部分」。点击时全开就全关,否则一律全开——三态里只有这一种映射不会有歧义。
+function syncMasterToggle(items){
+  const button=document.getElementById('toggle-all');
+  const total=items.length;
+  const on=items.filter(i=>i.enabled!==false).length;
+  const allOn=total>0&&on===total, allOff=total>0&&on===0;
+  button.disabled=total===0;
+  button.textContent=total?(allOn?'是':allOff?'否':'部分'):'-';
+  button.classList.toggle('on',allOn);
+  button.classList.toggle('mixed',total>0&&!allOn&&!allOff);
+  button.dataset.next=allOn?'0':'1';
+  button.title=total?(allOn?'点击停用全部账号':'点击启用全部账号（当前 '+on+'/'+total+' 启用）'):'暂无账号';
+}
+// enabledCell 渲染「启用」开关。关掉的账号不参与转发时的账号选择(后端在
+// OpenAIAccountsForModel 里就过滤掉了),页面上整行淡化提示。
+function enabledCell(item){
+  const on=item.enabled!==false;
+  const tip=on?'点击停用：停用后该账号不再被请求选中':'点击启用';
+  return '<td class="switch-cell"><button class="switch'+(on?' on':'')+'" data-toggle-id="'+item.id+'" type="button" title="'+esc(tip)+'">'+(on?'是':'否')+'</button></td>';
 }
 // tokenText 展示 access_token 过期时间:已过期/即将过期(1小时内)标红或标黄;
 // refresh_error 非空说明刷新被上游永久拒绝,必须重新登录。
@@ -354,12 +491,17 @@ function settingsCells(item){
   if(!models.length)return '<td><span class="small">未拉取，点「拉取模型」</span></td>';
   const model=currentModel(item);
   const modelOpts=models.map(m=>({value:m.model,label:m.display_name||m.model}));
+  // 库里存的模型不在该账号的目录里(换过套餐、或早期拉到过别的目录)时,currentModel 会
+  // 静默回落到目录默认模型,下拉就显示成了另一个模型——而转发仍按库里那个值匹配,
+  // 结果是「页面看着配好了、实际永远选不中这个账号」。这里把陈旧值原样列出来暴露掉。
+  const staleModel=item.selected_model&&!models.some(m=>m.model===item.selected_model)?item.selected_model:'';
+  if(staleModel)modelOpts.unshift({value:staleModel,label:'⚠ '+staleModel+'（该账号无此模型，不会被选中）'});
   const effortOpts=((model&&model.supported_reasoning_efforts)||[]).map(e=>({value:e.effort,label:EFFORT_LABEL[e.effort]||e.effort}));
   const tierOpts=tierOptions(model).map(t=>({value:t.id,label:t.name}));
   const effort=item.selected_reasoning_effort||(model&&model.default_reasoning_effort)||'';
   const tier=item.selected_service_tier||(model&&model.default_service_tier)||'default';
   return '<td><div class="cfg-stack">'+
-    selectHTML(item.id,'selected_model',modelOpts,model?model.model:'',false)+
+    selectHTML(item.id,'selected_model',modelOpts,staleModel||(model?model.model:''),false)+
     '<div class="cfg-row">'+
       '<label class="cfg-item"><span>推理</span>'+selectHTML(item.id,'selected_reasoning_effort',effortOpts,effort,false)+'</label>'+
       '<label class="cfg-item"><span>速度</span>'+selectHTML(item.id,'selected_service_tier',tierOpts,tier,false)+'</label>'+
@@ -458,9 +600,58 @@ function setupBatchButton(opts){
 }
 setupBatchButton({btnId:'refresh-all-btn',startURL:'/api/openai/accounts/refresh-all',statusURL:'/api/openai/refresh-all',label:'刷新全部额度',busyLabel:'刷新中',doneLabel:'刷新完成'});
 setupBatchButton({btnId:'models-all-btn',startURL:'/api/openai/accounts/models-all',statusURL:'/api/openai/models-all',label:'拉取全部模型',busyLabel:'拉取中',doneLabel:'拉取完成'});
-document.getElementById('account-rows').addEventListener('click',async event=>{const button=event.target.closest('.delete-btn');if(!button||!confirm('确认删除这个 GPT 账号及其数据库鉴权信息吗？'))return;const rsp=await fetch('/api/openai/accounts/'+button.dataset.id,{method:'DELETE'});if(!rsp.ok){alert('删除失败：'+await rsp.text());return}loadAccounts()});
+document.getElementById('account-rows').addEventListener('click',async event=>{
+  const button=event.target.closest('.delete-btn');
+  if(!button||!confirm('确认删除这个 GPT 账号吗？\n\n账号的数据库鉴权信息会一并删除；如果 OUTLOOK 里有同邮箱的邮箱记录（含 token 与 cookie），也会一起删掉。'))return;
+  const rsp=await fetch('/api/openai/accounts/'+button.dataset.id,{method:'DELETE'});
+  if(!rsp.ok){alert('删除失败：'+await rsp.text());return}
+  const result=await rsp.json().catch(()=>({}));
+  if(result.outlook_deleted)alert('已删除，同时清掉了 '+result.outlook_deleted+' 条同邮箱的 OUTLOOK 记录。');
+  loadAccounts();
+});
 // 整行点击跳转到该账号的 token 消耗统计页(点到按钮/链接/下拉等交互控件时不跳转)。
 document.getElementById('account-rows').addEventListener('click',event=>{if(event.target.closest('a,button,input,select'))return;const row=event.target.closest('tr[data-href]');if(row)location.href=row.dataset.href});
+// 顶部总开关:全开→全关要确认(会让所有请求都失败),其余方向直接全开。
+document.getElementById('toggle-all').addEventListener('click',async()=>{
+  const button=document.getElementById('toggle-all');
+  const enable=button.dataset.next==='1';
+  if(!enable&&!confirm('确认停用全部 GPT 账号吗？\n\n停用后所有走 API Key 直连的请求都会因为「没有已启用的账号」而失败，直到重新启用。'))return;
+  button.disabled=true;
+  try{
+    const rsp=await fetch('/api/openai/accounts/toggle-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enable})});
+    if(!rsp.ok)throw new Error(await rsp.text());
+    await loadAccounts();
+  }catch(err){alert('批量切换启用状态失败：'+err.message);button.disabled=false}
+});
+// 定时刷额度开关:读当前状态渲染,点一下即切并持久化。
+const autoRefreshBtn=document.getElementById('auto-refresh-toggle');
+function renderAutoRefresh(on){
+  autoRefreshBtn.disabled=false;
+  autoRefreshBtn.textContent=on?'开':'关';
+  autoRefreshBtn.classList.toggle('on',on);
+  autoRefreshBtn.dataset.next=on?'0':'1';
+}
+fetch('/api/openai/quota-auto-refresh',{cache:'no-store'}).then(r=>r.json()).then(s=>renderAutoRefresh(!!s.enabled)).catch(()=>{});
+autoRefreshBtn.addEventListener('click',async()=>{
+  const enable=autoRefreshBtn.dataset.next==='1';
+  autoRefreshBtn.disabled=true;
+  try{
+    const rsp=await fetch('/api/openai/quota-auto-refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enable})});
+    if(!rsp.ok)throw new Error(await rsp.text());
+    const s=await rsp.json();renderAutoRefresh(!!s.enabled);
+  }catch(err){alert('切换定时刷新失败：'+err.message);autoRefreshBtn.disabled=false}
+});
+// 启用开关:点一下即切,无二次确认(和路由页一致)
+document.getElementById('account-rows').addEventListener('click',async event=>{
+  const button=event.target.closest('.switch');if(!button)return;
+  button.disabled=true;
+  try{
+    const rsp=await fetch('/api/openai/accounts/'+button.dataset.toggleId+'/toggle',{method:'POST'});
+    if(!rsp.ok)throw new Error(await rsp.text());
+    await loadAccounts();
+  }catch(err){alert('切换启用状态失败：'+err.message)}
+  finally{button.disabled=false}
+});
 document.getElementById('account-rows').addEventListener('click',async event=>{
   const button=event.target.closest('.refresh-btn');if(!button)return;
   const label=button.textContent;button.disabled=true;button.textContent='…';
@@ -517,7 +708,7 @@ const openAIAccountHTML = `
     :root{--bg:#f6f7fb;--panel:#fff;--line:#dfe5ee;--text:#20242c;--muted:#6f7787;--blue:#2f6fed;--red:#c94040;--purple:#6750d8}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}.app{display:flex;min-height:100vh}.sidebar{width:208px;flex-shrink:0;background:#fff;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;height:100vh}.brand{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:.06em;padding:12px}.nav-item{display:block;padding:10px 12px;border-radius:8px;color:var(--text);font-weight:500;margin-bottom:4px;text-decoration:none}.nav-item:hover{background:#eef2fa}.nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}.page{flex:1;min-width:0;padding:22px 28px 56px}.top{display:flex;align-items:center;gap:14px}.top h1{font-size:18px;margin:0;flex:1}.back{color:var(--blue);text-decoration:none}.account-summary{margin-top:18px;padding:16px 18px;background:#fff;border:1px solid var(--line);border-radius:8px;display:flex;gap:28px;flex-wrap:wrap}.summary-item span{display:block;font-size:12px;color:var(--muted)}.summary-item strong{display:block;margin-top:3px}.quota-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:16px}.quota-card{border:1px solid var(--line);border-radius:8px;padding:15px 17px;background:#fff;min-width:0}.quota-card h2{font-size:14px;margin:0 0 10px}.kv{display:grid;grid-template-columns:minmax(105px,auto) minmax(0,1fr);gap:6px 12px;font-size:12px}.kv .key{color:var(--muted)}.kv div:nth-child(even){overflow-wrap:anywhere}.progress{height:9px;border-radius:6px;background:#e5eaf3;overflow:hidden;margin:10px 0}.progress span{display:block;height:100%;background:var(--blue)}.window-title{font-size:17px;font-weight:700}.window-label{float:right;font-size:12px;color:var(--muted);font-weight:600}.credit{padding:10px 0;border-top:1px solid #e8ebf1}.credit:first-of-type{border-top:0}.raw-status{margin-top:16px;background:#fff;border:1px solid var(--line);border-radius:8px;padding:14px 16px}.raw-status summary{cursor:pointer;color:var(--blue);font-weight:600}.raw-status pre{white-space:pre-wrap;word-break:break-word;max-height:520px;overflow:auto;background:#111827;color:#d7e0ee;padding:14px;border-radius:7px;font-size:11px}.error{color:var(--red)}
   </style>
 </head>
-<body><div class="app"><aside class="sidebar"><div class="brand">AGENT-GO-PROXY</div><nav><a class="nav-item" href="/">Dashboard</a><a class="nav-item" href="/routes">路由</a><a class="nav-item" href="/chains">链式代理</a><a class="nav-item active" href="/openai">OPENAI</a><a class="nav-item" href="/outlook">OUTLOOK</a><a class="nav-item" href="/api-keys">API Key</a></nav></aside><main class="page"><div class="top"><a class="back" href="/openai">← 返回账号列表</a><h1>GPT 账号额度详情</h1></div><div id="content"></div></main></div>
+<body><div class="app"><aside class="sidebar"><div class="brand">AGENT-GO-PROXY</div><nav><a class="nav-item" href="/">Dashboard</a><a class="nav-item" href="/routes">路由</a><a class="nav-item" href="/chains">链式代理</a><a class="nav-item active" href="/openai">OPENAI</a><a class="nav-item" href="/outlook">OUTLOOK</a><a class="nav-item" href="/api-keys">API Key</a><a class="nav-item" href="/herosms">HeroSMS</a></nav></aside><main class="page"><div class="top"><a class="back" href="/openai">← 返回账号列表</a><h1>GPT 账号额度详情</h1></div><div id="content"></div></main></div>
 <script>
 const account={{toJSON .}};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));

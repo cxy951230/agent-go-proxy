@@ -139,6 +139,56 @@ type OpenAIAccount struct {
 	StatusAt                time.Time `json:"status_at,omitempty"`
 	CreatedAt               time.Time `json:"created_at"`
 	UpdatedAt               time.Time `json:"updated_at"`
+	// Enabled 是页面上的「启用」开关。关掉的账号不参与转发时的账号选择。
+	Enabled bool `json:"enabled"`
+	// QuotaExhausted 表示最近一次拉取的额度里已有窗口用满(used_percent>=100)。
+	// 这类账号打过去必然 429,选择时直接剔除(全满时兜底保留,见 accountPlansForRequest)。
+	QuotaExhausted bool `json:"quota_exhausted"`
+}
+
+// quotaWindow / quotaStatus 只取判断「额度是否用满」需要的字段,
+// status_json 的其余内容由页面自己渲染,这里不关心。
+type quotaWindow struct {
+	UsedPercent *float64 `json:"used_percent"`
+}
+
+type quotaStatus struct {
+	Usage struct {
+		RateLimit struct {
+			Primary   *quotaWindow `json:"primary_window"`
+			Secondary *quotaWindow `json:"secondary_window"`
+		} `json:"rate_limit"`
+	} `json:"usage"`
+}
+
+// quotaMaxUsedPercent 返回额度快照里各窗口 used_percent 的最大值。free 账号只有月窗口,
+// plus/pro 还有 5 小时 / 周窗口,任一窗口满了请求都会被 429,所以取「最大」。
+// ok=false 表示没有额度数据(未拉取 / 解析失败 / 无窗口)——「未知」不等于「用满」。
+func quotaMaxUsedPercent(statusRaw string) (float64, bool) {
+	statusRaw = strings.TrimSpace(statusRaw)
+	if statusRaw == "" || statusRaw == "null" {
+		return 0, false
+	}
+	var parsed quotaStatus
+	if json.Unmarshal([]byte(statusRaw), &parsed) != nil {
+		return 0, false
+	}
+	max, found := 0.0, false
+	for _, window := range []*quotaWindow{parsed.Usage.RateLimit.Primary, parsed.Usage.RateLimit.Secondary} {
+		if window != nil && window.UsedPercent != nil {
+			found = true
+			if *window.UsedPercent > max {
+				max = *window.UsedPercent
+			}
+		}
+	}
+	return max, found
+}
+
+// quotaExhausted 判断这份额度快照里是否已有窗口用满(used_percent>=100)。
+func quotaExhausted(statusRaw string) bool {
+	pct, ok := quotaMaxUsedPercent(statusRaw)
+	return ok && pct >= 100
 }
 
 // APIRoute 是「路由」页配置的第三方 API 供应商,保存 Base URL / Model / API Key。
@@ -377,6 +427,12 @@ func (s *Store) migrate(ctx context.Context) error {
 				updated_at DATETIME(6) NOT NULL,
 				INDEX idx_api_keys_updated_at (updated_at)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		// app_settings 是通用键值设置表(目前存「定时刷新额度是否开启」)。
+		`CREATE TABLE IF NOT EXISTS app_settings (
+				k VARCHAR(128) NOT NULL PRIMARY KEY,
+				v TEXT NOT NULL,
+				updated_at DATETIME(6) NOT NULL
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 		`CREATE TABLE IF NOT EXISTS openai_accounts (
 			id BIGINT AUTO_INCREMENT PRIMARY KEY,
 			name VARCHAR(128) NOT NULL DEFAULT '',
@@ -494,6 +550,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		{"selected_model", "VARCHAR(128) NOT NULL DEFAULT ''"},
 		{"selected_reasoning_effort", "VARCHAR(32) NOT NULL DEFAULT ''"},
 		{"selected_service_tier", "VARCHAR(64) NOT NULL DEFAULT ''"},
+		// enabled:页面上的「启用」开关。默认 1,老数据自动全部启用。
+		{"enabled", "TINYINT(1) NOT NULL DEFAULT 1"},
 	} {
 		if err := s.ensureColumn(ctx, "openai_accounts", col[0], col[1]); err != nil {
 			return err
@@ -521,6 +579,36 @@ func (s *Store) UpdateOpenAIAccountModels(ctx context.Context, id int64, modelsJ
 	_, err := s.db.ExecContext(ctx, `UPDATE openai_accounts SET models_json=?, models_at=? WHERE id=?`,
 		modelsJSON, time.Now(), id)
 	return err
+}
+
+// ToggleOpenAIAccount 切换账号的启用状态,返回切换后的值。
+// 只改 enabled 不动 updated_at:这是一次纯开关操作,不该算作账号内容更新。
+func (s *Store) ToggleOpenAIAccount(ctx context.Context, id int64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var enabled bool
+	if err := tx.QueryRowContext(ctx, `SELECT enabled FROM openai_accounts WHERE id=? FOR UPDATE`, id).Scan(&enabled); err != nil {
+		return false, err
+	}
+	next := !enabled
+	if _, err := tx.ExecContext(ctx, `UPDATE openai_accounts SET enabled=? WHERE id=?`, next, id); err != nil {
+		return false, err
+	}
+	return next, tx.Commit()
+}
+
+// SetAllOpenAIAccountsEnabled 批量把所有账号设成启用/停用,返回真正改动的行数。
+// 带 `enabled<>?` 是为了只动状态不一致的行,避免无谓写入。
+func (s *Store) SetAllOpenAIAccountsEnabled(ctx context.Context, enabled bool) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE openai_accounts SET enabled=? WHERE enabled<>?`, enabled, enabled)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // UpdateOpenAIAccountSettings 保存页面上选择的模型 / 推理强度 / 速度档位。
@@ -589,12 +677,13 @@ func (s *Store) GetOpenAIAccount(ctx context.Context, id int64) (OpenAIAccount, 
 	var modelsRaw sql.NullString
 	var modelsAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `SELECT id, name, email, account_id, plan_type, auth_json, codex_commit, status_json, status_error, status_at, token_expires_at, refresh_error,
-		models_json, models_at, selected_model, selected_reasoning_effort, selected_service_tier, created_at, updated_at
+		models_json, models_at, selected_model, selected_reasoning_effort, selected_service_tier, enabled, created_at, updated_at
 		FROM openai_accounts WHERE id=?`, id).Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.AuthJSON, &account.CodexCommit, &statusRaw, &account.StatusError, &statusAt, &expiresAt, &refreshError,
-		&modelsRaw, &modelsAt, &account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier, &account.CreatedAt, &account.UpdatedAt)
+		&modelsRaw, &modelsAt, &account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier, &account.Enabled, &account.CreatedAt, &account.UpdatedAt)
 	if err != nil {
 		return account, err
 	}
+	account.QuotaExhausted = quotaExhausted(statusRaw)
 	account.Models = decodeModelsJSON(modelsRaw)
 	if modelsAt.Valid {
 		account.ModelsAt = modelsAt.Time
@@ -627,8 +716,8 @@ func (s *Store) UpdateOpenAIAccountStatus(ctx context.Context, id int64, statusJ
 
 func (s *Store) ListOpenAIAccounts(ctx context.Context) ([]OpenAIAccount, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, email, account_id, plan_type, codex_commit, status_json, status_error, status_at, token_expires_at, refresh_error,
-		models_json, models_at, selected_model, selected_reasoning_effort, selected_service_tier, created_at, updated_at
-		FROM openai_accounts ORDER BY updated_at DESC, id DESC`)
+		models_json, models_at, selected_model, selected_reasoning_effort, selected_service_tier, enabled, created_at, updated_at
+		FROM openai_accounts ORDER BY created_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -640,9 +729,10 @@ func (s *Store) ListOpenAIAccounts(ctx context.Context) ([]OpenAIAccount, error)
 		var statusAt, expiresAt, modelsAt sql.NullTime
 		var refreshError, modelsRaw sql.NullString
 		if err := rows.Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.CodexCommit, &statusRaw, &account.StatusError, &statusAt, &expiresAt, &refreshError,
-			&modelsRaw, &modelsAt, &account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier, &account.CreatedAt, &account.UpdatedAt); err != nil {
+			&modelsRaw, &modelsAt, &account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier, &account.Enabled, &account.CreatedAt, &account.UpdatedAt); err != nil {
 			return nil, err
 		}
+		account.QuotaExhausted = quotaExhausted(statusRaw)
 		if expiresAt.Valid {
 			account.TokenExpiresAt = expiresAt.Time
 		}
@@ -715,19 +805,34 @@ func (s *Store) UpsertOpenAIAccount(ctx context.Context, account OpenAIAccount) 
 	return id, err
 }
 
-func (s *Store) DeleteOpenAIAccount(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM openai_accounts WHERE id=?`, id)
+// DeleteOpenAIAccount 删除 GPT 账号,并把 OUTLOOK 里同邮箱的邮箱记录(含 token 与 cookie)
+// 一并删掉——这两边本来就是同一个号的两半,留着孤儿邮箱记录只会让列表越攒越脏。
+// 返回顺带删掉的 outlook 行数,供页面提示。
+//
+// 邮箱为空时**不做级联**:空串匹配不出「同一个人」,一旦按空串删会把所有没邮箱的行全清掉。
+func (s *Store) DeleteOpenAIAccount(ctx context.Context, id int64) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
+	defer tx.Rollback()
+
+	var email string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(email,'') FROM openai_accounts WHERE id=? FOR UPDATE`, id).Scan(&email); err != nil {
+		return 0, err // 不存在时是 sql.ErrNoRows,由上层转 404
 	}
-	if affected == 0 {
-		return sql.ErrNoRows
+	if _, err := tx.ExecContext(ctx, `DELETE FROM openai_accounts WHERE id=?`, id); err != nil {
+		return 0, err
 	}
-	return nil
+	var outlookDeleted int64
+	if email = strings.TrimSpace(email); email != "" {
+		res, err := tx.ExecContext(ctx, `DELETE FROM outlook_login_tokens WHERE email=?`, email)
+		if err != nil {
+			return 0, err
+		}
+		outlookDeleted, _ = res.RowsAffected()
+	}
+	return outlookDeleted, tx.Commit()
 }
 
 func (s *Store) ensureColumn(ctx context.Context, tableName, columnName, definition string) error {
@@ -1515,6 +1620,28 @@ func (s *Store) DeleteAPIRoute(ctx context.Context, id int64) error {
 	return nil
 }
 
+// GetSetting 读通用设置;不存在返回 def(不报错)。
+func (s *Store) GetSetting(ctx context.Context, key, def string) (string, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx, `SELECT v FROM app_settings WHERE k=?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return def, nil
+	}
+	if err != nil {
+		return def, err
+	}
+	return v, nil
+}
+
+// SetSetting 写通用设置(upsert)。
+func (s *Store) SetSetting(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO app_settings (k, v, updated_at) VALUES (?,?,?)
+		 ON DUPLICATE KEY UPDATE v=VALUES(v), updated_at=VALUES(updated_at)`,
+		key, value, time.Now())
+	return err
+}
+
 func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, api_key, created_at, updated_at
 		FROM api_keys ORDER BY updated_at DESC, id DESC`)
@@ -1566,16 +1693,18 @@ func (s *Store) OpenAIAccountForModel(ctx context.Context, model string) (OpenAI
 	return s.queryOpenAIAccount(ctx, "WHERE LOWER(selected_model)=LOWER(?)", model)
 }
 
-// OpenAIAccountsForModel 返回所有把 selected_model 设为该模型的账号(含 AuthJSON),
-// 供负载均衡在候选集里挑选。空模型或无候选返回空切片。按 id 升序,保证候选顺序稳定。
+// OpenAIAccountsForModel 返回所有把 selected_model 设为该模型、**且已启用**的账号
+// (含 AuthJSON),供负载均衡在候选集里挑选。关掉「启用」的账号直接不进候选,
+// 额度用满的账号仍会返回但带 QuotaExhausted 标记,由 accountPool 沉到最底。
+// 空模型或无候选返回空切片。按 id 升序,保证候选顺序稳定。
 func (s *Store) OpenAIAccountsForModel(ctx context.Context, model string) ([]OpenAIAccount, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, email, account_id, plan_type, auth_json, token_expires_at, refresh_error,
-		selected_model, selected_reasoning_effort, selected_service_tier
-		FROM openai_accounts WHERE LOWER(selected_model)=LOWER(?) ORDER BY id`, model)
+		selected_model, selected_reasoning_effort, selected_service_tier, status_json
+		FROM openai_accounts WHERE LOWER(selected_model)=LOWER(?) AND enabled=1 ORDER BY id`, model)
 	if err != nil {
 		return nil, err
 	}
@@ -1585,10 +1714,13 @@ func (s *Store) OpenAIAccountsForModel(ctx context.Context, model string) ([]Ope
 		var account OpenAIAccount
 		var expiresAt sql.NullTime
 		var refreshError sql.NullString
+		var statusRaw string
 		if err := rows.Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.AuthJSON, &expiresAt, &refreshError,
-			&account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier); err != nil {
+			&account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier, &statusRaw); err != nil {
 			return nil, err
 		}
+		account.Enabled = true
+		account.QuotaExhausted = quotaExhausted(statusRaw)
 		if expiresAt.Valid {
 			account.TokenExpiresAt = expiresAt.Time
 		}
@@ -2009,6 +2141,9 @@ type OutlookAccount struct {
 	// outlook_login_tokens.has_gpt_account 列里。为 0 的行每次列表查询仍会关联
 	// openai_accounts 复算一次,一旦算出 1 就回写该列(只 0→1,不回退)。
 	HasGPTAccount bool `json:"has_gpt_account"`
+	// HasPassword 表示这行存了明文登录密码。只返回「有没有」,不返回密码本身,
+	// 供页面决定行内「登录」按钮能不能点(自动登录需要密码)。
+	HasPassword bool `json:"has_password"`
 }
 
 // ListOutlookAccounts 列出所有已登录的 Outlook 账号(不含任何 token/cookie 明文)。
@@ -2022,8 +2157,9 @@ func (s *Store) ListOutlookAccounts(ctx context.Context) ([]OutlookAccount, erro
 		COALESCE(t.last_refresh_status,''), COALESCE(t.last_refresh_error,''), t.created_at, t.updated_at,
 		t.has_gpt_account,
 		CASE WHEN t.has_gpt_account=1 THEN 1
-			ELSE EXISTS(SELECT 1 FROM openai_accounts oa WHERE oa.email = t.email AND oa.email <> '') END
-		FROM outlook_login_tokens t ORDER BY t.updated_at DESC, t.id DESC`)
+			ELSE EXISTS(SELECT 1 FROM openai_accounts oa WHERE oa.email = t.email AND oa.email <> '') END,
+		CHAR_LENGTH(COALESCE(t.password,'')) > 0
+		FROM outlook_login_tokens t ORDER BY t.created_at DESC, t.id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -2033,15 +2169,16 @@ func (s *Store) ListOutlookAccounts(ctx context.Context) ([]OutlookAccount, erro
 	for rows.Next() {
 		var a OutlookAccount
 		var issuedAt, accessExp, refreshExp sql.NullTime
-		var storedGPT, hasGPT int64
+		var storedGPT, hasGPT, hasPassword int64
 		if err := rows.Scan(&a.ID, &a.Email, &a.DisplayName, &a.TenantID, &a.Scope,
 			&a.TokenType, &a.AccessTokenLen, &a.RefreshTokenLen,
 			&a.ExpiresIn, &a.RefreshTokenExpiresIn, &a.CookieCount,
 			&issuedAt, &accessExp, &refreshExp,
-			&a.LastRefreshStatus, &a.LastRefreshError, &a.CreatedAt, &a.UpdatedAt, &storedGPT, &hasGPT); err != nil {
+			&a.LastRefreshStatus, &a.LastRefreshError, &a.CreatedAt, &a.UpdatedAt, &storedGPT, &hasGPT, &hasPassword); err != nil {
 			return nil, err
 		}
 		a.HasGPTAccount = hasGPT != 0
+		a.HasPassword = hasPassword != 0
 		if storedGPT == 0 && a.HasGPTAccount {
 			backfill = append(backfill, a.ID)
 		}
@@ -2067,7 +2204,7 @@ func (s *Store) ListOutlookAccounts(ctx context.Context) ([]OutlookAccount, erro
 }
 
 // markOutlookHasGPT 把这些行的 has_gpt_account 刷成 1。显式写 updated_at=updated_at,
-// 避免 ON UPDATE CURRENT_TIMESTAMP 把「更新时间」刷新、导致列表排序乱跳。
+// 避免 ON UPDATE CURRENT_TIMESTAMP 把「更新时间」刷成这次纯内部回写的时刻。
 func (s *Store) markOutlookHasGPT(ctx context.Context, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
@@ -2084,10 +2221,10 @@ func (s *Store) markOutlookHasGPT(ctx context.Context, ids []int64) error {
 }
 
 // ListOutlookRefreshableIDs 列出「有 access token」的账号主键,供一键刷新全部 Token 用。
-// 顺序与列表页一致(最近更新在前),便于前端进度和页面顺序对得上。
+// 顺序与列表页一致(最近创建在前),便于前端进度和页面顺序对得上。
 func (s *Store) ListOutlookRefreshableIDs(ctx context.Context) ([]int64, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM outlook_login_tokens
-		WHERE COALESCE(access_token,'') <> '' ORDER BY updated_at DESC, id DESC`)
+		WHERE COALESCE(access_token,'') <> '' ORDER BY created_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -2116,7 +2253,8 @@ func (s *Store) GetOutlookAccountByID(ctx context.Context, id int64) (OutlookAcc
 		COALESCE(token_type,''), COALESCE(CHAR_LENGTH(access_token),0), COALESCE(CHAR_LENGTH(refresh_token),0),
 		COALESCE(expires_in,0), COALESCE(refresh_token_expires_in,0), COALESCE(cookie_count,0),
 		token_issued_at, access_token_expires_at, refresh_token_expires_at,
-		COALESCE(last_refresh_status,''), COALESCE(last_refresh_error,''), created_at, updated_at, has_gpt_account
+		COALESCE(last_refresh_status,''), COALESCE(last_refresh_error,''), created_at, updated_at, has_gpt_account,
+		CHAR_LENGTH(COALESCE(password,'')) > 0
 		FROM outlook_login_tokens WHERE id=?`, id)
 	if err != nil {
 		return OutlookAccount{}, err
@@ -2130,15 +2268,16 @@ func (s *Store) GetOutlookAccountByID(ctx context.Context, id int64) (OutlookAcc
 	}
 	var a OutlookAccount
 	var issuedAt, accessExp, refreshExp sql.NullTime
-	var hasGPT int64
+	var hasGPT, hasPassword int64
 	if err := rows.Scan(&a.ID, &a.Email, &a.DisplayName, &a.TenantID, &a.Scope,
 		&a.TokenType, &a.AccessTokenLen, &a.RefreshTokenLen,
 		&a.ExpiresIn, &a.RefreshTokenExpiresIn, &a.CookieCount,
 		&issuedAt, &accessExp, &refreshExp,
-		&a.LastRefreshStatus, &a.LastRefreshError, &a.CreatedAt, &a.UpdatedAt, &hasGPT); err != nil {
+		&a.LastRefreshStatus, &a.LastRefreshError, &a.CreatedAt, &a.UpdatedAt, &hasGPT, &hasPassword); err != nil {
 		return OutlookAccount{}, err
 	}
 	a.HasGPTAccount = hasGPT != 0
+	a.HasPassword = hasPassword != 0
 	if issuedAt.Valid {
 		a.TokenIssuedAt = issuedAt.Time
 	}
@@ -2198,9 +2337,20 @@ type outlookTokenUpdate struct {
 	CookieCount           int
 }
 
+// sqlExecer 让同一段 SQL 既能走 *sql.DB 也能走事务里的 *sql.Tx。
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // UpdateOutlookTokens 把刷新拿到的新 token 与续期后的 cookie 写回指定行。
 func (s *Store) UpdateOutlookTokens(ctx context.Context, id int64, u outlookTokenUpdate) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE outlook_login_tokens SET
+	return updateOutlookTokenRow(ctx, s.db, id, u, "refreshed")
+}
+
+// updateOutlookTokenRow 把一组 token 字段写到指定行。status 落 last_refresh_status:
+// 静默刷新是 refreshed,手动登录抓取是 login_captured(与 skill 写入的取值保持一致)。
+func updateOutlookTokenRow(ctx context.Context, ex sqlExecer, id int64, u outlookTokenUpdate, status string) error {
+	res, err := ex.ExecContext(ctx, `UPDATE outlook_login_tokens SET
 			token_type=?, scope=?, access_token=?, refresh_token=?, id_token=?, client_info=?,
 			expires_in=?, ext_expires_in=?, refresh_token_expires_in=?,
 			token_issued_at=?, access_token_expires_at=?, refresh_token_expires_at=?,
@@ -2209,7 +2359,7 @@ func (s *Store) UpdateOutlookTokens(ctx context.Context, id int64, u outlookToke
 			tenant_id=IF(?='', tenant_id, ?),
 			account_oid=IF(?='', account_oid, ?),
 			home_account_id=IF(?='', home_account_id, ?),
-			last_refresh_status='refreshed', last_refresh_error=NULL
+			last_refresh_status=?, last_refresh_error=NULL
 		WHERE id=?`,
 		u.TokenType, u.Scope, u.AccessToken, u.RefreshToken, u.IDToken, u.ClientInfo,
 		nullInt(u.ExpiresIn), nullInt(u.ExtExpiresIn), nullInt(u.RefreshTokenExpiresIn),
@@ -2219,7 +2369,7 @@ func (s *Store) UpdateOutlookTokens(ctx context.Context, id int64, u outlookToke
 		u.TenantID, u.TenantID,
 		u.AccountOID, u.AccountOID,
 		u.HomeAccountID, u.HomeAccountID,
-		id)
+		status, id)
 	if err != nil {
 		return err
 	}
@@ -2227,6 +2377,67 @@ func (s *Store) UpdateOutlookTokens(ctx context.Context, id int64, u outlookToke
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// SaveOutlookLogin 保存一次「页面手动登录」抓到的凭证,并决定写到哪一行:
+//
+//  1. 同邮箱 + 同 client_id 的行 —— 同一账号重新登录,原地更新;
+//  2. 同邮箱、但还没有 access_token 的行 —— 认领「新增账号」建的空行。这类行的
+//     client_id/scope 可能是空/NULL,和唯一键对不上,直接 INSERT 会让同一邮箱出现两行,
+//     所以这里改成更新它并把 client_id/scope 补成规范值;
+//  3. 都没有就插一行新的。
+//
+// password 只在非空时覆盖:手动登录时弹窗里的密码是选填的,没填不该清掉已存的。
+func (s *Store) SaveOutlookLogin(ctx context.Context, email, password string, u outlookTokenUpdate) (int64, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return 0, errors.New("没有解析出登录邮箱，请在弹窗里手动填写邮箱后重试")
+	}
+	if len(email) > 320 {
+		return 0, errors.New("邮箱过长")
+	}
+	if len(password) > 512 {
+		return 0, errors.New("密码过长")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var id int64
+	err = tx.QueryRowContext(ctx, `SELECT id FROM outlook_login_tokens
+		WHERE email=? AND client_id=? ORDER BY id LIMIT 1`, email, outlookClientID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRowContext(ctx, `SELECT id FROM outlook_login_tokens
+			WHERE email=? AND COALESCE(access_token,'')='' ORDER BY id LIMIT 1`, email).Scan(&id)
+	}
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		now := time.Now()
+		res, insertErr := tx.ExecContext(ctx, `INSERT INTO outlook_login_tokens
+			(email, password, client_id, scope, cookie_count, created_at, updated_at)
+			VALUES (?, ?, ?, ?, 0, ?, ?)`,
+			email, password, outlookClientID, outlookScopeStored, now, now)
+		if insertErr != nil {
+			return 0, insertErr
+		}
+		if id, err = res.LastInsertId(); err != nil {
+			return 0, err
+		}
+	case err != nil:
+		return 0, err
+	default:
+		if _, err := tx.ExecContext(ctx, `UPDATE outlook_login_tokens
+			SET client_id=?, password=IF(?='', password, ?) WHERE id=?`,
+			outlookClientID, password, password, id); err != nil {
+			return 0, err
+		}
+	}
+	if err := updateOutlookTokenRow(ctx, tx, id, u, "login_captured"); err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
 }
 
 // MarkOutlookRefreshError 记录一次刷新失败的原因(供页面显示「失败」并提示重新登录)。

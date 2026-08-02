@@ -52,6 +52,20 @@ const (
 // (滑动会话窗口才能真正往后滚)。不打开浏览器、不依赖 refresh_token(该 token 24h 固定窗口,
 // 滚动刷新不延长),纯 Go 实现,不调用任何外部脚本。
 func (p *proxyServer) refreshOutlookToken(ctx context.Context, id int64) (OutlookAccount, error) {
+	account, err := p.refreshOutlookTokenOnce(ctx, id)
+	if err != nil {
+		// 任何一条失败路径都要落状态,不能只标记「静默授权失败」那一种。
+		// 最常见的其实是「没有已保存的 cookie」,以前走的是直接 return,页面上
+		// 刷新状态一直停在 `-`,看不出点过刷新、也看不出为什么没成。
+		// 用独立的 ctx:请求可能已经取消/超时,但失败原因照样要记下来。
+		markCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = p.store.MarkOutlookRefreshError(markCtx, id, err.Error())
+		cancel()
+	}
+	return account, err
+}
+
+func (p *proxyServer) refreshOutlookTokenOnce(ctx context.Context, id int64) (OutlookAccount, error) {
 	email, cookiesJSON, userAgent, _, err := p.store.GetOutlookRefreshInput(ctx, id)
 	if err != nil {
 		return OutlookAccount{}, err
@@ -79,10 +93,24 @@ func (p *proxyServer) refreshOutlookToken(ctx context.Context, id int64) (Outloo
 
 	tj, err := silentAuthorizeOutlook(runCtx, client, store, userAgent)
 	if err != nil {
-		_ = p.store.MarkOutlookRefreshError(ctx, id, err.Error())
 		return OutlookAccount{}, err
 	}
 
+	upd, err := outlookTokenUpdateFromResponse(tj, userAgent, store.export())
+	if err != nil {
+		return OutlookAccount{}, err
+	}
+
+	if err := p.store.UpdateOutlookTokens(ctx, id, upd); err != nil {
+		return OutlookAccount{}, err
+	}
+	return p.store.GetOutlookAccountByID(ctx, id)
+}
+
+// outlookTokenUpdateFromResponse 把 token 端点返回的 JSON + 当前 cookie 快照,
+// 拼成要写回 outlook_login_tokens 的一组字段。静默刷新与手动登录抓取共用这一份逻辑,
+// 保证两条路径落库的字段口径完全一致。
+func outlookTokenUpdateFromResponse(tj map[string]any, userAgent string, cookies []map[string]any) (outlookTokenUpdate, error) {
 	now := time.Now()
 	ci := decodeOutlookClientInfo(asString(tj["client_info"]))
 	upd := outlookTokenUpdate{
@@ -114,18 +142,13 @@ func (p *proxyServer) refreshOutlookToken(ctx context.Context, id int64) (Outloo
 		t := now.Add(time.Duration(v) * time.Second)
 		upd.RefreshTokenExpiresAt = &t
 	}
-	merged := store.export()
-	cookiesOut, err := json.Marshal(merged)
+	cookiesOut, err := json.Marshal(cookies)
 	if err != nil {
-		return OutlookAccount{}, err
+		return upd, err
 	}
 	upd.CookiesJSON = string(cookiesOut)
-	upd.CookieCount = len(merged)
-
-	if err := p.store.UpdateOutlookTokens(ctx, id, upd); err != nil {
-		return OutlookAccount{}, err
-	}
-	return p.store.GetOutlookAccountByID(ctx, id)
+	upd.CookieCount = len(cookies)
+	return upd, nil
 }
 
 // silentAuthorizeOutlook 执行 authorize?prompt=none → 换 code → token 两步,返回 token 端点的 JSON。

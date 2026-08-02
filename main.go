@@ -18,8 +18,10 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -47,18 +49,24 @@ type config struct {
 }
 
 type proxyServer struct {
-	cfg          config
-	client       *http.Client
-	logs         *logWriter
-	store        *Store
-	recorder     *asyncRecorder
-	chains       *chainRouteState
-	accounts     *accountPool
-	openaiLogins *openAILoginManager
-	outlookJob   *batchRefreshJob // OUTLOOK 页「刷新全部 Token」
-	openaiJob    *batchRefreshJob // OPENAI 页「刷新全部额度」
+	cfg           config
+	client        *http.Client
+	logs          *logWriter
+	store         *Store
+	recorder      *asyncRecorder
+	chains        *chainRouteState
+	accounts      *accountPool
+	openaiLogins  *openAILoginManager
+	outlookLogins *outlookLoginManager // OUTLOOK 页「登录账号」(拉起 Chrome 手动登录)
+	outlookJob    *batchRefreshJob     // OUTLOOK 页「刷新全部 Token」
+	openaiJob     *batchRefreshJob     // OPENAI 页「刷新全部额度」
 
 	openaiModelsJob *batchRefreshJob // OPENAI 页「拉取全部模型」
+
+	// quotaAutoRefresh 控制「每 5 分钟定时刷新全部额度」是否开启(OPENAI 页开关,持久化在
+	// app_settings)。定时 goroutine 一直在跑,每次 tick 读这个标志决定是否真去刷,所以开关
+	// 一点就生效、无需重启。
+	quotaAutoRefresh atomic.Bool
 }
 
 const chainRouteCooldown = 2 * time.Minute
@@ -277,6 +285,21 @@ func main() {
 	openaiLogins := newOpenAILoginManager(*bridgeLibrary, store)
 	defer openaiLogins.Close()
 
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2: true,
+		MaxIdleConns:      100,
+		// 经本地代理(clash 等)时空闲隧道常被上游提前关闭,复用会得到 EOF。
+		// 缩短空闲超时,减少复用失效连接的概率(配合上层重试基本消除瞬时 502)。
+		IdleConnTimeout:       15 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	srv := &proxyServer{
 		cfg: config{
 			listenAddr:   *listenAddr,
@@ -286,39 +309,39 @@ func main() {
 			dsn:          *dsn,
 		},
 		client: &http.Client{
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				ForceAttemptHTTP2: true,
-				MaxIdleConns:      100,
-				// 经本地代理(clash 等)时空闲隧道常被上游提前关闭,复用会得到 EOF。
-				// 缩短空闲超时,减少复用失效连接的概率(配合上层重试基本消除瞬时 502)。
-				IdleConnTimeout:       15 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			},
-			Timeout: 0,
+			Transport: transport,
+			Timeout:   0,
 		},
-		logs:         lw,
-		store:        store,
-		recorder:     recorder,
-		chains:       newChainRouteState(),
-		accounts:     newAccountPool(),
-		openaiLogins: openaiLogins,
-		outlookJob:   &batchRefreshJob{},
-		openaiJob:    &batchRefreshJob{},
+		logs:          lw,
+		store:         store,
+		recorder:      recorder,
+		chains:        newChainRouteState(),
+		accounts:      newAccountPool(),
+		openaiLogins:  openaiLogins,
+		outlookLogins: newOutlookLoginManager(store, transport),
+		outlookJob:    &batchRefreshJob{},
+		openaiJob:     &batchRefreshJob{},
 
 		openaiModelsJob: &batchRefreshJob{},
 	}
+	defer srv.outlookLogins.Close()
+
+	// 定时刷新额度的开关:默认开启,从 app_settings 读回上次的选择。
+	srv.quotaAutoRefresh.Store(true)
+	if v, err := store.GetSetting(context.Background(), settingQuotaAutoRefresh, "1"); err == nil {
+		srv.quotaAutoRefresh.Store(v != "0")
+	}
+	// 每 5 分钟刷一次全部账号额度(开关开启时),让 100% 用满的账号能被及时标记、进而不被选中。
+	quotaCtx, stopQuota := context.WithCancel(context.Background())
+	defer stopQuota()
+	go srv.runQuotaAutoRefresh(quotaCtx)
 
 	router := chi.NewRouter()
 	router.Get("/", srv.handleIndex)
 	router.Get("/routes", srv.handleRoutes)
 	router.Get("/chains", srv.handleChains)
 	router.Get("/api-keys", srv.handleAPIKeysPage)
+	router.Get("/herosms", srv.handleHeroSMS)
 	router.Get("/openai", srv.handleOpenAI)
 	router.Get("/openai/accounts/{id}", srv.handleOpenAIAccount)
 	router.Get("/outlook", srv.handleOutlook)
@@ -352,6 +375,13 @@ func main() {
 	router.Get("/api/openai/models-all", srv.handleAPIOpenAIModelsAllStatus)
 	router.Post("/api/openai/accounts/{id}/models", srv.handleAPIOpenAIAccountModels)
 	router.Post("/api/openai/accounts/{id}/settings", srv.handleAPIOpenAIAccountSettings)
+	router.Post("/api/openai/accounts/{id}/toggle", srv.handleAPIOpenAIAccountToggle)
+	router.Post("/api/openai/accounts/toggle-all", srv.handleAPIOpenAIAccountsToggleAll)
+	router.Get("/api/openai/quota-auto-refresh", srv.handleAPIOpenAIQuotaAutoRefresh)
+	router.Post("/api/openai/quota-auto-refresh", srv.handleAPIOpenAIQuotaAutoRefreshToggle)
+	router.Post("/api/outlook/logins", srv.handleAPIOutlookLoginStart)
+	router.Get("/api/outlook/logins/{id}", srv.handleAPIOutlookLoginStatus)
+	router.Post("/api/outlook/logins/{id}/cancel", srv.handleAPIOutlookLoginCancel)
 	router.Get("/outlook/accounts/{id}", srv.handleOutlookAccountMail)
 	router.Get("/api/outlook/accounts", srv.handleAPIOutlookAccounts)
 	router.Get("/api/outlook/valid-emails", srv.handleAPIOutlookValidEmails)
@@ -361,8 +391,11 @@ func main() {
 	router.Get("/api/outlook/accounts/{id}/messages", srv.handleAPIOutlookMailList)
 	router.Get("/api/outlook/accounts/{id}/message", srv.handleAPIOutlookMailMessage)
 	router.Get("/api/outlook/mail/code", srv.handleAPIOutlookMailCode)
+	router.Post("/api/outlook/accounts/{id}/send", srv.handleAPIOutlookAccountSend)
+	router.Post("/api/outlook/mail/send", srv.handleAPIOutlookMailSend)
 	router.Put("/api/outlook/accounts/{id}", srv.handleAPIOutlookAccountUpdate)
 	router.Post("/api/outlook/accounts/{id}/refresh", srv.handleAPIOutlookAccountRefresh)
+	router.Post("/api/outlook/accounts/{id}/login", srv.handleAPIOutlookAccountAutoLogin)
 	router.Post("/api/outlook/accounts/refresh-all", srv.handleAPIOutlookRefreshAll)
 	router.Get("/api/outlook/refresh-all", srv.handleAPIOutlookRefreshAllStatus)
 	router.Delete("/api/outlook/accounts/{id}", srv.handleAPIOutlookAccountDelete)
@@ -370,6 +403,16 @@ func main() {
 	router.Get("/api/conversations/{id}", srv.handleAPIConversationDetail)
 	router.Delete("/api/conversations/{id}", srv.handleAPIConversationDelete)
 	router.Post("/api/conversations/batch-delete", srv.handleAPIConversationsBatchDelete)
+	router.Get("/api/herosms/config", srv.handleAPIHeroSMSConfig)
+	router.Post("/api/herosms/config", srv.handleAPIHeroSMSConfigSave)
+	router.Get("/api/herosms/balance", srv.handleAPIHeroSMSBalance)
+	router.Get("/api/herosms/services", srv.handleAPIHeroSMSServices)
+	router.Get("/api/herosms/offers", srv.handleAPIHeroSMSOffers)
+	router.Post("/api/herosms/number", srv.handleAPIHeroSMSBuyNumber)
+	router.Get("/api/herosms/status", srv.handleAPIHeroSMSStatus)
+	router.Post("/api/herosms/cancel", srv.handleAPIHeroSMSCancel)
+	router.Post("/api/herosms/finish", srv.handleAPIHeroSMSFinish)
+	router.Get("/api/herosms/active", srv.handleAPIHeroSMSActive)
 	router.Get("/stats/tokens", srv.handleTokenStatsPage)
 	router.Get("/api/stats/tokens", srv.handleAPITokenStats)
 	router.Post("/api/conversations/{id}/tags", srv.handleAPIConversationTags)
@@ -521,7 +564,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resolved, resolveErr := p.resolveAccountAuth(r.Context(), plan.accountCandidate, plan.apiKeyID)
 			if resolveErr != nil {
 				lastErr = resolveErr
-				p.accounts.MarkFailure(meta.SessionID, plan.effectiveModel, plan.accountCandidate.ID)
+				p.accounts.MarkFailure(meta.SessionID, plan.effectiveModel, plan.accountCandidate.ID, 0)
 				if i == len(plans)-1 {
 					status := http.StatusServiceUnavailable
 					var local *localError
@@ -548,8 +591,13 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		resp, err = p.doUpstream(r, plan)
 		if err != nil {
 			lastErr = err
-			p.markAttemptFailure(chainMode, accountMode, plan, meta.SessionID)
-			if !failoverMode || i == len(plans)-1 {
+			// 传输层错误(EOF / 连接失败)在账号模式下既不熔断账号、也不换账号:
+			// 所有账号打的是同一个上游地址,换账号只换鉴权头、不换网络路径,同一个网络
+			// 故障必然全部失败。逐个试只会让客户端多等 N×3 次徒劳重试,还会把所有账号
+			// 打进冷却、把会话粘性全解绑,网络恢复后缓存命中率归零。
+			// 链式代理相反:不同路由是不同的上游主机,换一个确实可能通,所以照旧。
+			p.markAttemptFailure(chainMode, false, plan, meta.SessionID, 0)
+			if !chainMode || i == len(plans)-1 {
 				if chainMode {
 					p.chains.ClearFailures(plan.chainID, meta.SessionID)
 				}
@@ -569,8 +617,20 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				fmt.Printf("== upstream 401, refreshed credentials and retried, status=%d\n", resp.StatusCode)
 			}
 		}
+		// 上游说限流/额度用尽时,顺手异步补刷一次这个账号的额度。额度数据平时只有
+		// 页面上手动点才更新,靠这一下它才能自己变成「已用满」,进而被调度沉底、
+		// 不再被反复选中。同一账号 60 秒内只刷一次,防止并发 429 把它刷爆。
+		if accountMode && resp.StatusCode == http.StatusTooManyRequests && plan.accountCandidate != nil {
+			if accountID := plan.accountCandidate.ID; p.accounts.ShouldRefreshQuota(accountID) {
+				go func() {
+					if err := p.openaiLogins.Refresh(accountID); err != nil {
+						log.Printf("429 后补刷账号 %d 额度失败: %v", accountID, err)
+					}
+				}()
+			}
+		}
 		if failoverMode && resp.StatusCode >= 400 {
-			p.markAttemptFailure(chainMode, accountMode, plan, meta.SessionID)
+			p.markAttemptFailure(chainMode, accountMode, plan, meta.SessionID, accountFailureCooldown(resp))
 			if i < len(plans)-1 {
 				rawFail, _ := io.ReadAll(resp.Body)
 				decodedFail := decodeResponseBody(rawFail, resp.Header.Get("Content-Encoding"))
@@ -856,9 +916,22 @@ func (p *proxyServer) accountPlansForRequest(ctx context.Context, r *http.Reques
 	}
 	if len(candidates) == 0 {
 		return nil, false, newLocalError(http.StatusBadRequest,
-			"没有账号配置了模型 %s，请在 OPENAI 页面为某个账号选择该模型", model)
+			"没有已启用的账号配置了模型 %s，请在 OPENAI 页面为某个账号选择该模型并确认「启用」是「是」", model)
 	}
-	ordered := p.accounts.OrderedAccounts(sessionID, model, candidates)
+	// 剔除已用满(used_percent>=100,QuotaExhausted)的账号——打过去必然 429。
+	// 90% 之类的中间占用不再限制,只有 100% 才不选。额度靠两条更新:定时刷新(可关)+ 请求
+	// 返回 429 时异步补刷,所以刚满的账号很快会被标记为 exhausted、进而在这里被剔除。
+	// 全部都用满时保留原候选兜底,避免月度重置后额度数据还没刷、一个都不敢试导致永久发不出。
+	selectable := make([]OpenAIAccount, 0, len(candidates))
+	for _, account := range candidates {
+		if !account.QuotaExhausted {
+			selectable = append(selectable, account)
+		}
+	}
+	if len(selectable) == 0 {
+		selectable = candidates
+	}
+	ordered := p.accounts.OrderedAccounts(sessionID, model, selectable)
 	forwardBody := p.prepareCodexBackendBody(reqBody)
 	directJSON := !clientWantsSSE(reqBody)
 	upstreamURL := buildUpstreamURL(upstreamTarget, r.URL)
@@ -1053,13 +1126,40 @@ func (p *proxyServer) writeChainAttemptLog(r *http.Request, start time.Time, pla
 }
 
 // markAttemptFailure 按当前模式给失败的这一跳打上失败标记:链式代理按路由冷却,账号模式按账号熔断。
-func (p *proxyServer) markAttemptFailure(chainMode, accountMode bool, plan forwardPlan, sessionID string) {
+// cooldown 由上游响应决定(见 accountFailureCooldown),传 0 用默认时长。
+func (p *proxyServer) markAttemptFailure(chainMode, accountMode bool, plan forwardPlan, sessionID string, cooldown time.Duration) {
 	if chainMode && plan.route != nil {
 		p.chains.MarkFailure(plan.chainID, sessionID, plan.route.ID)
 	}
 	if accountMode && plan.accountCandidate != nil {
-		p.accounts.MarkFailure(sessionID, plan.effectiveModel, plan.accountCandidate.ID)
+		p.accounts.MarkFailure(sessionID, plan.effectiveModel, plan.accountCandidate.ID, cooldown)
 	}
+}
+
+// accountFailureCooldown 按上游响应决定这个账号该冷却多久。
+// 429 优先采信 Retry-After(ChatGPT 后端基本都给 60 秒),避免限流刚解除就又被跳过,
+// 也避免额度类失败只冷却 90 秒、每个新会话都要再白撞一次。其余失败沿用默认。
+func accountFailureCooldown(resp *http.Response) time.Duration {
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		return accountCooldown
+	}
+	clamp := func(d time.Duration) time.Duration {
+		if d < accountRateLimitCooldownMin {
+			return accountRateLimitCooldownMin
+		}
+		if d > accountRateLimitCooldownMax {
+			return accountRateLimitCooldownMax
+		}
+		return d
+	}
+	value := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return clamp(time.Duration(seconds) * time.Second)
+	}
+	if deadline, err := http.ParseTime(value); err == nil {
+		return clamp(time.Until(deadline))
+	}
+	return accountRateLimitCooldownMin
 }
 
 // accountNextID 返回下一个待尝试候选账号的 id,仅用于日志。

@@ -65,6 +65,83 @@ func outlookMailGet(ctx context.Context, client *http.Client, rawURL, accessToke
 	return out, resp.StatusCode, nil
 }
 
+// outlookServiceSvcURL 是 OWA 原生的邮件动作端点。**发信必须走这条,不能走 /api/beta/me/sendmail**:
+// 后者对我们这套 token(scope MBI_SSL)只有读权限,任何写操作(sendmail / 建草稿 / 标记已读)一律
+// 403 ErrorAccessDenied——已实测全部账号一致,与账号无关。service.svc 是浏览器 OWA 自己发信用的端点,
+// 同一个 token 打过去就能成功,且不需要抓包脚本里那些页面态头(x-owa-sessionid / x-client-version / prefer)。
+const outlookServiceSvcSend = "https://outlook.live.com/owa/service.svc?action=CreateItem&app=Mail"
+
+// outlookMailSendOWA 通过 OWA service.svc 发信。协议特点:请求 JSON 塞在 x-owa-urlpostdata 头里
+// (URL 编码)、body 为空;响应恒 HTTP 200,真正结果在 body 的 ResponseCode(成功=NoError)。
+// token 失效时才回 401(交给上层刷新重试)。
+func outlookMailSendOWA(ctx context.Context, client *http.Client, accessToken, anchor string, urlPostData string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, outlookServiceSvcSend, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", outlookMailAuthHeader(accessToken))
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Origin", "https://outlook.live.com")
+	req.Header.Set("Referer", "https://outlook.live.com/mail/0/")
+	req.Header.Set("action", "CreateItem")
+	req.Header.Set("x-owa-actionsource", "CreateItem")
+	req.Header.Set("x-owa-urlpostdata", urlPostData)
+	if anchor != "" {
+		req.Header.Set("x-anchormailbox", anchor)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusUnauthorized {
+		return resp.StatusCode, fmt.Errorf("发信接口返回 401")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return resp.StatusCode, fmt.Errorf("Outlook 发信接口返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
+	}
+	// **必须拿到 ResponseCode=NoError 才算真发出去**,不能只看 HTTP 2xx。
+	// 实测新注册未验证账号(signup_captured)外发会被微软静默拦截:CreateItem 返回
+	// 204 空 body、邮件不进「已发送」、收件人收不到,但 HTTP 是 2xx。老逻辑把这种当成功,
+	// 页面就报「已发送」误导人。正常成功是 200 + ResponseMessages 里带 NoError。
+	code := owaResponseCode(body)
+	if code == "NoError" {
+		return resp.StatusCode, nil
+	}
+	if code != "" {
+		return resp.StatusCode, fmt.Errorf("Outlook 发信被拒: %s", code)
+	}
+	return resp.StatusCode, fmt.Errorf("发送未被确认(HTTP %d,无 NoError 回执):该账号可能被微软限制外发(常见于新注册未验证账号),请先在网页版正常发一封验证", resp.StatusCode)
+}
+
+// owaResponseCode 从 service.svc 响应里挖出 ResponseCode(可能在 Body 顶层或 ResponseMessages.Items 里)。
+func owaResponseCode(body []byte) string {
+	var parsed struct {
+		Body struct {
+			ResponseCode     string `json:"ResponseCode"`
+			ResponseMessages struct {
+				Items []struct {
+					ResponseCode string `json:"ResponseCode"`
+				} `json:"Items"`
+			} `json:"ResponseMessages"`
+		} `json:"Body"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return ""
+	}
+	if parsed.Body.ResponseCode != "" {
+		return parsed.Body.ResponseCode
+	}
+	for _, item := range parsed.Body.ResponseMessages.Items {
+		if item.ResponseCode != "" {
+			return item.ResponseCode
+		}
+	}
+	return ""
+}
+
 // outlookMailFetch 取该账号的 access_token 调邮件接口;遇 401(token 过期)自动刷新一次再重试。
 func (p *proxyServer) outlookMailFetch(ctx context.Context, id int64, buildURL func() string, prefer string) (map[string]any, error) {
 	token, email, err := p.store.GetOutlookAccessToken(ctx, id)
@@ -90,6 +167,170 @@ func (p *proxyServer) outlookMailFetch(ctx context.Context, id int64, buildURL f
 		return nil, err
 	}
 	return data, nil
+}
+
+// ---- 发信 ----
+
+// outlookSendInput 是两个发信接口共用的入参。
+//
+//	Token 只有无状态接口 POST /api/outlook/mail/send 会用:外部脚本自己拿着 token 发信,
+//	代理不查库。留空且给了 Email 时回落到「按邮箱查库取 token」,这样两种用法一个接口都能覆盖。
+type outlookSendInput struct {
+	To       string `json:"to"`
+	Subject  string `json:"subject"`
+	Body     string `json:"body"`
+	BodyType string `json:"body_type"` // text(默认) / html
+	Token    string `json:"token"`
+	Email    string `json:"email"` // 发送方邮箱:作为 x-anchormailbox,也用于 token 留空时查库
+}
+
+// outlookRecipientSplit 拆多个收件人:逗号 / 分号 / 空白都认。
+var outlookRecipientSplit = regexp.MustCompile(`[,;\s]+`)
+
+// buildOutlookSendPayload 拼 OWA service.svc CreateItem 的 x-owa-urlpostdata 值(URL 编码后的 JSON),
+// 并返回解析出的收件人列表(用于回执)。正文默认按纯文本发:UI 里是个 textarea,当 HTML 发会把换行
+// 吃掉、还要额外转义。MessageDisposition=SendAndSaveCopy 即「发送并存到已发送」。
+func buildOutlookSendPayload(in outlookSendInput) (string, []string, error) {
+	recipients := make([]map[string]any, 0, 4)
+	addresses := make([]string, 0, 4)
+	for _, addr := range outlookRecipientSplit.Split(strings.TrimSpace(in.To), -1) {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
+		}
+		if !strings.Contains(addr, "@") {
+			return "", nil, fmt.Errorf("收件人地址不合法: %s", addr)
+		}
+		addresses = append(addresses, addr)
+		recipients = append(recipients, map[string]any{
+			"__type": "EmailAddressWrapper:#Exchange", "EmailAddress": addr, "Name": addr,
+			"MailboxType": "OneOff", "RoutingType": "SMTP",
+		})
+	}
+	if len(recipients) == 0 {
+		return "", nil, errors.New("请填写收件人")
+	}
+	bodyType := "Text"
+	if strings.EqualFold(strings.TrimSpace(in.BodyType), "html") {
+		bodyType = "HTML"
+	}
+	message := map[string]any{
+		"__type":       "Message:#Exchange",
+		"Subject":      in.Subject,
+		"Body":         map[string]any{"__type": "BodyContentType:#Exchange", "BodyType": bodyType, "Value": in.Body},
+		"ToRecipients": recipients,
+	}
+	payload := map[string]any{
+		"__type": "CreateItemJsonRequest:#Exchange",
+		"Header": map[string]any{"__type": "JsonRequestHeaders:#Exchange", "RequestServerVersion": "V2018_01_08"},
+		"Body": map[string]any{
+			"__type":             "CreateItemRequest:#Exchange",
+			"MessageDisposition": "SendAndSaveCopy",
+			"Items":              []any{message},
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", nil, err
+	}
+	return url.QueryEscape(string(raw)), addresses, nil
+}
+
+// sendOutlookMailWithToken 用给定 token 直接发信,不查库、不刷新(调用方自己保证 token 有效)。
+func (p *proxyServer) sendOutlookMailWithToken(ctx context.Context, token, anchor, urlPostData string) error {
+	_, err := outlookMailSendOWA(ctx, p.outlookMailClient(), token, anchor, urlPostData)
+	return err
+}
+
+// sendOutlookMailByAccount 用库里该账号的 token 发信;遇 401 静默刷新一次再重试,
+// 与读邮件的 outlookMailFetch 同一套口径。
+func (p *proxyServer) sendOutlookMailByAccount(ctx context.Context, id int64, urlPostData string) error {
+	token, email, err := p.store.GetOutlookAccessToken(ctx, id)
+	if err != nil {
+		return err
+	}
+	if token == "" {
+		return errors.New("该账号还没有 access token(尚未登录),无法发信")
+	}
+	client := p.outlookMailClient()
+	status, err := outlookMailSendOWA(ctx, client, token, email, urlPostData)
+	if status == http.StatusUnauthorized {
+		if _, rerr := p.refreshOutlookToken(ctx, id); rerr != nil {
+			return fmt.Errorf("access token 已失效且自动刷新失败(%v),请手动点「刷新 Token」或重新登录", rerr)
+		}
+		if token, email, err = p.store.GetOutlookAccessToken(ctx, id); err == nil && token != "" {
+			_, err = outlookMailSendOWA(ctx, client, token, email, urlPostData)
+		}
+	}
+	return err
+}
+
+// handleAPIOutlookAccountSend 行内「发邮件」:POST /api/outlook/accounts/{id}/send
+// 用这一行账号的 token 发,前端只传收件人/主题/正文。
+func (p *proxyServer) handleAPIOutlookAccountSend(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad account id", http.StatusBadRequest)
+		return
+	}
+	var in outlookSendInput
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&in); err != nil {
+		http.Error(w, "invalid json body", http.StatusBadRequest)
+		return
+	}
+	payload, addresses, err := buildOutlookSendPayload(in)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := p.sendOutlookMailByAccount(r.Context(), id, payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "to": addresses}, nil)
+}
+
+// handleAPIOutlookMailSend 无状态发信:POST /api/outlook/mail/send
+// 供外部脚本调用,发送方凭证由入参 token 提供;token 留空时按 email 查库取(此时才有 401 自动刷新)。
+func (p *proxyServer) handleAPIOutlookMailSend(w http.ResponseWriter, r *http.Request) {
+	var in outlookSendInput
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&in); err != nil {
+		http.Error(w, "invalid json body", http.StatusBadRequest)
+		return
+	}
+	payload, addresses, err := buildOutlookSendPayload(in)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	token := strings.TrimSpace(in.Token)
+	email := strings.TrimSpace(in.Email)
+	if token == "" {
+		if email == "" {
+			http.Error(w, "缺少 token(也没给 email 供查库)", http.StatusBadRequest)
+			return
+		}
+		id, lookupErr := p.store.GetOutlookIDByEmail(r.Context(), email)
+		if lookupErr != nil {
+			if errors.Is(lookupErr, sql.ErrNoRows) {
+				http.Error(w, "该邮箱不存在于 outlook_login_tokens", http.StatusNotFound)
+				return
+			}
+			http.Error(w, lookupErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := p.sendOutlookMailByAccount(r.Context(), id, payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "to": addresses, "from": email}, nil)
+		return
+	}
+	if err := p.sendOutlookMailWithToken(r.Context(), token, email, payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "to": addresses, "from": email}, nil)
 }
 
 // ---- 处理函数 ----
@@ -357,7 +598,7 @@ const outlookMailHTML = `
 <body><div class="app">
   <aside class="sidebar"><div class="brand">AGENT-GO-PROXY</div><nav>
     <a class="nav-item" href="/">Dashboard</a><a class="nav-item" href="/routes">路由</a><a class="nav-item" href="/chains">链式代理</a>
-    <a class="nav-item" href="/openai">OPENAI</a><a class="nav-item active" href="/outlook">OUTLOOK</a><a class="nav-item" href="/api-keys">API Key</a>
+    <a class="nav-item" href="/openai">OPENAI</a><a class="nav-item active" href="/outlook">OUTLOOK</a><a class="nav-item" href="/api-keys">API Key</a><a class="nav-item" href="/herosms">HeroSMS</a>
   </nav></aside>
   <main class="page">
     <div class="top">
