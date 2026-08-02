@@ -23,7 +23,7 @@ func (p *proxyServer) handleAPIOutlookAccounts(w http.ResponseWriter, r *http.Re
 }
 
 // handleAPIOutlookValidEmails 返回「有 access token 且未过期」的所有账号邮箱。
-// 过期时间由驱动按 loc=Local 解析成正确时刻,在 Go 里与 time.Now() 比较(避开 MySQL NOW() 的 UTC 时区坑)。
+// 过期时间由驱动按 loc=Asia/Shanghai 解析成中国时区时刻,在 Go 里与 time.Now() 比较(避开 MySQL NOW() 的 UTC 时区坑)。
 func (p *proxyServer) handleAPIOutlookValidEmails(w http.ResponseWriter, r *http.Request) {
 	accounts, err := p.store.ListOutlookAccounts(r.Context())
 	if err != nil {
@@ -40,9 +40,8 @@ func (p *proxyServer) handleAPIOutlookValidEmails(w http.ResponseWriter, r *http
 	writeJSON(w, map[string]any{"ok": true, "count": len(emails), "emails": emails}, nil)
 }
 
-// handleAPIOutlookUnregisteredEmails 返回「还没注册 GPT 账号」的邮箱列表(has_gpt_account=0),
-// 供批量注册流程挑下一个可用邮箱。判定复用 ListOutlookAccounts:该列为 0 的行会再关联一次
-// openai_accounts 复算并回写,所以刚注册完的邮箱这里立刻就不再出现。
+// handleAPIOutlookUnregisteredEmails 返回「还没注册 GPT 账号」的邮箱列表(registered_gpt_account=0),
+// 供批量注册流程挑下一个可用邮箱。Codex 已登录的邮箱也视为已注册,不会出现在这里。
 // 可选 ?valid=1 只保留 access token 未过期的邮箱(判定同 valid-emails)。
 // 同一邮箱可能有多行(唯一键是 email+client_id+scope),这里按邮箱去重,保留最近创建的那条。
 func (p *proxyServer) handleAPIOutlookUnregisteredEmails(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +55,7 @@ func (p *proxyServer) handleAPIOutlookUnregisteredEmails(w http.ResponseWriter, 
 	seen := make(map[string]bool, len(accounts))
 	emails := make([]string, 0, len(accounts))
 	for _, a := range accounts {
-		if a.HasGPTAccount || a.Email == "" || seen[a.Email] {
+		if a.RegisteredGPTAccount || a.HasCodexAccount || a.Email == "" || seen[a.Email] {
 			continue
 		}
 		if onlyValid && !(a.AccessTokenLen > 0 && !a.AccessTokenExpiresAt.IsZero() && a.AccessTokenExpiresAt.After(now)) {
@@ -218,6 +217,8 @@ const outlookHTML = `
     .login-btn{color:var(--green);border-color:#bfe6cf;background:#f1fbf5}.login-btn:hover:not(:disabled){background:#e6f7ee}
     .refresh-btn{color:var(--blue);border-color:#b9ccf5;background:#f4f8ff}.refresh-btn:hover{background:#e9f1ff}.edit-btn{color:#5a4bc4;border-color:#cfc7f2;background:#f6f4ff}.edit-btn:hover{background:#efeaff}.delete-btn{color:var(--red);border-color:#f0b3b3;background:#fff6f6}.delete-btn:hover{background:#fff1f1}
     .send-btn{color:#b06d12;border-color:#f0d9ab;background:#fffaf0}.send-btn:hover:not(:disabled){background:#fff4e2}
+    .signup-btn{color:#0f8548;border-color:#bfe6cf;background:#f1fbf5}.signup-btn:hover:not(:disabled){background:#e6f7ee}
+    .gptlogin-btn{color:#5a4bc4;border-color:#cfc7f2;background:#f6f4ff}.gptlogin-btn:hover:not(:disabled){background:#efeaff}
     .empty{padding:28px;color:var(--muted);text-align:center}
     .btn-primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}.btn-primary:hover{background:#265fd0}
     .modal-mask{display:none;position:fixed;inset:0;background:rgba(20,28,45,.42);align-items:center;justify-content:center;z-index:50}.modal-mask.show{display:flex}
@@ -253,8 +254,13 @@ const outlookHTML = `
         <div class="small login-detail" id="login-status"></div>
         <div class="modal-actions"><button id="login-cancel" type="button">取消登录</button></div>
       </div>
+      <div class="login-box" id="gpt-box">
+        <div class="login-title" id="gpt-title">GPT 任务</div>
+        <div class="small login-detail" id="gpt-status"></div>
+        <div class="modal-actions"><button id="gpt-cancel" type="button">取消任务</button></div>
+      </div>
       <table>
-        <thead><tr><th>账号</th><th>GPT 账号</th><th>套餐/租户</th><th>Access Token 过期</th><th>Refresh Token 过期</th><th>Cookie</th><th>刷新状态</th><th>创建时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>账号</th><th>Codex</th><th>套餐/租户</th><th>Access Token 过期</th><th>Refresh Token 过期</th><th>Cookie</th><th>刷新状态</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody id="account-rows"></tbody>
       </table>
       <div class="empty" id="empty">暂无已登录的 Outlook 账号。点右上角「+ 登录账号」开始。</div>
@@ -285,7 +291,7 @@ const appEl=document.querySelector('.app');
 if(localStorage.getItem('sidebarCollapsed')==='1')appEl.classList.add('sidebar-collapsed');
 document.getElementById('sidebar-toggle').addEventListener('click',()=>{appEl.classList.toggle('sidebar-collapsed');localStorage.setItem('sidebarCollapsed',appEl.classList.contains('sidebar-collapsed')?'1':'0')});
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const fmtTime=v=>v?new Date(v).toLocaleString('zh-CN',{hour12:false}):'';
+const fmtTime=v=>v?new Date(v).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'';
 // tokenText 按过期时间着色:已过期红、1 小时内到期黄、其余绿;时间未知(零值/空)显示「未知」。
 function tokenText(v){
   const at=v?new Date(v):null;
@@ -317,7 +323,7 @@ async function loadAccounts(){
   rows.innerHTML=(items||[]).map(item=>
     '<tr class="row-link" data-href="/outlook/accounts/'+item.id+'">'+
     '<td><div class="email">'+esc(item.email||'-')+'</div>'+(item.display_name?'<div class="sub">'+esc(item.display_name)+'</div>':'')+'</td>'+
-    '<td>'+(item.has_gpt_account?'<span class="pill gpt-yes">是</span>':'<span class="pill gpt-no">否</span>')+'</td>'+
+    '<td>'+((item.has_codex_account||item.has_gpt_account)?'<span class="pill gpt-yes">是</span>':'<span class="pill gpt-no">否</span>')+'</td>'+
     '<td><div class="sub">'+esc(item.token_type||'-')+'</div><div class="sub mono" title="'+esc(item.tenant_id||'')+'">'+esc((item.tenant_id||'').slice(0,12)||'-')+'</div></td>'+
     '<td>'+tokenText(item.access_token_expires_at)+'</td>'+
     '<td>'+tokenText(item.refresh_token_expires_at)+'</td>'+
@@ -327,6 +333,8 @@ async function loadAccounts(){
     '<td class="actions"><div class="act-grid">'+
       (needsLogin(item)?'<button class="login-btn" data-login-id="'+item.id+'" type="button"'+(item.has_password?' title="用这行保存的邮箱+密码自动登录"':' disabled title="没有保存密码，请先用「修改」填写密码"')+'>登录</button>':'')+
       '<button class="send-btn" data-send-id="'+item.id+'" data-email="'+esc(item.email||'')+'" type="button"'+(item.access_token_len?' title="用这个邮箱发一封邮件"':' disabled title="没有 access token，先登录或刷新 Token"')+'>发邮件</button>'+
+      ((item.registered_gpt_account||item.has_codex_account||item.has_gpt_account)?'':'<button class="signup-btn" data-signup-id="'+item.id+'" type="button" title="用这个邮箱自动注册 ChatGPT 账号(CDP 自动化)">注册GPT</button>')+
+      '<button class="gptlogin-btn" data-gptlogin-id="'+item.id+'" type="button" title="把这个邮箱的 GPT 账号登进 Codex(含手机验证)">登录Codex</button>'+
       '<button class="refresh-btn" data-refresh-id="'+item.id+'" type="button" title="刷新 access + refresh token">刷新 Token</button>'+
       '<button class="edit-btn" data-edit-id="'+item.id+'" type="button" title="修改邮箱/密码">修改</button>'+
       '<button class="delete-btn" data-id="'+item.id+'" type="button">删除</button>'+
@@ -569,6 +577,53 @@ document.getElementById('login-cancel').addEventListener('click',async()=>{
   const id=currentLoginId;currentLoginId=null;clearTimeout(loginPollTimer);
   if(id)await fetch('/api/outlook/logins/'+id+'/cancel',{method:'POST'}).catch(()=>{});
   hideLoginBox();
+});
+// ===== GPT 注册 / 登录任务(CDP 自动化,后台跑,轮询状态)=====
+const gptBox=document.getElementById('gpt-box');
+let gptTimer=null,gptId=null,gptKind=null;
+function showGptBox(title,detail){document.getElementById('gpt-title').textContent=title;document.getElementById('gpt-status').textContent=detail||'';gptBox.classList.add('show')}
+function hideGptBox(){gptBox.classList.remove('show')}
+const GPT_LABEL={signup:'注册 GPT',login:'登录 Codex'};
+const GPT_DONE={completed:'完成',failed:'失败',human_verification:'需人工(人机验证)',cancelled:'已取消'};
+async function startGptTask(kind,id){
+  const url=kind==='signup'?('/api/outlook/accounts/'+id+'/gpt-signup'):('/api/outlook/accounts/'+id+'/gpt-login');
+  const rsp=await fetch(url,{method:'POST'});
+  if(!rsp.ok)throw new Error(await rsp.text());
+  const st=await rsp.json();
+  gptId=st.id;gptKind=kind;
+  showGptBox(GPT_LABEL[kind]+'…',st.message||'启动中…');
+  pollGpt();
+}
+function pollGpt(){
+  clearTimeout(gptTimer);
+  gptTimer=setTimeout(async()=>{
+    if(!gptId)return;
+    try{
+      const rsp=await fetch('/api/'+(gptKind==='signup'?'gpt-signup':'gpt-login')+'/'+gptId,{cache:'no-store'});
+      if(!rsp.ok)throw new Error(await rsp.text());
+      const st=await rsp.json();
+      if(st.state==='running'){showGptBox(GPT_LABEL[gptKind]+'进行中…',st.message||'');pollGpt();return}
+      gptId=null;
+      const label=GPT_DONE[st.state]||st.state;
+      showGptBox(GPT_LABEL[gptKind]+'：'+label, st.error||st.message||st.final_url||'');
+      await loadAccounts().catch(()=>{});
+      if(st.state==='completed')setTimeout(hideGptBox,6000);
+    }catch(err){gptId=null;showGptBox('任务状态查询失败',(err&&err.message)||String(err))}
+  },1500);
+}
+document.getElementById('account-rows').addEventListener('click',async event=>{
+  const s=event.target.closest('.signup-btn'),l=event.target.closest('.gptlogin-btn');
+  const btn=s||l;if(!btn||btn.disabled)return;
+  if(gptId){alert('已有一个 GPT 任务在进行中，先等它结束。');return}
+  const label=btn.textContent;btn.disabled=true;btn.classList.add('busy');btn.textContent='启动中…';
+  try{await startGptTask(s?'signup':'login',btn.dataset.signupId||btn.dataset.gptloginId)}
+  catch(err){alert((s?'注册':'登录')+'启动失败：'+err.message)}
+  finally{btn.disabled=false;btn.classList.remove('busy');btn.textContent=label}
+});
+document.getElementById('gpt-cancel').addEventListener('click',async()=>{
+  const id=gptId,kind=gptKind;gptId=null;clearTimeout(gptTimer);
+  if(id)await fetch('/api/'+(kind==='signup'?'gpt-signup':'gpt-login')+'/'+id+'/cancel',{method:'POST'}).catch(()=>{});
+  hideGptBox();
 });
 loadAccounts().catch(err=>alert('加载账号失败：'+err.message));
 </script>

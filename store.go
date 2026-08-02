@@ -228,6 +228,51 @@ type ChainProxy struct {
 	Routes    []APIRoute `json:"routes,omitempty"`
 }
 
+// HeroSMSActivation 是 HeroSMS 买号记录。页面手动买号和 GPT 登录自动化买号共用同一张表，
+// 避免以前页面只存在 localStorage、自动化只存在进程内存导致互相看不到。
+type HeroSMSActivation struct {
+	ID           string    `json:"id"`
+	Phone        string    `json:"phone"`
+	Service      string    `json:"service"`
+	CountryID    string    `json:"country_id"`
+	CountryName  string    `json:"country"`
+	Price        float64   `json:"price"`
+	Source       string    `json:"source"`
+	Status       string    `json:"status"`
+	Code         string    `json:"code"`
+	LastRaw      string    `json:"last_raw"`
+	BoughtAt     time.Time `json:"bought_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	FinishedAt   time.Time `json:"finished_at,omitempty"`
+	CancelledAt  time.Time `json:"cancelled_at,omitempty"`
+	CancelAfterS int64     `json:"cancel_after_s"`
+}
+
+type HeroSMSAttemptLog struct {
+	ID           int64     `json:"id"`
+	ActivationID string    `json:"activation_id"`
+	Phone        string    `json:"phone"`
+	Service      string    `json:"service"`
+	CountryID    string    `json:"country_id"`
+	CountryName  string    `json:"country"`
+	Fee          float64   `json:"fee"`
+	Source       string    `json:"source"`
+	Result       string    `json:"result"`
+	Reason       string    `json:"reason"`
+	Raw          string    `json:"raw"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type HeroSMSCountryBlacklist struct {
+	ID          int64     `json:"id"`
+	Service     string    `json:"service"`
+	CountryID   string    `json:"country_id"`
+	CountryName string    `json:"country"`
+	Reason      string    `json:"reason"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 // routeProtocols 定义每种 API 风格支持的接口协议(值→展示名),前后端各用一份保持一致。
 var routeProtocols = map[string]map[string]string{
 	"openai": {
@@ -433,6 +478,52 @@ func (s *Store) migrate(ctx context.Context) error {
 				v TEXT NOT NULL,
 				updated_at DATETIME(6) NOT NULL
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS herosms_activations (
+			activation_id VARCHAR(64) NOT NULL PRIMARY KEY,
+			phone VARCHAR(64) NOT NULL DEFAULT '',
+			service VARCHAR(32) NOT NULL DEFAULT '',
+			country_id VARCHAR(32) NOT NULL DEFAULT '',
+			country_name VARCHAR(128) NOT NULL DEFAULT '',
+			price DECIMAL(10,4) NOT NULL DEFAULT 0,
+			source VARCHAR(32) NOT NULL DEFAULT '',
+			status VARCHAR(32) NOT NULL DEFAULT 'waiting',
+			code VARCHAR(32) NOT NULL DEFAULT '',
+			last_raw TEXT NULL,
+			bought_at DATETIME(6) NOT NULL,
+			updated_at DATETIME(6) NOT NULL,
+			finished_at DATETIME(6) NULL,
+			cancelled_at DATETIME(6) NULL,
+			INDEX idx_herosms_bought (bought_at),
+			INDEX idx_herosms_status (status),
+			INDEX idx_herosms_source (source)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS herosms_attempt_logs (
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			activation_id VARCHAR(64) NOT NULL DEFAULT '',
+			phone VARCHAR(64) NOT NULL DEFAULT '',
+			service VARCHAR(32) NOT NULL DEFAULT '',
+			country_id VARCHAR(32) NOT NULL DEFAULT '',
+			country_name VARCHAR(128) NOT NULL DEFAULT '',
+			source VARCHAR(32) NOT NULL DEFAULT '',
+			result VARCHAR(32) NOT NULL DEFAULT '',
+			reason VARCHAR(128) NOT NULL DEFAULT '',
+			raw TEXT NULL,
+			created_at DATETIME(6) NOT NULL,
+			INDEX idx_hsal_created (created_at),
+			INDEX idx_hsal_service_country (service, country_id),
+			INDEX idx_hsal_result (result)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS herosms_country_blacklist (
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			service VARCHAR(32) NOT NULL DEFAULT '',
+			country_id VARCHAR(32) NOT NULL DEFAULT '',
+			country_name VARCHAR(128) NOT NULL DEFAULT '',
+			reason VARCHAR(255) NOT NULL DEFAULT '',
+			created_at DATETIME(6) NOT NULL,
+			updated_at DATETIME(6) NOT NULL,
+			UNIQUE KEY uk_hscb_service_country (service, country_id),
+			INDEX idx_hscb_service (service)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 		`CREATE TABLE IF NOT EXISTS openai_accounts (
 			id BIGINT AUTO_INCREMENT PRIMARY KEY,
 			name VARCHAR(128) NOT NULL DEFAULT '',
@@ -562,12 +653,250 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "outlook_login_tokens", "password", "VARCHAR(512) NOT NULL DEFAULT '' AFTER email"); err != nil {
 		return err
 	}
-	// has_gpt_account 落库缓存「该邮箱是否已配置 GPT 账号」。列表查询只对该列为 0 的行
-	// 再去关联 openai_accounts,一旦关联到就把该列刷成 1,后续不再重复关联。
+	// has_gpt_account 历史字段:缓存「该邮箱是否已登录 Codex/OPENAI 菜单存在账号」。
+	// registered_gpt_account 是单独的「是否已完成 ChatGPT 注册」标记,不在页面展示,只控制注册按钮。
 	if err := s.ensureColumn(ctx, "outlook_login_tokens", "has_gpt_account", "TINYINT(1) NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "outlook_login_tokens", "registered_gpt_account", "TINYINT(1) NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Store) SaveHeroSMSActivation(ctx context.Context, a HeroSMSActivation) error {
+	if strings.TrimSpace(a.ID) == "" {
+		return errors.New("empty HeroSMS activation id")
+	}
+	now := time.Now()
+	if a.BoughtAt.IsZero() {
+		a.BoughtAt = now
+	}
+	if a.UpdatedAt.IsZero() {
+		a.UpdatedAt = now
+	}
+	if a.Status == "" {
+		a.Status = "waiting"
+	}
+	var finished any
+	var cancelled any
+	if a.Status == "finished" {
+		finished = a.UpdatedAt
+	}
+	if a.Status == "cancelled" {
+		cancelled = a.UpdatedAt
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO herosms_activations
+		(activation_id, phone, service, country_id, country_name, price, source, status, code, last_raw, bought_at, updated_at, finished_at, cancelled_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE phone=VALUES(phone), service=VALUES(service), country_id=VALUES(country_id),
+		country_name=VALUES(country_name), price=VALUES(price), source=VALUES(source), status=VALUES(status),
+		code=IF(VALUES(code)<>'', VALUES(code), code), last_raw=VALUES(last_raw), updated_at=VALUES(updated_at),
+		finished_at=IF(VALUES(finished_at) IS NULL, finished_at, VALUES(finished_at)),
+		cancelled_at=IF(VALUES(cancelled_at) IS NULL, cancelled_at, VALUES(cancelled_at))`,
+		a.ID, a.Phone, a.Service, a.CountryID, a.CountryName, a.Price, a.Source, a.Status, a.Code, a.LastRaw, a.BoughtAt, a.UpdatedAt, finished, cancelled)
+	return err
+}
+
+func (s *Store) ListHeroSMSActivations(ctx context.Context, includeDone bool) ([]HeroSMSActivation, error) {
+	where := ""
+	if !includeDone {
+		where = "WHERE status NOT IN ('cancelled','finished')"
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT activation_id, phone, service, country_id, country_name, price, source, status, code, COALESCE(last_raw,''), bought_at, updated_at,
+		finished_at, cancelled_at FROM herosms_activations `+where+` ORDER BY bought_at DESC LIMIT 300`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []HeroSMSActivation{}
+	for rows.Next() {
+		var a HeroSMSActivation
+		var finished, cancelled sql.NullTime
+		if err := rows.Scan(&a.ID, &a.Phone, &a.Service, &a.CountryID, &a.CountryName, &a.Price, &a.Source, &a.Status, &a.Code, &a.LastRaw, &a.BoughtAt, &a.UpdatedAt, &finished, &cancelled); err != nil {
+			return nil, err
+		}
+		if finished.Valid {
+			a.FinishedAt = finished.Time
+		}
+		if cancelled.Valid {
+			a.CancelledAt = cancelled.Time
+		}
+		left := int64(herosmsCancelAfter.Seconds()) - int64(time.Since(a.BoughtAt).Seconds())
+		if left < 0 {
+			left = 0
+		}
+		a.CancelAfterS = left
+		items = append(items, a)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) UpdateHeroSMSActivationStatus(ctx context.Context, id, status, code, raw string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "waiting"
+	}
+	now := time.Now()
+	var finished any
+	var cancelled any
+	if status == "finished" {
+		finished = now
+	}
+	if status == "cancelled" {
+		cancelled = now
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE herosms_activations SET status=?, code=IF(?<>'', ?, code), last_raw=?, updated_at=?,
+		finished_at=COALESCE(finished_at, ?), cancelled_at=COALESCE(cancelled_at, ?) WHERE activation_id=?`,
+		status, code, code, raw, now, finished, cancelled, id)
+	return err
+}
+
+func (s *Store) DueHeroSMSActivations(ctx context.Context, olderThan time.Duration) ([]HeroSMSActivation, error) {
+	cutoff := time.Now().Add(-olderThan)
+	rows, err := s.db.QueryContext(ctx, `SELECT activation_id, phone, service, country_id, country_name, price, source, status, code, COALESCE(last_raw,''), bought_at, updated_at,
+		finished_at, cancelled_at FROM herosms_activations
+		WHERE status NOT IN ('cancelled','finished') AND bought_at<=? ORDER BY bought_at ASC LIMIT 100`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []HeroSMSActivation{}
+	for rows.Next() {
+		var a HeroSMSActivation
+		var finished, cancelled sql.NullTime
+		if err := rows.Scan(&a.ID, &a.Phone, &a.Service, &a.CountryID, &a.CountryName, &a.Price, &a.Source, &a.Status, &a.Code, &a.LastRaw, &a.BoughtAt, &a.UpdatedAt, &finished, &cancelled); err != nil {
+			return nil, err
+		}
+		if finished.Valid {
+			a.FinishedAt = finished.Time
+		}
+		if cancelled.Valid {
+			a.CancelledAt = cancelled.Time
+		}
+		items = append(items, a)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) ClearDoneHeroSMSActivations(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM herosms_activations WHERE status IN ('cancelled','finished')`)
+	return err
+}
+
+func (s *Store) InsertHeroSMSAttemptLog(ctx context.Context, in HeroSMSAttemptLog) error {
+	if strings.TrimSpace(in.ActivationID) == "" && strings.TrimSpace(in.Phone) == "" {
+		return nil
+	}
+	if in.CreatedAt.IsZero() {
+		in.CreatedAt = time.Now()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO herosms_attempt_logs
+		(activation_id, phone, service, country_id, country_name, source, result, reason, raw, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		in.ActivationID, in.Phone, in.Service, in.CountryID, in.CountryName, in.Source, in.Result, in.Reason, in.Raw, in.CreatedAt)
+	return err
+}
+
+func (s *Store) UpdateLatestHeroSMSAttemptLog(ctx context.Context, activationID, result, reason, raw string) (bool, error) {
+	if strings.TrimSpace(activationID) == "" {
+		return false, nil
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE herosms_attempt_logs SET result=?, reason=?, raw=?
+		WHERE id=(SELECT id FROM (SELECT id FROM herosms_attempt_logs WHERE activation_id=? ORDER BY id DESC LIMIT 1) AS t)`,
+		result, reason, raw, activationID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *Store) ListHeroSMSAttemptLogs(ctx context.Context, service string, limit int) ([]HeroSMSAttemptLog, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 300
+	}
+	where := ""
+	args := []any{}
+	if service = strings.TrimSpace(service); service != "" {
+		where = "WHERE l.service=?"
+		args = append(args, service)
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT l.id, l.activation_id, l.phone, l.service, l.country_id, l.country_name, COALESCE(a.price,0), l.source, l.result, l.reason, COALESCE(l.raw,''), l.created_at
+		FROM herosms_attempt_logs l LEFT JOIN herosms_activations a ON a.activation_id=l.activation_id `+where+` ORDER BY l.created_at DESC LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []HeroSMSAttemptLog{}
+	for rows.Next() {
+		var x HeroSMSAttemptLog
+		if err := rows.Scan(&x.ID, &x.ActivationID, &x.Phone, &x.Service, &x.CountryID, &x.CountryName, &x.Fee, &x.Source, &x.Result, &x.Reason, &x.Raw, &x.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, x)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) HeroSMSBlacklistedCountryIDs(ctx context.Context, service string) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT country_id FROM herosms_country_blacklist WHERE service=?`, service)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListHeroSMSCountryBlacklist(ctx context.Context, service string) ([]HeroSMSCountryBlacklist, error) {
+	where := ""
+	args := []any{}
+	if service = strings.TrimSpace(service); service != "" {
+		where = "WHERE l.service=?"
+		args = append(args, service)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, service, country_id, country_name, reason, created_at, updated_at FROM herosms_country_blacklist `+where+` ORDER BY service, country_name, country_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []HeroSMSCountryBlacklist{}
+	for rows.Next() {
+		var x HeroSMSCountryBlacklist
+		if err := rows.Scan(&x.ID, &x.Service, &x.CountryID, &x.CountryName, &x.Reason, &x.CreatedAt, &x.UpdatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, x)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) UpsertHeroSMSCountryBlacklist(ctx context.Context, in HeroSMSCountryBlacklist) error {
+	if strings.TrimSpace(in.Service) == "" || strings.TrimSpace(in.CountryID) == "" {
+		return errors.New("缺少 service/country_id")
+	}
+	now := time.Now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO herosms_country_blacklist (service, country_id, country_name, reason, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE country_name=VALUES(country_name), reason=VALUES(reason), updated_at=VALUES(updated_at)`,
+		in.Service, in.CountryID, in.CountryName, in.Reason, now, now)
+	return err
+}
+
+func (s *Store) DeleteHeroSMSCountryBlacklist(ctx context.Context, service, countryID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM herosms_country_blacklist WHERE service=? AND country_id=?`, service, countryID)
+	return err
 }
 
 // UpdateOpenAIAccountModels 缓存 Bridge 拉回的模型目录。目录随账号套餐变化,
@@ -2137,25 +2466,28 @@ type OutlookAccount struct {
 	LastRefreshError      string    `json:"last_refresh_error"`
 	CreatedAt             time.Time `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
-	// HasGPTAccount 是否在 OPENAI 菜单里存在同邮箱的 GPT 账号,存在
-	// outlook_login_tokens.has_gpt_account 列里。为 0 的行每次列表查询仍会关联
-	// openai_accounts 复算一次,一旦算出 1 就回写该列(只 0→1,不回退)。
+	// HasCodexAccount 表示这个 Outlook 邮箱是否已经在 OPENAI/Codex 里登录过账号。
+	// 底层沿用历史列 outlook_login_tokens.has_gpt_account。
+	HasCodexAccount bool `json:"has_codex_account"`
+	// HasGPTAccount 保留给旧前端/旧调用方兼容,含义同 HasCodexAccount。
 	HasGPTAccount bool `json:"has_gpt_account"`
+	// RegisteredGPTAccount 是「是否已完成 ChatGPT 注册」标记,不在页面展示,只控制注册按钮。
+	RegisteredGPTAccount bool `json:"registered_gpt_account"`
 	// HasPassword 表示这行存了明文登录密码。只返回「有没有」,不返回密码本身,
 	// 供页面决定行内「登录」按钮能不能点(自动登录需要密码)。
 	HasPassword bool `json:"has_password"`
 }
 
 // ListOutlookAccounts 列出所有已登录的 Outlook 账号(不含任何 token/cookie 明文)。
-// GPT 账号标记以 has_gpt_account 列为准;该列为 0 的行才按邮箱关联 openai_accounts 复算一次
-// (CASE 短路,已是 1 的行不做子查询),复算出 1 的行在返回前回写该列,下次直接读列。
+// Codex 登录标记以历史列 has_gpt_account 为准;该列为 0 的行才按邮箱关联 openai_accounts
+// 复算一次。注册标记 registered_gpt_account 独立维护;Codex 已登录时会顺手视为已注册并回写。
 func (s *Store) ListOutlookAccounts(ctx context.Context) ([]OutlookAccount, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT t.id, t.email, COALESCE(t.display_name,''), COALESCE(t.tenant_id,''), COALESCE(t.scope,''),
 		COALESCE(t.token_type,''), COALESCE(CHAR_LENGTH(t.access_token),0), COALESCE(CHAR_LENGTH(t.refresh_token),0),
 		COALESCE(t.expires_in,0), COALESCE(t.refresh_token_expires_in,0), COALESCE(t.cookie_count,0),
 		t.token_issued_at, t.access_token_expires_at, t.refresh_token_expires_at,
 		COALESCE(t.last_refresh_status,''), COALESCE(t.last_refresh_error,''), t.created_at, t.updated_at,
-		t.has_gpt_account,
+		t.has_gpt_account, t.registered_gpt_account,
 		CASE WHEN t.has_gpt_account=1 THEN 1
 			ELSE EXISTS(SELECT 1 FROM openai_accounts oa WHERE oa.email = t.email AND oa.email <> '') END,
 		CHAR_LENGTH(COALESCE(t.password,'')) > 0
@@ -2165,22 +2497,28 @@ func (s *Store) ListOutlookAccounts(ctx context.Context) ([]OutlookAccount, erro
 	}
 	defer rows.Close()
 	out := make([]OutlookAccount, 0)
-	var backfill []int64 // 列里是 0、但刚关联到 GPT 账号的行,查完统一回写
+	var codexBackfill []int64      // has_gpt_account 列里是 0、但刚关联到 Codex 账号的行
+	var registeredBackfill []int64 // 注册列是 0、但已确认注册/Codex 已登录的行
 	for rows.Next() {
 		var a OutlookAccount
 		var issuedAt, accessExp, refreshExp sql.NullTime
-		var storedGPT, hasGPT, hasPassword int64
+		var storedCodex, storedRegistered, hasCodex, hasPassword int64
 		if err := rows.Scan(&a.ID, &a.Email, &a.DisplayName, &a.TenantID, &a.Scope,
 			&a.TokenType, &a.AccessTokenLen, &a.RefreshTokenLen,
 			&a.ExpiresIn, &a.RefreshTokenExpiresIn, &a.CookieCount,
 			&issuedAt, &accessExp, &refreshExp,
-			&a.LastRefreshStatus, &a.LastRefreshError, &a.CreatedAt, &a.UpdatedAt, &storedGPT, &hasGPT, &hasPassword); err != nil {
+			&a.LastRefreshStatus, &a.LastRefreshError, &a.CreatedAt, &a.UpdatedAt, &storedCodex, &storedRegistered, &hasCodex, &hasPassword); err != nil {
 			return nil, err
 		}
-		a.HasGPTAccount = hasGPT != 0
+		a.HasCodexAccount = hasCodex != 0
+		a.HasGPTAccount = a.HasCodexAccount
+		a.RegisteredGPTAccount = storedRegistered != 0 || a.HasCodexAccount
 		a.HasPassword = hasPassword != 0
-		if storedGPT == 0 && a.HasGPTAccount {
-			backfill = append(backfill, a.ID)
+		if storedCodex == 0 && a.HasCodexAccount {
+			codexBackfill = append(codexBackfill, a.ID)
+		}
+		if storedRegistered == 0 && a.RegisteredGPTAccount {
+			registeredBackfill = append(registeredBackfill, a.ID)
 		}
 		if issuedAt.Valid {
 			a.TokenIssuedAt = issuedAt.Time
@@ -2197,15 +2535,18 @@ func (s *Store) ListOutlookAccounts(ctx context.Context) ([]OutlookAccount, erro
 		return nil, err
 	}
 	rows.Close()
-	if err := s.markOutlookHasGPT(ctx, backfill); err != nil {
+	if err := s.markOutlookHasCodex(ctx, codexBackfill); err != nil {
+		return nil, err
+	}
+	if err := s.MarkOutlookRegisteredGPT(ctx, registeredBackfill); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// markOutlookHasGPT 把这些行的 has_gpt_account 刷成 1。显式写 updated_at=updated_at,
+// markOutlookHasCodex 把这些行的 has_gpt_account(历史字段)刷成 1。显式写 updated_at=updated_at,
 // 避免 ON UPDATE CURRENT_TIMESTAMP 把「更新时间」刷成这次纯内部回写的时刻。
-func (s *Store) markOutlookHasGPT(ctx context.Context, ids []int64) error {
+func (s *Store) markOutlookHasCodex(ctx context.Context, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -2217,6 +2558,32 @@ func (s *Store) markOutlookHasGPT(ctx context.Context, ids []int64) error {
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE outlook_login_tokens SET has_gpt_account=1, updated_at=updated_at
 		WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	return err
+}
+
+// MarkOutlookRegisteredGPT 把这些 Outlook 行标记为“已注册 ChatGPT”。
+func (s *Store) MarkOutlookRegisteredGPT(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, 0, len(ids))
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE outlook_login_tokens SET registered_gpt_account=1, updated_at=updated_at
+		WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	return err
+}
+
+// MarkOutlookRegisteredGPTByEmail 按邮箱标记为“已注册 ChatGPT”;注册自动化成功后调用。
+func (s *Store) MarkOutlookRegisteredGPTByEmail(ctx context.Context, email string) error {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE outlook_login_tokens SET registered_gpt_account=1, updated_at=updated_at WHERE email=?`, email)
 	return err
 }
 
@@ -2253,7 +2620,7 @@ func (s *Store) GetOutlookAccountByID(ctx context.Context, id int64) (OutlookAcc
 		COALESCE(token_type,''), COALESCE(CHAR_LENGTH(access_token),0), COALESCE(CHAR_LENGTH(refresh_token),0),
 		COALESCE(expires_in,0), COALESCE(refresh_token_expires_in,0), COALESCE(cookie_count,0),
 		token_issued_at, access_token_expires_at, refresh_token_expires_at,
-		COALESCE(last_refresh_status,''), COALESCE(last_refresh_error,''), created_at, updated_at, has_gpt_account,
+		COALESCE(last_refresh_status,''), COALESCE(last_refresh_error,''), created_at, updated_at, has_gpt_account, registered_gpt_account,
 		CHAR_LENGTH(COALESCE(password,'')) > 0
 		FROM outlook_login_tokens WHERE id=?`, id)
 	if err != nil {
@@ -2268,15 +2635,17 @@ func (s *Store) GetOutlookAccountByID(ctx context.Context, id int64) (OutlookAcc
 	}
 	var a OutlookAccount
 	var issuedAt, accessExp, refreshExp sql.NullTime
-	var hasGPT, hasPassword int64
+	var hasCodex, registeredGPT, hasPassword int64
 	if err := rows.Scan(&a.ID, &a.Email, &a.DisplayName, &a.TenantID, &a.Scope,
 		&a.TokenType, &a.AccessTokenLen, &a.RefreshTokenLen,
 		&a.ExpiresIn, &a.RefreshTokenExpiresIn, &a.CookieCount,
 		&issuedAt, &accessExp, &refreshExp,
-		&a.LastRefreshStatus, &a.LastRefreshError, &a.CreatedAt, &a.UpdatedAt, &hasGPT, &hasPassword); err != nil {
+		&a.LastRefreshStatus, &a.LastRefreshError, &a.CreatedAt, &a.UpdatedAt, &hasCodex, &registeredGPT, &hasPassword); err != nil {
 		return OutlookAccount{}, err
 	}
-	a.HasGPTAccount = hasGPT != 0
+	a.HasCodexAccount = hasCodex != 0
+	a.HasGPTAccount = a.HasCodexAccount
+	a.RegisteredGPTAccount = registeredGPT != 0 || a.HasCodexAccount
 	a.HasPassword = hasPassword != 0
 	if issuedAt.Valid {
 		a.TokenIssuedAt = issuedAt.Time

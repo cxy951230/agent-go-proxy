@@ -18,7 +18,7 @@ var baseTemplate = template.Must(template.New("base").Funcs(template.FuncMap{
 		if t.IsZero() {
 			return ""
 		}
-		return t.Format("2006-01-02 15:04:05")
+		return t.In(time.Local).Format("2006-01-02 15:04:05")
 	},
 	"fmtNullTime": func(t any) string {
 		if nt, ok := t.(interface {
@@ -26,7 +26,7 @@ var baseTemplate = template.Must(template.New("base").Funcs(template.FuncMap{
 		}); ok {
 			v, _ := nt.Value()
 			if tv, ok := v.(time.Time); ok {
-				return tv.Format("2006-01-02 15:04:05")
+				return tv.In(time.Local).Format("2006-01-02 15:04:05")
 			}
 		}
 		return ""
@@ -720,12 +720,7 @@ document.getElementById('sidebar-toggle').addEventListener('click', () => {
   localStorage.setItem('sidebarCollapsed', appEl.classList.contains('sidebar-collapsed') ? '1' : '0');
 });
 const fmtInt = n => Number(n || 0).toLocaleString('en-US');
-const fmtTime = v => {
-  if (!v) return '';
-  const d = new Date(v);
-  const pad = n => String(n).padStart(2, '0');
-  return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
-};
+const fmtTime = v => v ? new Date(v).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}) : '';
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const short = (v, n) => (v || '').length > n ? (v || '').slice(0, n) + '...' : (v || '');
 const accountLabel = item => item.AccountName || short(item.AccountID || 'unknown', 12);

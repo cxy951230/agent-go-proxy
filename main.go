@@ -58,6 +58,9 @@ type proxyServer struct {
 	accounts      *accountPool
 	openaiLogins  *openAILoginManager
 	outlookLogins *outlookLoginManager // OUTLOOK 页「登录账号」(拉起 Chrome 手动登录)
+	gptSignups    *gptSignupManager    // OUTLOOK 页「注册 GPT」(CDP 自动化)
+	gptLogins     *gptLoginManager     // OUTLOOK 页「登录 Codex」(CDP 自动化 + HeroSMS 手机验证)
+	herosmsTrack  herosmsTracker       // 买过号码的后台自动取消跟踪器
 	outlookJob    *batchRefreshJob     // OUTLOOK 页「刷新全部 Token」
 	openaiJob     *batchRefreshJob     // OPENAI 页「刷新全部额度」
 
@@ -250,11 +253,14 @@ func chainSessionKey(chainID int64, sessionID string) string {
 }
 
 func main() {
+	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+		time.Local = loc
+	}
 	listenAddr := flag.String("listen", "127.0.0.1:8080", "local listen address")
 	targetValue := flag.String("target", envOrDefault("UPSTREAM_BASE_URL", "https://chatgpt.com/backend-api/codex"), "upstream base URL for Codex requests")
 	claudeTargetValue := flag.String("claude-target", envOrDefault("CLAUDE_BASE_URL", "https://api.anthropic.com"), "upstream base URL for Claude (Anthropic) requests")
 	logDir := flag.String("log-dir", "log", "directory for date-based JSONL logs")
-	dsn := flag.String("mysql-dsn", envOrDefault("MYSQL_DSN", "root:123456@tcp(127.0.0.1:3306)/agent_go_proxy?parseTime=true&charset=utf8mb4&loc=Local"), "MySQL DSN")
+	dsn := flag.String("mysql-dsn", envOrDefault("MYSQL_DSN", "root:123456@tcp(127.0.0.1:3306)/agent_go_proxy?parseTime=true&charset=utf8mb4&loc=Asia%2FShanghai"), "MySQL DSN")
 	bridgeLibrary := flag.String("codex-bridge-lib", defaultBridgeLoginBin(), "path to libcodex_bridge dynamic library")
 	flag.Parse()
 
@@ -325,6 +331,15 @@ func main() {
 		openaiModelsJob: &batchRefreshJob{},
 	}
 	defer srv.outlookLogins.Close()
+	srv.gptSignups = newGPTSignupManager(srv)
+	defer srv.gptSignups.Close()
+	srv.gptLogins = newGPTLoginManager(srv)
+	defer srv.gptLogins.Close()
+
+	// 买过号码超 125s 未用上就自动取消(login 手机验证配套)。
+	herosmsCancelCtx, stopHeroSMSCancel := context.WithCancel(context.Background())
+	defer stopHeroSMSCancel()
+	go srv.runHeroSMSCanceler(herosmsCancelCtx)
 
 	// 定时刷新额度的开关:默认开启,从 app_settings 读回上次的选择。
 	srv.quotaAutoRefresh.Store(true)
@@ -391,6 +406,12 @@ func main() {
 	router.Get("/api/outlook/accounts/{id}/messages", srv.handleAPIOutlookMailList)
 	router.Get("/api/outlook/accounts/{id}/message", srv.handleAPIOutlookMailMessage)
 	router.Get("/api/outlook/mail/code", srv.handleAPIOutlookMailCode)
+	router.Post("/api/outlook/accounts/{id}/gpt-signup", func(w http.ResponseWriter, r *http.Request) { srv.gptSignups.handleStart(w, r) })
+	router.Get("/api/gpt-signup/{id}", func(w http.ResponseWriter, r *http.Request) { srv.gptSignups.handleStatus(w, r) })
+	router.Post("/api/gpt-signup/{id}/cancel", func(w http.ResponseWriter, r *http.Request) { srv.gptSignups.handleCancel(w, r) })
+	router.Post("/api/outlook/accounts/{id}/gpt-login", func(w http.ResponseWriter, r *http.Request) { srv.gptLogins.handleStart(w, r) })
+	router.Get("/api/gpt-login/{id}", func(w http.ResponseWriter, r *http.Request) { srv.gptLogins.handleStatus(w, r) })
+	router.Post("/api/gpt-login/{id}/cancel", func(w http.ResponseWriter, r *http.Request) { srv.gptLogins.handleCancel(w, r) })
 	router.Post("/api/outlook/accounts/{id}/send", srv.handleAPIOutlookAccountSend)
 	router.Post("/api/outlook/mail/send", srv.handleAPIOutlookMailSend)
 	router.Put("/api/outlook/accounts/{id}", srv.handleAPIOutlookAccountUpdate)
@@ -412,6 +433,13 @@ func main() {
 	router.Get("/api/herosms/status", srv.handleAPIHeroSMSStatus)
 	router.Post("/api/herosms/cancel", srv.handleAPIHeroSMSCancel)
 	router.Post("/api/herosms/finish", srv.handleAPIHeroSMSFinish)
+	router.Get("/api/herosms/activations", srv.handleAPIHeroSMSActivations)
+	router.Delete("/api/herosms/activations/done", srv.handleAPIHeroSMSActivationsClearDone)
+	router.Get("/api/herosms/attempt-logs", srv.handleAPIHeroSMSAttemptLogs)
+	router.Get("/api/herosms/countries", srv.handleAPIHeroSMSCountries)
+	router.Get("/api/herosms/blacklist", srv.handleAPIHeroSMSBlacklist)
+	router.Post("/api/herosms/blacklist", srv.handleAPIHeroSMSBlacklistSave)
+	router.Delete("/api/herosms/blacklist", srv.handleAPIHeroSMSBlacklistDelete)
 	router.Get("/api/herosms/active", srv.handleAPIHeroSMSActive)
 	router.Get("/stats/tokens", srv.handleTokenStatsPage)
 	router.Get("/api/stats/tokens", srv.handleAPITokenStats)

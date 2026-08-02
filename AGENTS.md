@@ -251,6 +251,39 @@ CDP 侧为此在 `cdp.go` 增加了**页面级会话**：`Target.attachToTarget{
 - 接口：`GET /herosms`(页) + `GET/POST /api/herosms/config`、`GET /api/herosms/balance`、`GET /api/herosms/services`、`GET /api/herosms/offers?service=&max_price=&min_count=`、`POST /api/herosms/number {service,country,max_price}`、`GET /api/herosms/status?id=`、`POST /api/herosms/cancel {id}`、`POST /api/herosms/finish {id}`、`GET /api/herosms/active`。
 - **注意**：HeroSMS 的手机验证**编排**（多国轮换、blocked 国家、E.164 输入、React Aria 国家选择器等踩坑）仍在 skill 的 Python 里，这里搬的是单步接码原语 + 页面手动编排（选服务/查价/买/轮询/取消），不含把验证码自动填进 OpenAI 登录页那段。
 
+## GPT 账号自动化(注册 / 登录 Codex)
+
+把 `gpt-account-signup` 和 `gpt-login-automation` 两个 skill 的 Python 移植成**原生 Go**,用 cdp.go 的隔离 Chrome + DOM 状态机驱动。OUTLOOK 页每行两个按钮:**注册GPT**(signup)、**登录Codex**(login)。用户手动点触发,后台异步跑,页面轮询状态框显示进度。
+
+**共享驱动**(`gpt_automation.go`):`gptDriver` 包 `gptChrome`(见下 CDP 传输),提供 `state`(一次性 DOM 快照 union)、`insertTrusted`(focus+Input.insertText,signup 用)、`reactFill`(原型 value setter+派发 input/change,login 受控组件用)、`clickContinue`/`clickContinueOrEnter`/`clickExact`/`submitForm`/`pressEnter`/`navigate`/`waitUntil`。`gptIsHuman` 命中 captcha/turnstile/arkose 即停。`gptErrorPageReason` 命中 OpenAI 自己的报错页(Route Error / Invalid content type: text/html)即快速失败。`fetchFreshGPTCode` 复用 `outlookMailFetch` 取「发件人/主题含 openai|chatgpt 且晚于提交时刻」的验证码(避开旧微软安全码)。
+
+**CDP 传输必须用端口模式 + 直连页面 WS(`cdp_ws.go`)**,不能用 cdp.go 的 pipe + `Target.attachToTarget`:
+- **踩坑**:pipe 是浏览器级连接,`Target.attachToTarget` 会触发 Chrome 的 **AutomationControlled** 特性 → `navigator.webdriver=true` → OpenAI/Cloudflare 判定机器人 → 后端返回 **HTML 错误页**(前端报 `Route Error 400 Invalid content type: text/html`),验证码明明通过了却卡这。`--disable-blink-features=AutomationControlled` 能压掉 webdriver 但会弹「不受支持的命令行标记」横幅(本身也是检测信号),不用。
+- **正解(与 skill 一致)**:`--remote-debugging-port=<free>` 起 Chrome → HTTP `GET /json/list` 取页面目标的 `webSocketDebuggerUrl` → **直连该页面 WS**(不碰浏览器级目标、不 attachToTarget)→ Runtime/Page.enable。这样 `navigator.webdriver=false`,与真人一致。探针 `cdp_ws_probe_test.go`(需 `PROBE_GPT_CDP=1`)实测过 webdriver=false。
+- `cdp_ws.go` 里手写了**零依赖的最小 RFC6455 客户端**(文本帧 + 客户端掩码 + 分片重组 + ping→pong),CDP 走它。`gptChrome` 提供 `Evaluate`/`InsertText`/`Key`/`Navigate`/`Close`(Close 杀进程 + 删临时 profile)。启动参数与 skill 对齐(`--disable-sync --disable-default-apps --remote-allow-origins=* --new-window`)。**只 GPT 流程用这套;OUTLOOK 登录仍走 cdp.go 的 pipe(它不碰 OpenAI 反爬,没这问题)**。
+
+**关键设计**(与 skill 的差异):
+- **任务结束一律删临时 profile**:`gptDriver.Close()` 走 cdp.go 的 `session.Close()`(内部 `os.RemoveAll(profile)`),defer 在 run 里,失败/取消/完成都清。**不做 resume**(skill 有,这里砍掉)。
+- **不做模型兜底**:撞人机验证/账号停用/未知状态就干净失败(状态置 `human_verification`/`failed`,留窗口给人工),不靠 LLM 现场改选择器。DOM 一变要改 Go 重编译。
+- **不切 Clash**。
+- 管理器(`gptSignupManager` 等)与 `outlookLoginManager` 同构:一次只跑一个、重复发起 409、`context.Background()` 不随请求取消、Close 时 WaitGroup 收尾。
+
+### signup(已完成)
+
+`gpt_signup.go`,移植自 `chatgpt_signup.py`。状态机:`chatgpt.com/auth/login` → 填邮箱提交 → 等 DOM 真跳 `email-verification`+有 code 输入框 → 取新鲜码填入回车 → about-you 填 name/age → all-set 点 Continue → `chatgpt.com/` 出欢迎文案=成功。name 从邮箱本地部分猜(`deriveSignupName`)。**免费号注册撞 CAPTCHA 概率高**,撞到即转 `human_verification` 停。
+- 接口:`POST /api/outlook/accounts/{id}/gpt-signup`、`GET /api/gpt-signup/{id}`、`POST /api/gpt-signup/{id}/cancel`。
+- 离线单测:`gpt_signup_test.go`(名字推导、状态分类、human 检测、jsStr 转义)。
+
+### login(已完成)
+
+`gpt_login.go`,移植自 `gpt_login_automation.py`。`openaiLogins.Start(邮箱前缀)` 拿 auth_url(`open_browser:false`,Bridge 只起 1455 回调)+ bridgeID → 开隔离 Chrome → `enterEmailAndCode`(reactFill 邮箱+码,新鲜过滤)→ 若未到 consent 则 `phoneFlow` 手机验证 → `clickConsent` 点 Continue 等 `localhost:1455/success` → `waitLoginCompleted` 轮询 `openaiLogins.Status(bridgeID)==completed`。
+- **手机验证** `phoneFlow`:`herosmsOfferRows` 拉 dr 优惠逐国试,每国批量买最多 3 个号(`herosmsBuyNumber`),`setCountryPhone` 输完整 E.164 让控件自解析国家+强制 SMS,`submitPhone` 提交,按返回文案分流(SMS 成功→`pollSMS`轮询→`finishActivation`+`fillPhoneCode`;WhatsApp-only/无法发短信→拉黑该国换下一国;已用/无效→换下一个号;授权失效/次数过多→整体失败)。`isSMSCodeForm`/`isWhatsappOnly` 判交付方式。blocked 国家目前**只在本次运行内存**(不跨运行持久化)。
+- **接码后台异步取消**(按用户要求):买号后 `herosmsRegister(actID)` 登记进 `herosmsTracker`,**不再任务结束阻塞等 2 分钟**。后台 `runHeroSMSCanceler`(每 30s)把**超 125s 未用上**的号自动 `cancelActivation`(HeroSMS 有 120s 最小激活期,提前取消 `EARLY_CANCEL_DENIED`,故卡 125s)。用上验证码的号 `herosmsMarkUsed` 标记,不会被取消。
+- **与 signup 互斥**:两者都开浏览器,一次只跑一个(`hasRunning` 交叉检查,固定锁序避免死锁),重复发起 409。
+- 接口:`POST /api/outlook/accounts/{id}/gpt-login`、`GET /api/gpt-login/{id}`、`POST /api/gpt-login/{id}/cancel`。前端「登录Codex」按钮 + 任务状态框已就位。
+- 离线单测:`gpt_login_test.go`(交付方式判定、Continue 检测、邮箱前缀)。
+- **未移植**:resume、Clash 切换、blocked 国家跨运行持久化、`attempt_history.jsonl` 明细、余额花费汇总。
+
 ## 路由与第三方 API 转发
 
 `ServeHTTP`（main.go）在转发前按请求风格挑选上游，`forwardPlans` 生成候选，优先级如下：

@@ -115,6 +115,14 @@ var outlookProblemPhrases = []string{
 	"too many times",
 	"something went wrong",
 	"we ran into a problem",
+	"err_connection_closed",
+	"err_connection_reset",
+	"err_timed_out",
+	"this site can't be reached",
+	"this site can’t be reached",
+	"unexpectedly closed the connection",
+	"无法访问此网站",
+	"意外终止了连接",
 }
 
 // classifyOutlookLoginState 把一次 DOM 快照归类成登录状态。**判定顺序不能改**:
@@ -722,6 +730,14 @@ func outlookProblemReason(snap domSnapshot) string {
 		{"does not exist", "账号不存在"},
 		{"enter a valid email address", "邮箱格式不被接受"},
 		{"incorrect", "账号或密码不正确"},
+		{"err_connection_closed", "登录页网络加载失败(ERR_CONNECTION_CLOSED)"},
+		{"err_connection_reset", "登录页网络加载失败(ERR_CONNECTION_RESET)"},
+		{"err_timed_out", "登录页网络加载超时(ERR_TIMED_OUT)"},
+		{"无法访问此网站", "登录页网络加载失败：无法访问此网站"},
+		{"意外终止了连接", "登录页网络加载失败：连接被意外终止"},
+		{"unexpectedly closed the connection", "登录页网络加载失败：连接被意外终止"},
+		{"this site can't be reached", "登录页网络加载失败：无法访问此网站"},
+		{"this site can’t be reached", "登录页网络加载失败：无法访问此网站"},
 		{"we ran into a problem", "微软登录页报错"},
 		{"something went wrong", "微软登录页报错"},
 	}

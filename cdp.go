@@ -99,14 +99,24 @@ func chromeExecutable() string {
 	return ""
 }
 
-// launchChrome 用独立的临时 profile 启动一个可见的 Chrome 窗口并接上 CDP 管道。
-// profile 目录由 session 自己管理,Close 时删除。
+// launchChrome 用独立的临时 profile 启动一个可见的 Chrome 窗口并接上 CDP 管道(OUTLOOK 登录用)。
 func launchChrome(startURL string) (*chromeSession, error) {
+	return launchChromeWith(startURL, "agent-go-proxy-outlook-login-", []string{
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-background-networking",
+		"--window-size=1120,860",
+	})
+}
+
+// launchChromeWith 是 launchChrome 的可定制版本:调用方给中间那段启动参数,pipe/profile/startURL 仍由本函数管。
+// profile 目录 Close 时删除。GPT 注册/登录流程用它 + 反检测参数(见 gpt_automation.go)。
+func launchChromeWith(startURL, profilePrefix string, flags []string) (*chromeSession, error) {
 	binary := chromeExecutable()
 	if binary == "" {
 		return nil, errors.New("没找到 Chrome,可用环境变量 CHROME_PATH 指定可执行文件路径")
 	}
-	profile, err := os.MkdirTemp("", "agent-go-proxy-outlook-login-")
+	profile, err := os.MkdirTemp("", profilePrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -124,15 +134,9 @@ func launchChrome(startURL string) (*chromeSession, error) {
 		return nil, err
 	}
 
-	cmd := exec.Command(binary,
-		"--remote-debugging-pipe",
-		"--user-data-dir="+profile,
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--disable-background-networking",
-		"--window-size=1120,860",
-		startURL,
-	)
+	args := append([]string{"--remote-debugging-pipe", "--user-data-dir=" + profile}, flags...)
+	args = append(args, startURL)
+	cmd := exec.Command(binary, args...)
 	cmd.ExtraFiles = []*os.File{inRead, outWrite}
 	if err := cmd.Start(); err != nil {
 		inRead.Close()

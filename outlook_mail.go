@@ -631,7 +631,7 @@ const outlookMailHTML = `
 <script>
 const account={{toJSON .}};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const fmtTime=v=>v?new Date(v).toLocaleString('zh-CN',{hour12:false}):'';
+const fmtTime=v=>v?new Date(v).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'';
 document.getElementById('title').textContent='邮件 · '+(account.email||'');
 let history=[''];   // 每页的 next token(第一页为空串);栈式前进/后退
 let cur=0;
