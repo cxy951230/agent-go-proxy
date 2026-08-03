@@ -105,7 +105,7 @@ func (p *proxyServer) runHeroSMSCanceler(ctx context.Context) {
 		}
 		p.herosmsTrack.mu.Unlock()
 		for _, id := range due {
-			text, err := p.herosmsGet(ctx, key, "cancelActivation", map[string]string{"id": id})
+			text, err := p.herosmsCancelActivation(ctx, key, id)
 			if err != nil {
 				log.Printf("HeroSMS 自动取消 %s 失败: %v (%s)", id, err, text)
 			} else if p.store != nil {
@@ -123,12 +123,12 @@ func (p *proxyServer) runHeroSMSCanceler(ctx context.Context) {
 					if item.ID == "" {
 						continue
 					}
-					text, err := p.herosmsGet(ctx, key, "cancelActivation", map[string]string{"id": item.ID})
+					text, err := p.herosmsCancelActivation(ctx, key, item.ID)
 					if err != nil {
 						log.Printf("HeroSMS 数据库自动取消 %s 失败: %v (%s)", item.ID, err, text)
-						if strings.Contains(text, "STATUS_CANCEL") || strings.Contains(text, "ALREADY_CANCEL") || strings.Contains(text, "NO_ACTIVATION") {
-							_ = p.store.UpdateHeroSMSActivationStatus(ctx, item.ID, "cancelled", "", text)
-						}
+						// 已经尝试过自动取消但仍失败的记录标成 cancel_failed，避免每 30 秒重复处理刷屏。
+						// 如果后续需要人工处理，可以在 HeroSMS 页面 include_done 查看 last_raw。
+						_ = p.store.UpdateHeroSMSActivationStatus(ctx, item.ID, "cancel_failed", "", fallback(text, err.Error()))
 						continue
 					}
 					_ = p.store.UpdateHeroSMSActivationStatus(ctx, item.ID, "cancelled", "", text)
@@ -193,6 +193,39 @@ func (p *proxyServer) herosmsGet(ctx context.Context, key, action string, params
 		return text, fmt.Errorf("HeroSMS %s HTTP %d: %s", action, resp.StatusCode, truncate(text, 200))
 	}
 	return text, nil
+}
+
+// herosmsCancelActivation 对 cancelActivation 做终态归一化。
+// HeroSMS 对已经结束的激活可能返回 409 ACTIVATION_NOT_ACTIVE，也可能返回 204 空响应；
+// 这些都表示本地不应再继续取消，统一当作已取消成功处理。
+func (p *proxyServer) herosmsCancelActivation(ctx context.Context, key, id string) (string, error) {
+	text, err := p.herosmsGet(ctx, key, "cancelActivation", map[string]string{"id": id})
+	if err == nil {
+		if strings.TrimSpace(text) == "" {
+			return "cancelActivation: empty success response", nil
+		}
+		return text, nil
+	}
+	if heroSMSCancelTerminal(text, err) {
+		if strings.TrimSpace(text) != "" {
+			return text, nil
+		}
+		return err.Error(), nil
+	}
+	return text, err
+}
+
+func heroSMSCancelTerminal(text string, err error) bool {
+	combined := strings.ToUpper(strings.TrimSpace(text))
+	if err != nil {
+		combined += "\n" + strings.ToUpper(err.Error())
+	}
+	return strings.Contains(combined, "STATUS_CANCEL") ||
+		strings.Contains(combined, "ALREADY_CANCEL") ||
+		strings.Contains(combined, "NO_ACTIVATION") ||
+		strings.Contains(combined, "ACTIVATION_NOT_ACTIVE") ||
+		strings.Contains(combined, "ACTIVATION IS TERMINATED") ||
+		strings.Contains(combined, "HTTP 204")
 }
 
 // ---- 国家名缓存(getCountries 结果较大且极少变,缓存 1 小时)----
@@ -533,7 +566,13 @@ func (p *proxyServer) herosmsActivationAction(w http.ResponseWriter, r *http.Req
 		http.Error(w, "缺少 id", http.StatusBadRequest)
 		return
 	}
-	text, err := p.herosmsGet(r.Context(), p.herosmsKey(r.Context()), action, map[string]string{"id": in.ID})
+	var text string
+	var err error
+	if action == "cancelActivation" {
+		text, err = p.herosmsCancelActivation(r.Context(), p.herosmsKey(r.Context()), in.ID)
+	} else {
+		text, err = p.herosmsGet(r.Context(), p.herosmsKey(r.Context()), action, map[string]string{"id": in.ID})
+	}
 	if err != nil {
 		http.Error(w, err.Error()+" | "+text, http.StatusBadGateway)
 		return

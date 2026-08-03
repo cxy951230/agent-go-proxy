@@ -701,7 +701,7 @@ func (s *Store) SaveHeroSMSActivation(ctx context.Context, a HeroSMSActivation) 
 func (s *Store) ListHeroSMSActivations(ctx context.Context, includeDone bool) ([]HeroSMSActivation, error) {
 	where := ""
 	if !includeDone {
-		where = "WHERE status NOT IN ('cancelled','finished')"
+		where = "WHERE status NOT IN ('cancelled','finished','cancel_failed')"
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT activation_id, phone, service, country_id, country_name, price, source, status, code, COALESCE(last_raw,''), bought_at, updated_at,
 		finished_at, cancelled_at FROM herosms_activations `+where+` ORDER BY bought_at DESC LIMIT 300`)
@@ -746,7 +746,7 @@ func (s *Store) UpdateHeroSMSActivationStatus(ctx context.Context, id, status, c
 	if status == "finished" {
 		finished = now
 	}
-	if status == "cancelled" {
+	if status == "cancelled" || status == "cancel_failed" {
 		cancelled = now
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE herosms_activations SET status=?, code=IF(?<>'', ?, code), last_raw=?, updated_at=?,
@@ -759,7 +759,7 @@ func (s *Store) DueHeroSMSActivations(ctx context.Context, olderThan time.Durati
 	cutoff := time.Now().Add(-olderThan)
 	rows, err := s.db.QueryContext(ctx, `SELECT activation_id, phone, service, country_id, country_name, price, source, status, code, COALESCE(last_raw,''), bought_at, updated_at,
 		finished_at, cancelled_at FROM herosms_activations
-		WHERE status NOT IN ('cancelled','finished') AND bought_at<=? ORDER BY bought_at ASC LIMIT 100`, cutoff)
+		WHERE status NOT IN ('cancelled','finished','cancel_failed') AND bought_at<=? ORDER BY bought_at ASC LIMIT 100`, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -783,7 +783,7 @@ func (s *Store) DueHeroSMSActivations(ctx context.Context, olderThan time.Durati
 }
 
 func (s *Store) ClearDoneHeroSMSActivations(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM herosms_activations WHERE status IN ('cancelled','finished')`)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM herosms_activations WHERE status IN ('cancelled','finished','cancel_failed')`)
 	return err
 }
 
