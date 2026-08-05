@@ -79,4 +79,5 @@ Useful flags:
 ```sh
 go run . -listen 127.0.0.1:18080
 go run . -mysql-dsn 'root:123456@tcp(127.0.0.1:3306)/agent_go_proxy?parseTime=true&charset=utf8mb4&loc=Local'
+# OPENAI/OUTLOOK 后端请求和 GPT 账号直连对话请求在代码里固定走 http://127.0.0.1:7899
 ```

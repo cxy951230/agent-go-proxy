@@ -256,10 +256,12 @@ func launchGPTChrome(ctx context.Context, startURL string) (*gptChrome, error) {
 		"--disable-sync",
 		"--disable-default-apps",
 		"--remote-allow-origins=*",
+		"--proxy-server="+scopedLocalProxyURL,
 		fmt.Sprintf("--remote-debugging-port=%d", port),
 		"--new-window",
 		startURL,
 	)
+	cmd.Env = withoutProxyEnv(os.Environ())
 	if err := cmd.Start(); err != nil {
 		_ = os.RemoveAll(profile)
 		return nil, fmt.Errorf("启动 Chrome 失败: %w", err)

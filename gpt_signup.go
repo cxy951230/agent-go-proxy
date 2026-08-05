@@ -102,7 +102,7 @@ func (m *gptSignupManager) Start(email, name, age string) (gptSignupStatus, erro
 	if strings.TrimSpace(age) == "" {
 		age = "30"
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), scopedProxyContextKey{}, true))
 	proc := &gptSignupProcess{
 		status: gptSignupStatus{ID: id, Email: email, State: "running", Message: "启动浏览器…", StartedAt: time.Now()},
 		cancel: cancel,

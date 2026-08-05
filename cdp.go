@@ -137,6 +137,7 @@ func launchChromeWith(startURL, profilePrefix string, flags []string) (*chromeSe
 	args := append([]string{"--remote-debugging-pipe", "--user-data-dir=" + profile}, flags...)
 	args = append(args, startURL)
 	cmd := exec.Command(binary, args...)
+	cmd.Env = withoutProxyEnv(os.Environ())
 	cmd.ExtraFiles = []*os.File{inRead, outWrite}
 	if err := cmd.Start(); err != nil {
 		inRead.Close()

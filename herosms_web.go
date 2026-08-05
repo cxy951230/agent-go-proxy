@@ -52,6 +52,7 @@ const herosmsHTML = `
     .finish-btn{color:var(--green);border-color:#bfe6cf;background:#f1fbf5}
     .tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;background:#eef1f6;color:#4b5563}
     .tag.ok{background:#e9f7ef;color:var(--green)}.tag.cancel{background:#fdecec;color:var(--red)}
+    .country-chips{display:flex;gap:8px;align-items:center;flex-wrap:wrap;min-height:32px}.country-chip{display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 10px;border-radius:999px;background:#eef5ff;color:var(--blue);border:1px solid #bfd0f7;font-weight:600}.country-chip button{height:20px;width:20px;padding:0;border-radius:50%;border:0;background:#dfe9ff;color:var(--blue);font-weight:800;line-height:20px}.limit-btn.on{color:var(--green);border-color:#bfe6cf;background:#f1fbf5}
   </style>
 </head>
 <body>
@@ -88,6 +89,11 @@ const herosmsHTML = `
         <span class="small" style="min-width:150px">Codex 登录库存限制最小值</span>
         <input id="cfg-gpt-min-count" type="number" min="0" step="100" placeholder="2000" style="max-width:220px">
         <span class="small">OUTLOOK 页「登录 Codex」自动买号时只选库存大于这个值的国家/价格。</span>
+      </div>
+      <div class="cfg-row" style="margin-top:12px">
+        <span class="small" style="min-width:150px">Codex 登录限定国家</span>
+        <div id="cfg-gpt-countries" class="country-chips"><span class="small">未限定，按原逻辑自动选择。</span></div>
+        <span class="small">在「买号 / 接码」的国家列表点「限定」加入；每个国家最多试 3 个，全部试完即结束。</span>
       </div>
     </section>
 
@@ -194,6 +200,38 @@ function switchTab(name){
 document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.tab)));
 
 // ===== 配置 =====
+let gptCountryLimits=[];
+function countryKey(v){return String(v??'').trim()}
+function countryLabel(c){return c.name?c.name+' ('+c.id+')':c.id}
+function serializeCountryLimits(){return gptCountryLimits.map(c=>c.id).join(',')}
+function renderCountryLimits(){
+  const box=document.getElementById('cfg-gpt-countries');
+  if(!box)return;
+  if(!gptCountryLimits.length){box.innerHTML='<span class="small">未限定，按原逻辑自动选择。</span>';return}
+  box.innerHTML=gptCountryLimits.map((c,i)=>'<span class="country-chip">'+esc(countryLabel(c))+'<button type="button" data-rm-limit="'+i+'" title="取消限定">×</button></span>').join('');
+  document.querySelectorAll('.limit-btn').forEach(btn=>btn.classList.toggle('on',gptCountryLimits.some(c=>c.id===btn.dataset.cid)));
+}
+function setCountryLimitsFromString(raw){
+  gptCountryLimits=[];
+  String(raw||'').split(',').map(x=>x.trim()).filter(Boolean).forEach(id=>{
+    if(!gptCountryLimits.some(c=>c.id===id))gptCountryLimits.push({id,name:''});
+  });
+  renderCountryLimits();
+}
+async function saveHeroSMSConfig(){
+  return jpost('/api/herosms/config',{api_key:document.getElementById('cfg-key').value.trim(),gpt_login_max_price:Number(document.getElementById('cfg-gpt-price').value||0.2),gpt_login_min_count:Math.max(0,parseInt(document.getElementById('cfg-gpt-min-count').value,10)||0),gpt_login_countries:serializeCountryLimits()});
+}
+function toggleCountryLimit(o){
+  const id=countryKey(o.country_id), name=String(o.country_name||'').trim(); if(!id)return;
+  const idx=gptCountryLimits.findIndex(c=>c.id===id);
+  if(idx>=0)gptCountryLimits.splice(idx,1); else gptCountryLimits.push({id,name});
+  renderCountryLimits();
+  saveHeroSMSConfig().catch(e=>alert('保存限定国家失败：'+e.message));
+}
+document.addEventListener('click',event=>{
+  const rm=event.target.closest('[data-rm-limit]'); if(!rm)return;
+  gptCountryLimits.splice(+rm.dataset.rmLimit,1);renderCountryLimits();saveHeroSMSConfig().catch(e=>alert('保存限定国家失败：'+e.message));
+});
 async function loadConfig(){
   try{const c=await jget('/api/herosms/config');
     document.getElementById('cfg-key').value=c.api_key||'';
@@ -201,17 +239,18 @@ async function loadConfig(){
     const minCount=Number.isFinite(Number(c.gpt_login_min_count))?Number(c.gpt_login_min_count):2000;
     document.getElementById('cfg-gpt-price').value=Number(c.gpt_login_max_price||0.2).toFixed(4);
     document.getElementById('cfg-gpt-min-count').value=String(minCount);
+    setCountryLimitsFromString(c.gpt_login_countries||'');
     const fCount=document.getElementById('f-count');if(fCount&&!fCount.dataset.touched)fCount.value=String(minCount);
   }catch(e){}
 }
 document.getElementById('cfg-save').addEventListener('click',async()=>{
   const btn=document.getElementById('cfg-save');btn.disabled=true;
-  try{await jpost('/api/herosms/config',{api_key:document.getElementById('cfg-key').value.trim(),gpt_login_max_price:Number(document.getElementById('cfg-gpt-price').value||0.2),gpt_login_min_count:Math.max(0,parseInt(document.getElementById('cfg-gpt-min-count').value,10)||0)});await loadConfig();await loadBalance();loadServices()}
+  try{await saveHeroSMSConfig();await loadConfig();await loadBalance();loadServices()}
   catch(e){alert('保存失败：'+e.message)}finally{btn.disabled=false}
 });
 document.getElementById('cfg-reset').addEventListener('click',async()=>{
   if(!confirm('清空自定义 Key，恢复使用 skill 内置默认 Key？'))return;
-  try{await jpost('/api/herosms/config',{api_key:'',gpt_login_max_price:Number(document.getElementById('cfg-gpt-price').value||0.2),gpt_login_min_count:Math.max(0,parseInt(document.getElementById('cfg-gpt-min-count').value,10)||0)});await loadConfig();await loadBalance();loadServices()}catch(e){alert('失败：'+e.message)}
+  try{document.getElementById('cfg-key').value='';await saveHeroSMSConfig();await loadConfig();await loadBalance();loadServices()}catch(e){alert('失败：'+e.message)}
 });
 
 // ===== 余额 =====
@@ -343,7 +382,7 @@ async function loadOffers(){
     document.getElementById('offer-rows').innerHTML=rows.map((o,i)=>
       '<tr data-i="'+i+'"><td>'+esc(o.country_name||'-')+'</td><td class="mono">'+esc(o.country_id)+'</td>'+
       '<td class="price">$'+Number(o.price).toFixed(4)+'</td><td class="mono">'+esc(o.count)+'</td>'+
-      '<td><button class="pick-btn" data-i="'+i+'" type="button">选择</button></td></tr>'
+      '<td><button class="pick-btn" data-i="'+i+'" type="button">选择</button> <button class="pick-btn limit-btn '+(gptCountryLimits.some(c=>c.id===String(o.country_id))?'on':'')+'" data-limit-i="'+i+'" data-cid="'+esc(o.country_id)+'" type="button">'+(gptCountryLimits.some(c=>c.id===String(o.country_id))?'取消限定':'限定')+'</button></td></tr>'
     ).join('');
     window._offers=rows;selectedOffer=null;document.getElementById('buybar').classList.add('hidden');
   }catch(e){alert('查询价格失败：'+e.message)}
@@ -351,7 +390,9 @@ async function loadOffers(){
 }
 document.getElementById('offers-btn').addEventListener('click',loadOffers);
 document.getElementById('offer-rows').addEventListener('click',event=>{
-  const btn=event.target.closest('.pick-btn');if(!btn)return;
+  const limitBtn=event.target.closest('[data-limit-i]');
+  if(limitBtn){const o=(window._offers||[])[+limitBtn.dataset.limitI];if(o)toggleCountryLimit(o);loadOffers();return}
+  const btn=event.target.closest('.pick-btn');if(!btn||btn.dataset.limitI)return;
   const o=(window._offers||[])[+btn.dataset.i];if(!o)return;
   selectedOffer=o;
   document.querySelectorAll('#offer-rows tr').forEach(tr=>tr.classList.toggle('sel',tr.dataset.i===btn.dataset.i));

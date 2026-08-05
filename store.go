@@ -594,21 +594,37 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "traces", "account_id", "VARCHAR(128) NOT NULL DEFAULT '' AFTER session_id"); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE traces
-		SET account_id=COALESCE(JSON_UNQUOTE(JSON_EXTRACT(request_headers, '$."Chatgpt-Account-Id"[0]')), '')
-		WHERE account_id='' AND request_headers IS NOT NULL`); err != nil {
+	// 历史数据回填只需要跑一次。traces 里保存了完整请求/响应体，表可能很大；
+	// 如果每次启动都 UPDATE/扫描，会明显拖慢服务启动。
+	if done, err := s.GetSetting(ctx, "migration_account_id_backfill_v1", "0"); err != nil {
 		return err
+	} else if done != "1" {
+		if _, err := s.db.ExecContext(ctx, `UPDATE traces
+			SET account_id=COALESCE(JSON_UNQUOTE(JSON_EXTRACT(request_headers, '$."Chatgpt-Account-Id"[0]')), '')
+			WHERE account_id='' AND request_headers IS NOT NULL`); err != nil {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE conversations c
+			JOIN (
+				SELECT conversation_id, MAX(account_id) account_id FROM traces WHERE account_id<>'' GROUP BY conversation_id
+			) t ON t.conversation_id=c.id
+			SET c.account_id=t.account_id
+			WHERE c.account_id=''`); err != nil {
+			return err
+		}
+		if err := s.SetSetting(ctx, "migration_account_id_backfill_v1", "1"); err != nil {
+			return err
+		}
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE conversations c
-		JOIN (
-			SELECT conversation_id, MAX(account_id) account_id FROM traces WHERE account_id<>'' GROUP BY conversation_id
-		) t ON t.conversation_id=c.id
-		SET c.account_id=t.account_id
-		WHERE c.account_id=''`); err != nil {
+	if done, err := s.GetSetting(ctx, "migration_repair_injected_prompts_v1", "0"); err != nil {
 		return err
-	}
-	if err := s.repairInjectedPrompts(ctx); err != nil {
-		return err
+	} else if done != "1" {
+		if err := s.repairInjectedPrompts(ctx); err != nil {
+			return err
+		}
+		if err := s.SetSetting(ctx, "migration_repair_injected_prompts_v1", "1"); err != nil {
+			return err
+		}
 	}
 	// api_routes 新增字段(旧库补迁移)
 	if err := s.ensureColumn(ctx, "api_routes", "api_style", "VARCHAR(32) NOT NULL DEFAULT 'openai' AFTER model"); err != nil {

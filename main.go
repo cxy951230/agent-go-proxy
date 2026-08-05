@@ -46,23 +46,25 @@ type config struct {
 	claudeTarget *url.URL
 	logDir       string
 	dsn          string
+	proxyURL     string
 }
 
 type proxyServer struct {
-	cfg           config
-	client        *http.Client
-	logs          *logWriter
-	store         *Store
-	recorder      *asyncRecorder
-	chains        *chainRouteState
-	accounts      *accountPool
-	openaiLogins  *openAILoginManager
-	outlookLogins *outlookLoginManager // OUTLOOK 页「登录账号」(拉起 Chrome 手动登录)
-	gptSignups    *gptSignupManager    // OUTLOOK 页「注册 GPT」(CDP 自动化)
-	gptLogins     *gptLoginManager     // OUTLOOK 页「登录 Codex」(CDP 自动化 + HeroSMS 手机验证)
-	herosmsTrack  herosmsTracker       // 买过号码的后台自动取消跟踪器
-	outlookJob    *batchRefreshJob     // OUTLOOK 页「刷新全部 Token」
-	openaiJob     *batchRefreshJob     // OPENAI 页「刷新全部额度」
+	cfg              config
+	client           *http.Client
+	proxiedTransport http.RoundTripper
+	logs             *logWriter
+	store            *Store
+	recorder         *asyncRecorder
+	chains           *chainRouteState
+	accounts         *accountPool
+	openaiLogins     *openAILoginManager
+	outlookLogins    *outlookLoginManager // OUTLOOK 页「登录账号」(拉起 Chrome 手动登录)
+	gptSignups       *gptSignupManager    // OUTLOOK 页「注册 GPT」(CDP 自动化)
+	gptLogins        *gptLoginManager     // OUTLOOK 页「登录 Codex」(CDP 自动化 + HeroSMS 手机验证)
+	herosmsTrack     herosmsTracker       // 买过号码的后台自动取消跟踪器
+	outlookJob       *batchRefreshJob     // OUTLOOK 页「刷新全部 Token」
+	openaiJob        *batchRefreshJob     // OPENAI 页「刷新全部额度」
 
 	openaiModelsJob *batchRefreshJob // OPENAI 页「拉取全部模型」
 
@@ -71,6 +73,12 @@ type proxyServer struct {
 	// 一点就生效、无需重启。
 	quotaAutoRefresh atomic.Bool
 }
+
+// scopedLocalProxyURL 只用于 OPENAI/OUTLOOK 菜单的后端请求,以及 API Key 命中 GPT 账号后的官方直连对话请求。
+// 其它路由/链式代理/HeroSMS 等保持原来的出站策略;Chrome 启动也不会注入代理。
+const scopedLocalProxyURL = "http://127.0.0.1:7899"
+
+type scopedProxyContextKey struct{}
 
 const chainRouteCooldown = 2 * time.Minute
 
@@ -288,7 +296,7 @@ func main() {
 	defer store.Close()
 	recorder := newAsyncRecorder(store)
 	defer recorder.Close()
-	openaiLogins := newOpenAILoginManager(*bridgeLibrary, store)
+	openaiLogins := newOpenAILoginManager(*bridgeLibrary, store, scopedLocalProxyURL)
 	defer openaiLogins.Close()
 
 	transport := &http.Transport{
@@ -305,6 +313,10 @@ func main() {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	proxiedTransport, err := localProxyTransport(scopedLocalProxyURL)
+	if err != nil {
+		log.Fatalf("init scoped local proxy: %v", err)
+	}
 
 	srv := &proxyServer{
 		cfg: config{
@@ -313,20 +325,22 @@ func main() {
 			claudeTarget: claudeTarget,
 			logDir:       *logDir,
 			dsn:          *dsn,
+			proxyURL:     scopedLocalProxyURL,
 		},
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   0,
 		},
-		logs:          lw,
-		store:         store,
-		recorder:      recorder,
-		chains:        newChainRouteState(),
-		accounts:      newAccountPool(),
-		openaiLogins:  openaiLogins,
-		outlookLogins: newOutlookLoginManager(store, transport),
-		outlookJob:    &batchRefreshJob{},
-		openaiJob:     &batchRefreshJob{},
+		proxiedTransport: proxiedTransport,
+		logs:             lw,
+		store:            store,
+		recorder:         recorder,
+		chains:           newChainRouteState(),
+		accounts:         newAccountPool(),
+		openaiLogins:     openaiLogins,
+		outlookLogins:    newOutlookLoginManager(store, proxiedTransport),
+		outlookJob:       &batchRefreshJob{},
+		openaiJob:        &batchRefreshJob{},
 
 		openaiModelsJob: &batchRefreshJob{},
 	}
@@ -465,6 +479,7 @@ func main() {
 		fmt.Printf("log dir: %s\n", *logDir)
 		fmt.Printf("dashboard: http://%s/\n", *listenAddr)
 		fmt.Printf("codex bridge library: %s\n", *bridgeLibrary)
+		fmt.Printf("scoped OPENAI/OUTLOOK proxy: %s\n", scopedLocalProxyURL)
 		fmt.Printf("for Codex CLI: CODEX_HOME=/path/to/codex_home NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost codex\n")
 		errCh <- httpServer.ListenAndServe()
 	}()
@@ -1638,4 +1653,64 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func localProxyTransport(proxyURLValue string) (*http.Transport, error) {
+	u, err := url.Parse(strings.TrimSpace(proxyURLValue))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("invalid proxy URL %q", proxyURLValue)
+	}
+	return &http.Transport{
+		Proxy: http.ProxyURL(u),
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       15 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}, nil
+}
+
+func setProcessProxyEnv(proxyURLValue string) func() {
+	keys := []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
+	old := make(map[string]string, len(keys))
+	present := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		if v, ok := os.LookupEnv(key); ok {
+			old[key] = v
+			present[key] = true
+		}
+		_ = os.Setenv(key, proxyURLValue)
+	}
+	return func() {
+		for _, key := range keys {
+			if present[key] {
+				_ = os.Setenv(key, old[key])
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		}
+	}
+}
+
+func withoutProxyEnv(env []string) []string {
+	proxyKeys := map[string]bool{
+		"HTTP_PROXY": true, "HTTPS_PROXY": true, "ALL_PROXY": true,
+		"http_proxy": true, "https_proxy": true, "all_proxy": true,
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if proxyKeys[key] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }

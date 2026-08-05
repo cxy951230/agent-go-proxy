@@ -42,6 +42,7 @@ type openAILoginProcess struct {
 	home        string
 	bridge      *nativeBridge
 	session     unsafe.Pointer
+	browser     *chromeSession
 }
 
 type openAILoginManager struct {
@@ -51,6 +52,7 @@ type openAILoginManager struct {
 	refreshMu sync.Mutex
 	bridge    *nativeBridge
 	store     *Store
+	proxyURL  string
 	logins    map[string]*openAILoginProcess
 	baseURL   string
 	// Responses 请求体的基线默认值,取自 Bridge 的 JSON Schema。只取一次:schema 是静态的。
@@ -58,16 +60,104 @@ type openAILoginManager struct {
 	schemaDefaults map[string]json.RawMessage
 }
 
-func newOpenAILoginManager(bridgePath string, store *Store) *openAILoginManager {
+func newOpenAILoginManager(bridgePath string, store *Store, proxyURL string) *openAILoginManager {
 	return &openAILoginManager{
-		bridge:  newNativeBridge(bridgePath),
-		store:   store,
-		logins:  make(map[string]*openAILoginProcess),
-		baseURL: envOrDefault("CODEX_STATUS_BASE_URL", "https://chatgpt.com/backend-api"),
+		bridge:   newNativeBridge(bridgePath),
+		store:    store,
+		proxyURL: proxyURL,
+		logins:   make(map[string]*openAILoginProcess),
+		baseURL:  envOrDefault("CODEX_STATUS_BASE_URL", "https://chatgpt.com/backend-api"),
 	}
 }
 
+var bridgeProxyEnvMu sync.Mutex
+
+func (m *openAILoginManager) withProxyEnv(fn func() error) error {
+	bridgeProxyEnvMu.Lock()
+	defer bridgeProxyEnvMu.Unlock()
+	restore := setProcessProxyEnv(m.proxyURL)
+	defer restore()
+	return fn()
+}
+
+func (m *openAILoginManager) bridgeCallLoginStart(config []byte) (unsafe.Pointer, string, error) {
+	var session unsafe.Pointer
+	var out string
+	err := m.withProxyEnv(func() error {
+		var err error
+		session, out, err = m.bridge.loginStart(config)
+		return err
+	})
+	return session, out, err
+}
+
+func (p *openAILoginProcess) bridgeCallLoginWait(session unsafe.Pointer) (string, error) {
+	var out string
+	err := bridgeProxyEnvMuLocked(p.bridge, func() error {
+		var err error
+		out, err = p.bridge.loginWait(session)
+		return err
+	})
+	return out, err
+}
+
+func bridgeProxyEnvMuLocked(bridge *nativeBridge, fn func() error) error {
+	bridgeProxyEnvMu.Lock()
+	defer bridgeProxyEnvMu.Unlock()
+	restore := setProcessProxyEnv(scopedLocalProxyURL)
+	defer restore()
+	return fn()
+}
+
+func (m *openAILoginManager) bridgeCallStatus(auth, baseURL []byte) (string, error) {
+	var out string
+	err := m.withProxyEnv(func() error {
+		var err error
+		out, err = m.bridge.status(auth, baseURL)
+		return err
+	})
+	return out, err
+}
+
+func (m *openAILoginManager) bridgeCallTokenRefresh(auth []byte) (string, error) {
+	var out string
+	err := m.withProxyEnv(func() error {
+		var err error
+		out, err = m.bridge.tokenRefresh(auth)
+		return err
+	})
+	return out, err
+}
+
+func (m *openAILoginManager) bridgeCallModelsList(auth []byte) (string, error) {
+	var out string
+	err := m.withProxyEnv(func() error {
+		var err error
+		out, err = m.bridge.modelsList(auth)
+		return err
+	})
+	return out, err
+}
+
+func (m *openAILoginManager) bridgeCallResponsesSchema() (string, error) {
+	var out string
+	err := m.withProxyEnv(func() error {
+		var err error
+		out, err = m.bridge.responsesSchema()
+		return err
+	})
+	return out, err
+}
+
 func (m *openAILoginManager) Start(displayName string) (openAILoginStatus, error) {
+	return m.start(displayName, false)
+}
+
+func (m *openAILoginManager) StartWithBrowser(displayName string) (openAILoginStatus, error) {
+	return m.start(displayName, true)
+}
+
+func (m *openAILoginManager) start(displayName string, openBrowser bool) (openAILoginStatus, error) {
 	id, err := randomLoginID()
 	if err != nil {
 		return openAILoginStatus{}, err
@@ -83,7 +173,7 @@ func (m *openAILoginManager) Start(displayName string) (openAILoginStatus, error
 		_ = os.RemoveAll(home)
 		return openAILoginStatus{}, err
 	}
-	session, startJSON, err := m.bridge.loginStart(config)
+	session, startJSON, err := m.bridgeCallLoginStart(config)
 	if err != nil {
 		_ = os.RemoveAll(home)
 		return openAILoginStatus{}, fmt.Errorf("启动 Codex Bridge 登录失败: %w", err)
@@ -102,6 +192,23 @@ func (m *openAILoginManager) Start(displayName string) (openAILoginStatus, error
 		displayName: strings.TrimSpace(displayName), home: home,
 		bridge: m.bridge, session: session,
 	}
+	if openBrowser {
+		// OPENAI 页「+ 登录 GPT 账号」由本进程启动一个独立 Chrome,并指定 7899 代理。
+		// OUTLOOK 页「登录 Codex」只需要这里返回 auth_url,它自己会启动自动化 Chrome,不能重复开。
+		browser, browserErr := launchChromeWith(started.AuthURL, "agent-go-proxy-openai-login-browser-", []string{
+			"--no-first-run",
+			"--no-default-browser-check",
+			"--disable-background-networking",
+			"--window-size=1120,860",
+			"--proxy-server=" + scopedLocalProxyURL,
+		})
+		if browserErr != nil {
+			m.bridge.sessionFree(session)
+			_ = os.RemoveAll(home)
+			return openAILoginStatus{}, fmt.Errorf("启动代理 Chrome 失败: %w", browserErr)
+		}
+		process.browser = browser
+	}
 	m.mu.Lock()
 	m.logins[id] = process
 	m.mu.Unlock()
@@ -112,7 +219,12 @@ func (m *openAILoginManager) Start(displayName string) (openAILoginStatus, error
 func (m *openAILoginManager) finish(process *openAILoginProcess) {
 	defer os.RemoveAll(process.home)
 	defer process.bridge.sessionFree(process.session)
-	credentialsJSON, err := process.bridge.loginWait(process.session)
+	defer func() {
+		if process.browser != nil {
+			process.browser.Close()
+		}
+	}()
+	credentialsJSON, err := process.bridgeCallLoginWait(process.session)
 	if err != nil {
 		m.complete(process.status.ID, "failed", nil, err.Error())
 		return
@@ -320,7 +432,7 @@ func (m *openAILoginManager) ForceRefreshAccount(ctx context.Context, id int64) 
 
 // refreshAuth 调 Bridge 刷新一次并回写结果。调用方需已持有 refreshMu。
 func (m *openAILoginManager) refreshAuth(ctx context.Context, account OpenAIAccount) (OpenAIAccount, error) {
-	raw, err := m.bridge.tokenRefresh([]byte(account.AuthJSON))
+	raw, err := m.bridgeCallTokenRefresh([]byte(account.AuthJSON))
 	if err != nil {
 		return account, fmt.Errorf("调用 Bridge 刷新凭证失败: %w", err)
 	}
@@ -357,7 +469,7 @@ func (m *openAILoginManager) refreshAuth(ctx context.Context, account OpenAIAcco
 // 取自 Bridge 的 JSON Schema 里每个 property 的 default。Bridge 不可用时返回 nil,调用方自行兜底。
 func (m *openAILoginManager) ResponsesDefaults() map[string]json.RawMessage {
 	m.schemaOnce.Do(func() {
-		raw, err := m.bridge.responsesSchema()
+		raw, err := m.bridgeCallResponsesSchema()
 		if err != nil {
 			log.Printf("load responses schema from bridge: %v", err)
 			return
@@ -395,7 +507,7 @@ func (m *openAILoginManager) RefreshModels(ctx context.Context, id int64) error 
 	} else {
 		account = fresh
 	}
-	raw, err := m.bridge.modelsList([]byte(account.AuthJSON))
+	raw, err := m.bridgeCallModelsList([]byte(account.AuthJSON))
 	if err != nil {
 		return fmt.Errorf("拉取模型列表失败: %w", err)
 	}
@@ -472,7 +584,7 @@ func (m *openAILoginManager) Refresh(id int64) error {
 		account = refreshed
 	}
 
-	statusJSON, err := m.bridge.status([]byte(account.AuthJSON), []byte(m.baseURL))
+	statusJSON, err := m.bridgeCallStatus([]byte(account.AuthJSON), []byte(m.baseURL))
 	if err != nil {
 		_ = m.store.UpdateOpenAIAccountStatus(ctx, id, "", err.Error())
 		return err
@@ -515,7 +627,11 @@ func (m *openAILoginManager) Cancel(id string) error {
 		return nil
 	}
 	process.status.State, process.status.CompletedAt = "cancelled", time.Now()
+	browser := process.browser
 	m.mu.Unlock()
+	if browser != nil {
+		browser.Close()
+	}
 	return process.bridge.loginCancel(process.session)
 }
 
@@ -524,6 +640,9 @@ func (m *openAILoginManager) Close() {
 	defer m.mu.Unlock()
 	for _, process := range m.logins {
 		if process.status.State == "waiting" {
+			if process.browser != nil {
+				process.browser.Close()
+			}
 			_ = process.bridge.loginCancel(process.session)
 		}
 	}

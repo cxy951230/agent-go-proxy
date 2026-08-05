@@ -25,11 +25,12 @@ const (
 	herosmsHandlerAPI = "https://hero-sms.com/stubs/handler_api.php"
 	herosmsOffersAPI  = "https://hero-sms.com/api/v1/activations/offers"
 	// herosmsDefaultKey 先从 gpt-login-automation skill 直接拿过来兜底;页面可覆盖。
-	herosmsDefaultKey              = "076c10b118b7b1917f40b20b8fAb2A7b"
-	herosmsService                 = "dr" // OpenAI
-	settingHeroSMSKey              = "herosms_api_key"
-	settingHeroSMSGPTLoginMaxPrice = "herosms_gpt_login_max_price"
-	settingHeroSMSGPTLoginMinCount = "herosms_gpt_login_min_count"
+	herosmsDefaultKey               = "076c10b118b7b1917f40b20b8fAb2A7b"
+	herosmsService                  = "dr" // OpenAI
+	settingHeroSMSKey               = "herosms_api_key"
+	settingHeroSMSGPTLoginMaxPrice  = "herosms_gpt_login_max_price"
+	settingHeroSMSGPTLoginMinCount  = "herosms_gpt_login_min_count"
+	settingHeroSMSGPTLoginCountries = "herosms_gpt_login_countries"
 )
 
 // ---- 买过号码的后台自动取消监控 ----
@@ -166,8 +167,41 @@ func (p *proxyServer) herosmsGPTLoginMinCount(ctx context.Context) int {
 	return gptLoginDefaultMinCount
 }
 
+// herosmsGPTLoginCountries 是 OUTLOOK 页「登录 Codex」自动买号国家白名单。
+// 为空表示沿用原逻辑:按 HeroSMS 优惠列表和黑名单自动选择。非空时按逗号分割的顺序只尝试这些国家。
+func (p *proxyServer) herosmsGPTLoginCountries(ctx context.Context) string {
+	v, _ := p.store.GetSetting(ctx, settingHeroSMSGPTLoginCountries, "")
+	return normalizeHeroSMSCountries(v)
+}
+
+func normalizeHeroSMSCountries(v string) string {
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]bool{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key := strings.ToLower(part)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, part)
+	}
+	return strings.Join(out, ",")
+}
+
 func (p *proxyServer) herosmsClient() *http.Client {
 	return &http.Client{Transport: p.client.Transport, Timeout: 30 * time.Second}
+}
+
+func (p *proxyServer) herosmsClientForContext(ctx context.Context) *http.Client {
+	if use, _ := ctx.Value(scopedProxyContextKey{}).(bool); use {
+		return &http.Client{Transport: p.proxiedTransport, Timeout: 30 * time.Second}
+	}
+	return p.herosmsClient()
 }
 
 // herosmsGet 打 handler_api.php(SMS-Activate 兼容),返回去空白的纯文本响应。
@@ -182,7 +216,7 @@ func (p *proxyServer) herosmsGet(ctx context.Context, key, action string, params
 	if err != nil {
 		return "", err
 	}
-	resp, err := p.herosmsClient().Do(req)
+	resp, err := p.herosmsClientForContext(ctx).Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -285,15 +319,17 @@ func (p *proxyServer) handleAPIHeroSMSConfig(w http.ResponseWriter, r *http.Requ
 		"service":             herosmsService,
 		"gpt_login_max_price": p.herosmsGPTLoginMaxPrice(r.Context()),
 		"gpt_login_min_count": p.herosmsGPTLoginMinCount(r.Context()),
+		"gpt_login_countries": p.herosmsGPTLoginCountries(r.Context()),
 	}, nil)
 }
 
 // POST /api/herosms/config —— 保存 key、Codex 登录买号单价与库存门槛。
 func (p *proxyServer) handleAPIHeroSMSConfigSave(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		APIKey           string  `json:"api_key"`
-		GPTLoginMaxPrice float64 `json:"gpt_login_max_price"`
-		GPTLoginMinCount int     `json:"gpt_login_min_count"`
+		APIKey            string  `json:"api_key"`
+		GPTLoginMaxPrice  float64 `json:"gpt_login_max_price"`
+		GPTLoginMinCount  int     `json:"gpt_login_min_count"`
+		GPTLoginCountries string  `json:"gpt_login_countries"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		http.Error(w, "invalid json body", http.StatusBadRequest)
@@ -316,6 +352,10 @@ func (p *proxyServer) handleAPIHeroSMSConfigSave(w http.ResponseWriter, r *http.
 		minCount = gptLoginDefaultMinCount
 	}
 	if err := p.store.SetSetting(r.Context(), settingHeroSMSGPTLoginMinCount, strconv.Itoa(minCount)); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := p.store.SetSetting(r.Context(), settingHeroSMSGPTLoginCountries, normalizeHeroSMSCountries(in.GPTLoginCountries)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -374,7 +414,7 @@ func (p *proxyServer) herosmsOfferRows(ctx context.Context, key, service string,
 func (p *proxyServer) herosmsOfferRowsWithBlacklist(ctx context.Context, key, service string, maxPrice float64, minCount int, includeBlacklisted bool) ([]herosmsOfferRow, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, herosmsOffersAPI+"?services="+url.QueryEscape(service), nil)
 	req.Header.Set("Authorization", "ApiKey "+key)
-	resp, err := p.herosmsClient().Do(req)
+	resp, err := p.herosmsClientForContext(ctx).Do(req)
 	if err != nil {
 		return nil, err
 	}

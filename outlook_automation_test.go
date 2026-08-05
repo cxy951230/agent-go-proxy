@@ -71,6 +71,13 @@ func TestClassifyOutlookLoginState(t *testing.T) {
 			want: "problem",
 		},
 		{
+			name: "密码登录不可用",
+			snap: domSnapshot{Href: "https://login.live.com/", Ready: "complete",
+				Inputs: []domMeta{passwordInput}, Buttons: []domMeta{nextButton},
+				BodyText: "Enter your password\nPassword sign-in isn't available. Try another method."},
+			want: "problem",
+		},
+		{
 			// 账号不存在时邮箱输入框还在,不认这句报错就会被判回 email、
 			// 状态机原地重试到任务超时。
 			name: "账号不存在",
@@ -133,13 +140,14 @@ func TestClassifyOutlookLoginState(t *testing.T) {
 
 func TestOutlookProblemReason(t *testing.T) {
 	cases := map[string]string{
-		"Your account or password is incorrect.":            "账号或密码不正确",
-		"That Microsoft account doesn't exist.":             "账号不存在",
-		"We couldn't find a Microsoft account.":             "账号不存在（微软找不到这个账号）",
-		"Your account has been locked.":                     "账号已被锁定",
-		"You've tried to sign in too many times.":           "尝试次数过多",
-		"We ran into a problem. Please try again later.":    "微软登录页报错",
-		"Some unrelated page text without a known keyword.": "未知原因",
+		"Your account or password is incorrect.":                "账号或密码不正确",
+		"Password sign-in isn't available. Try another method.": "此账号当前不允许密码登录，需改用其它验证方式",
+		"That Microsoft account doesn't exist.":                 "账号不存在",
+		"We couldn't find a Microsoft account.":                 "账号不存在（微软找不到这个账号）",
+		"Your account has been locked.":                         "账号已被锁定",
+		"You've tried to sign in too many times.":               "尝试次数过多",
+		"We ran into a problem. Please try again later.":        "微软登录页报错",
+		"Some unrelated page text without a known keyword.":     "未知原因",
 	}
 	for body, want := range cases {
 		if got := outlookProblemReason(domSnapshot{BodyText: body}); got != want {

@@ -120,17 +120,17 @@ func (p *proxyServer) runQuotaAutoRefresh(ctx context.Context) {
 	ticker := time.NewTicker(quotaAutoRefreshInterval)
 	defer ticker.Stop()
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		if p.quotaAutoRefresh.Load() {
 			if _, started, err := p.startRefreshAllQuota(ctx); err != nil {
 				log.Printf("定时刷新额度失败: %v", err)
 			} else if !started {
 				log.Printf("定时刷新额度: 已有刷新任务在进行中，跳过本次")
 			}
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
 		}
 	}
 }
@@ -537,13 +537,19 @@ function resetLine(window,statusAt){
 function windowLabel(window){const seconds=Number(window.limit_window_seconds);if(seconds>=2419200&&seconds<=2764800)return '月';if(seconds>=518400&&seconds<=691200)return '周';if(seconds>=14400&&seconds<=21600)return '5小时';if(seconds>=3600&&seconds%3600===0)return seconds/3600+'小时';if(seconds>=86400&&seconds%86400===0)return seconds/86400+'天';return seconds?Math.round(seconds/3600)+'小时':'-'}
 async function beginLogin(){
   const name=prompt('账号名称（可选）','');if(name===null)return;
+  // 必须在用户点击事件链路里先打开空白页；等 fetch 返回后再改 location，避免被浏览器拦截弹窗。
+  const loginTab=window.open('about:blank','_blank');
   const button=document.getElementById('login-btn');button.disabled=true;
   try{
     const rsp=await fetch('/api/openai/logins',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.trim()})});
     if(!rsp.ok)throw new Error(await rsp.text());const task=await rsp.json();
-    const box=document.getElementById('login-box');const link=document.getElementById('login-url');box.classList.add('show');link.href=task.auth_url;link.textContent=task.auth_url;document.getElementById('login-status').textContent='请在浏览器中完成 ChatGPT 登录…';
-    window.open(task.auth_url,'_blank','noopener');pollLogin(task.id);
-  }catch(err){alert('启动登录失败：'+err.message);button.disabled=false}
+    if(task.auth_url){
+      if(loginTab&&!loginTab.closed)loginTab.location.href=task.auth_url;
+      else window.open(task.auth_url,'_blank','noopener');
+    }
+    const box=document.getElementById('login-box');const link=document.getElementById('login-url');box.classList.add('show');link.href=task.auth_url;link.textContent=task.auth_url;document.getElementById('login-status').textContent='请在新标签页完成 ChatGPT 登录…';
+    pollLogin(task.id);
+  }catch(err){if(loginTab&&!loginTab.closed)loginTab.close();alert('启动登录失败：'+err.message);button.disabled=false}
 }
 async function pollLogin(id){
   try{

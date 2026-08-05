@@ -85,7 +85,7 @@ func (p *proxyServer) refreshOutlookTokenOnce(ctx context.Context, id int64) (Ou
 	runCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	client := &http.Client{
-		Transport: p.client.Transport, // 复用代理出站 transport(含系统代理/TLS 配置)
+		Transport: p.proxiedTransport, // OUTLOOK 菜单请求走固定本地代理 127.0.0.1:7899
 		// 手动跟重定向:需要读 Location 里的 #code= 片段,并逐跳收集 Set-Cookie。
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Timeout:       40 * time.Second,

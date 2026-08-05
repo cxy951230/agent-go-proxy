@@ -32,7 +32,7 @@ func outlookMailAuthHeader(accessToken string) string {
 }
 
 func (p *proxyServer) outlookMailClient() *http.Client {
-	return &http.Client{Transport: p.client.Transport, Timeout: 30 * time.Second}
+	return &http.Client{Transport: p.proxiedTransport, Timeout: 30 * time.Second}
 }
 
 // outlookMailGet 发一个带鉴权头的 GET,返回解析后的 JSON、HTTP 状态码。

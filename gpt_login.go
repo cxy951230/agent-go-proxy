@@ -95,7 +95,7 @@ func (m *gptLoginManager) Start(email string) (gptLoginStatus, error) {
 		m.mu.Unlock()
 		return gptLoginStatus{}, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), scopedProxyContextKey{}, true))
 	proc := &gptLoginProcess{
 		status: gptLoginStatus{ID: id, Email: email, State: "running", Message: "启动中…", StartedAt: time.Now()},
 		cancel: cancel,
@@ -291,6 +291,19 @@ func (m *gptLoginManager) phoneFlow(ctx context.Context, id string, d *gptDriver
 		return fmt.Errorf("拉 HeroSMS 优惠失败: %w", err)
 	}
 	names := m.srv.herosmsCountryNames(ctx, key)
+	limitedCountries := parseHeroSMSCountryLimit(m.srv.herosmsGPTLoginCountries(ctx), names)
+	limitedMode := len(limitedCountries) > 0
+	if limitedMode {
+		offers = orderHeroSMSOffersByCountryLimit(offers, limitedCountries)
+		labels := make([]string, 0, len(limitedCountries))
+		for _, cid := range limitedCountries {
+			labels = append(labels, fallback(names[cid], cid))
+		}
+		m.note(id, "按配置限定国家买号: "+strings.Join(labels, ", "))
+		if len(offers) == 0 {
+			return fmt.Errorf("配置的国家没有可买号码(最高 $%.4f, 库存>%d): %s", maxPrice, minCount, strings.Join(labels, ", "))
+		}
+	}
 	blocked := map[string]bool{}
 	// countryAttempts 只统计本次登录任务里“实际拿去填 OpenAI 手机框”的号码数。HeroSMS
 	// offers 可能同一国家按多个价格返回多行；不加这层会一行买 3 个、下一价格再买 3 个。
@@ -301,7 +314,7 @@ func (m *gptLoginManager) phoneFlow(ctx context.Context, id string, d *gptDriver
 		if ctx.Err() != nil {
 			return context.Canceled
 		}
-		if bought >= gptLoginMaxAttempts {
+		if !limitedMode && bought >= gptLoginMaxAttempts {
 			return fmt.Errorf("试了 %d 个号仍未通过手机验证", gptLoginMaxAttempts)
 		}
 		cid := row.CountryID
@@ -313,6 +326,9 @@ func (m *gptLoginManager) phoneFlow(ctx context.Context, id string, d *gptDriver
 			chn = cid
 		}
 		remain := gptLoginMaxAttempts - bought
+		if limitedMode {
+			remain = gptLoginBatch
+		}
 		countryRemain := gptLoginMaxAttemptsPerCountry - countryAttempts[cid]
 		batch := gptLoginBatch
 		if remain < batch {
@@ -433,7 +449,60 @@ func (m *gptLoginManager) phoneFlow(ctx context.Context, id string, d *gptDriver
 			}
 		}
 	}
+	if limitedMode {
+		return errors.New("配置的 HeroSMS 国家都已试完,仍未通过手机验证")
+	}
 	return errors.New("HeroSMS 没有可用国家/号码了")
+}
+
+func parseHeroSMSCountryLimit(raw string, names map[string]string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]bool{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		cid := resolveHeroSMSCountryID(part, names)
+		key := strings.ToLower(cid)
+		if cid == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, cid)
+	}
+	return out
+}
+
+func resolveHeroSMSCountryID(v string, names map[string]string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if _, ok := names[v]; ok {
+		return v
+	}
+	lower := strings.ToLower(v)
+	for cid, name := range names {
+		if strings.ToLower(strings.TrimSpace(cid)) == lower || strings.ToLower(strings.TrimSpace(name)) == lower {
+			return cid
+		}
+	}
+	// HeroSMS 国家 ID 常是数字;names 拉取失败时也允许用户直接填 ID。
+	return v
+}
+
+func orderHeroSMSOffersByCountryLimit(offers []herosmsOfferRow, countries []string) []herosmsOfferRow {
+	byCountry := make(map[string][]herosmsOfferRow)
+	for _, row := range offers {
+		byCountry[row.CountryID] = append(byCountry[row.CountryID], row)
+	}
+	out := make([]herosmsOfferRow, 0, len(offers))
+	for _, cid := range countries {
+		out = append(out, byCountry[cid]...)
+	}
+	return out
 }
 
 func (m *gptLoginManager) logHeroSMSAttempt(ctx context.Context, actID, phone, service, countryID, countryName, source, result, reason, raw string) {
