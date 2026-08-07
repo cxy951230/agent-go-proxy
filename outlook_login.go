@@ -50,8 +50,9 @@ func (s outlookLoginStatus) done() bool {
 }
 
 type outlookLoginProcess struct {
-	status outlookLoginStatus
-	cancel context.CancelFunc
+	status  outlookLoginStatus
+	cancel  context.CancelFunc
+	session *chromeSession
 }
 
 type outlookLoginManager struct {
@@ -86,8 +87,15 @@ func (m *outlookLoginManager) Start(email, password string, auto bool) (outlookL
 	m.mu.Lock()
 	for existingID, process := range m.logins {
 		if !process.status.done() {
-			m.mu.Unlock()
-			return outlookLoginStatus{}, fmt.Errorf("已有一个登录任务在进行中(%s),请先完成或取消", existingID)
+			if process.session != nil && !process.session.Alive() {
+				process.status.State = "cancelled"
+				process.status.Message = "Chrome 窗口已关闭"
+				process.status.CompletedAt = time.Now()
+				process.cancel()
+			} else {
+				m.mu.Unlock()
+				return outlookLoginStatus{}, fmt.Errorf("已有一个登录任务在进行中(%s),请先完成或取消", existingID)
+			}
 		}
 		// 顺手清掉早就结束的任务,避免 map 无限增长。
 		if time.Since(process.status.CompletedAt) > 30*time.Minute {
@@ -122,12 +130,20 @@ func (m *outlookLoginManager) Start(email, password string, auto bool) (outlookL
 
 func (m *outlookLoginManager) Status(id string) (outlookLoginStatus, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	process, ok := m.logins[id]
 	if !ok {
+		m.mu.Unlock()
 		return outlookLoginStatus{}, false
 	}
-	return process.status, true
+	if !process.status.done() && process.session != nil && !process.session.Alive() {
+		process.status.State = "cancelled"
+		process.status.Message = "Chrome 窗口已关闭"
+		process.status.CompletedAt = time.Now()
+		process.cancel()
+	}
+	st := process.status
+	m.mu.Unlock()
+	return st, true
 }
 
 func (m *outlookLoginManager) Cancel(id string) error {
@@ -145,8 +161,12 @@ func (m *outlookLoginManager) Cancel(id string) error {
 	process.status.Message = "已取消"
 	process.status.CompletedAt = time.Now()
 	cancel := process.cancel
+	session := process.session
 	m.mu.Unlock()
 	cancel()
+	if session != nil {
+		session.Close()
+	}
 	return nil
 }
 
@@ -206,6 +226,15 @@ func (m *outlookLoginManager) complete(id, state, email string, accountID int64,
 	process.status.Message = message
 }
 
+func (m *outlookLoginManager) attachSession(id string, session *chromeSession) {
+	m.mu.Lock()
+	process := m.logins[id]
+	if process != nil {
+		process.session = session
+	}
+	m.mu.Unlock()
+}
+
 func (m *outlookLoginManager) cancelled(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -219,6 +248,7 @@ func (m *outlookLoginManager) run(ctx context.Context, id, email, password strin
 		m.complete(id, "failed", "", 0, err.Error())
 		return
 	}
+	m.attachSession(id, session)
 	defer session.Close()
 
 	// 自动模式:先按 DOM 状态机填表。撞到人机验证/两步验证/未识别页面时不算失败,

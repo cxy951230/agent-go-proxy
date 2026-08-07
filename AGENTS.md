@@ -279,6 +279,10 @@ CDP 侧为此在 `cdp.go` 增加了**页面级会话**：`Target.attachToTarget{
 `gpt_login.go`,移植自 `gpt_login_automation.py`。`openaiLogins.Start(邮箱前缀)` 拿 auth_url(`open_browser:false`,Bridge 只起 1455 回调)+ bridgeID → 开隔离 Chrome → `enterEmailAndCode`(reactFill 邮箱+码,新鲜过滤)→ 若未到 consent 则 `phoneFlow` 手机验证 → `clickConsent` 点 Continue 等 `localhost:1455/success` → `waitLoginCompleted` 轮询 `openaiLogins.Status(bridgeID)==completed`。
 - **手机验证** `phoneFlow`:`herosmsOfferRows` 拉 dr 优惠逐国试,每国批量买最多 3 个号(`herosmsBuyNumber`),`setCountryPhone` 输完整 E.164 让控件自解析国家+强制 SMS,`submitPhone` 提交,按返回文案分流(SMS 成功→`pollSMS`轮询→`finishActivation`+`fillPhoneCode`;WhatsApp-only/无法发短信→拉黑该国换下一国;已用/无效→换下一个号;授权失效/次数过多→整体失败)。`isSMSCodeForm`/`isWhatsappOnly` 判交付方式。blocked 国家目前**只在本次运行内存**(不跨运行持久化)。
 - **接码后台异步取消**(按用户要求):买号后 `herosmsRegister(actID)` 登记进 `herosmsTracker`,**不再任务结束阻塞等 2 分钟**。后台 `runHeroSMSCanceler`(每 30s)把**超 125s 未用上**的号自动 `cancelActivation`(HeroSMS 有 120s 最小激活期,提前取消 `EARLY_CANCEL_DENIED`,故卡 125s)。用上验证码的号 `herosmsMarkUsed` 标记,不会被取消。
+- **限定国家**(`herosms_gpt_login_countries`,HeroSMS 页配置,逗号分隔国家 ID):非空即进 `limitedMode`,`orderHeroSMSOffersByCountryLimit` 把 offers **原地过滤**成只剩这些国家的行,**保持 `herosmsOfferRows` 的全局价格升序**(跨国家一起排,便宜的先买)。早期实现按配置里的国家顺序分组拼接,限定多国时会让「第一个国家的贵档」排在「第二个国家的便宜档」前面,已改掉。
+  - **粒度是国家级,不含价格档**:页面点某一行「限定」只存国家 ID,同国家所有价格档都会被标成"已限定",这是有意的(价格档是秒级抖动的公共池,钉死单档极易扑空)。
+  - **已知坑**:价格/库存过滤在 `herosmsOfferRows` 里就做完了(`price > maxPrice` 或 `count <= minCount` 直接丢行),限定国家是在这之后才生效的。所以限定的国家若在那一瞬间没有达标行,`offers` 为空 → 立刻 `return` 报「配置的国家没有可买号码」,任务在手机号那步结束、一个号都没买。实测巴西(73)的 $0.0495 档库存 3 秒内能从 16660 掉到 8,查价时符合、发起登录时就不符合了——**限定国家时把「登录买号最高单价」设到该国家有稳定库存的那一档以上**(如巴西设 ≥0.17 覆盖 $0.1690/5.6 万库存档),别只压在抖动的最低价档上。
+  - `herosmsBuyNumber` 失败目前是静默 `continue`(不 note 不落库),所以"offers 为空"和"买号全失败"在界面上长得一样,都是零购买零日志。
 - **与 signup 互斥**:两者都开浏览器,一次只跑一个(`hasRunning` 交叉检查,固定锁序避免死锁),重复发起 409。
 - 接口:`POST /api/outlook/accounts/{id}/gpt-login`、`GET /api/gpt-login/{id}`、`POST /api/gpt-login/{id}/cancel`。前端「登录Codex」按钮 + 任务状态框已就位。
 - 离线单测:`gpt_login_test.go`(交付方式判定、Continue 检测、邮箱前缀)。

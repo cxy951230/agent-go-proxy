@@ -31,6 +31,14 @@ type openAILoginStatus struct {
 	CompletedAt  time.Time `json:"completed_at,omitempty"`
 }
 
+func (s openAILoginStatus) done() bool {
+	switch s.State {
+	case "completed", "failed", "cancelled":
+		return true
+	}
+	return false
+}
+
 type bridgeLoginStarted struct {
 	AuthURL      string `json:"auth_url"`
 	CallbackPort uint16 `json:"callback_port"`
@@ -70,13 +78,9 @@ func newOpenAILoginManager(bridgePath string, store *Store, proxyURL string) *op
 	}
 }
 
-var bridgeProxyEnvMu sync.Mutex
-
+// 进程环境变量在启动时已永久指向 scopedLocalProxyURL(见 main.go),Bridge(C 库)每次调用
+// 直接从 env 读代理,因此这里不再每次加锁改 env——去掉全局串行化,批量刷额度/拉模型才能真正并发。
 func (m *openAILoginManager) withProxyEnv(fn func() error) error {
-	bridgeProxyEnvMu.Lock()
-	defer bridgeProxyEnvMu.Unlock()
-	restore := setProcessProxyEnv(m.proxyURL)
-	defer restore()
 	return fn()
 }
 
@@ -102,10 +106,6 @@ func (p *openAILoginProcess) bridgeCallLoginWait(session unsafe.Pointer) (string
 }
 
 func bridgeProxyEnvMuLocked(bridge *nativeBridge, fn func() error) error {
-	bridgeProxyEnvMu.Lock()
-	defer bridgeProxyEnvMu.Unlock()
-	restore := setProcessProxyEnv(scopedLocalProxyURL)
-	defer restore()
 	return fn()
 }
 
@@ -154,7 +154,33 @@ func (m *openAILoginManager) Start(displayName string) (openAILoginStatus, error
 }
 
 func (m *openAILoginManager) StartWithBrowser(displayName string) (openAILoginStatus, error) {
+	// 页面刷新后前端会丢失旧任务 id；旧的浏览器登录如果仍停在 waiting，会继续占用
+	// Bridge 回调端口，导致再次点击只开出 about:blank/无响应。新开手动登录前先清理
+	// 这类由 OPENAI 页面启动的旧浏览器任务；不碰 browser=nil 的 Bridge 会话(GPT 登录流程在用)。
+	m.cancelWaitingBrowserLogins()
 	return m.start(displayName, true)
+}
+
+func (m *openAILoginManager) cancelWaitingBrowserLogins() {
+	type item struct {
+		id      string
+		browser *chromeSession
+		session unsafe.Pointer
+	}
+	var items []item
+	m.mu.Lock()
+	for id, process := range m.logins {
+		if process != nil && process.browser != nil && process.status.State == "waiting" {
+			process.status.State = "cancelled"
+			process.status.CompletedAt = time.Now()
+			items = append(items, item{id: id, browser: process.browser, session: process.session})
+		}
+	}
+	m.mu.Unlock()
+	for _, it := range items {
+		it.browser.Close()
+		_ = m.bridge.loginCancel(it.session)
+	}
 }
 
 func (m *openAILoginManager) start(displayName string, openBrowser bool) (openAILoginStatus, error) {
@@ -606,13 +632,25 @@ func (m *openAILoginManager) complete(id, state string, account *OpenAIAccount, 
 }
 
 func (m *openAILoginManager) Status(id string) (openAILoginStatus, bool) {
+	var cancelSession unsafe.Pointer
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	process, ok := m.logins[id]
 	if !ok {
+		m.mu.Unlock()
 		return openAILoginStatus{}, false
 	}
-	return process.status, true
+	if process.status.State == "waiting" && process.browser != nil && !process.browser.Alive() {
+		process.status.State = "cancelled"
+		process.status.Error = "Chrome 窗口已关闭"
+		process.status.CompletedAt = time.Now()
+		cancelSession = process.session
+	}
+	st := process.status
+	m.mu.Unlock()
+	if cancelSession != nil {
+		_ = m.bridge.loginCancel(cancelSession)
+	}
+	return st, true
 }
 
 func (m *openAILoginManager) Cancel(id string) error {
@@ -622,17 +660,18 @@ func (m *openAILoginManager) Cancel(id string) error {
 		m.mu.Unlock()
 		return errors.New("登录任务不存在")
 	}
-	if process.status.State != "waiting" {
+	if process.status.done() {
 		m.mu.Unlock()
 		return nil
 	}
 	process.status.State, process.status.CompletedAt = "cancelled", time.Now()
 	browser := process.browser
+	session := process.session
 	m.mu.Unlock()
 	if browser != nil {
 		browser.Close()
 	}
-	return process.bridge.loginCancel(process.session)
+	return process.bridge.loginCancel(session)
 }
 
 func (m *openAILoginManager) Close() {

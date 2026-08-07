@@ -47,6 +47,7 @@ func (s gptSignupStatus) done() bool {
 type gptSignupProcess struct {
 	status gptSignupStatus
 	cancel context.CancelFunc
+	driver *gptDriver
 }
 
 // gptSignupManager:一次只跑一个注册任务,重复发起返回 409(与 outlookLoginManager 同构)。
@@ -64,6 +65,13 @@ func newGPTSignupManager(srv *proxyServer) *gptSignupManager {
 func (m *gptSignupManager) running() bool {
 	for _, p := range m.all {
 		if !p.status.done() {
+			if p.driver != nil && !p.driver.Alive() {
+				p.status.State = "cancelled"
+				p.status.Message = "Chrome 窗口已关闭"
+				p.status.CompletedAt = time.Now()
+				p.cancel()
+				continue
+			}
 			return true
 		}
 	}
@@ -118,11 +126,23 @@ func (m *gptSignupManager) Start(email, name, age string) (gptSignupStatus, erro
 	return proc.status, nil
 }
 
+func (m *gptSignupManager) attachDriver(id string, driver *gptDriver) {
+	m.mu.Lock()
+	proc := m.all[id]
+	if proc != nil {
+		proc.driver = driver
+	}
+	m.mu.Unlock()
+}
+
 func (m *gptSignupManager) set(id, state, message, errMsg, finalURL string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	proc := m.all[id]
 	if proc == nil {
+		return
+	}
+	if proc.status.done() && proc.status.State != state {
 		return
 	}
 	proc.status.State = state
@@ -144,12 +164,20 @@ func (m *gptSignupManager) note(id, message string) { m.set(id, "running", messa
 
 func (m *gptSignupManager) Status(id string) (gptSignupStatus, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	proc := m.all[id]
 	if proc == nil {
+		m.mu.Unlock()
 		return gptSignupStatus{}, false
 	}
-	return proc.status, true
+	if proc.status.State == "running" && proc.driver != nil && !proc.driver.Alive() {
+		proc.status.State = "cancelled"
+		proc.status.Message = "Chrome 窗口已关闭"
+		proc.status.CompletedAt = time.Now()
+		proc.cancel()
+	}
+	st := proc.status
+	m.mu.Unlock()
+	return st, true
 }
 
 func (m *gptSignupManager) Latest() (gptSignupStatus, bool) {
@@ -168,11 +196,19 @@ func (m *gptSignupManager) Latest() (gptSignupStatus, bool) {
 }
 
 func (m *gptSignupManager) Cancel(id string) {
+	var driver *gptDriver
 	m.mu.Lock()
 	proc := m.all[id]
-	m.mu.Unlock()
-	if proc != nil {
+	if proc != nil && !proc.status.done() {
+		proc.status.State = "cancelled"
+		proc.status.Message = "已取消"
+		proc.status.CompletedAt = time.Now()
 		proc.cancel()
+		driver = proc.driver
+	}
+	m.mu.Unlock()
+	if driver != nil {
+		driver.Close()
 	}
 }
 
@@ -197,6 +233,7 @@ func (m *gptSignupManager) run(ctx context.Context, id, email, name, age string)
 		m.set(id, "failed", "", "启动浏览器失败: "+err.Error(), "")
 		return
 	}
+	m.attachDriver(id, driver)
 	defer driver.Close() // 任务结束(含失败/取消)删临时 profile
 
 	m.note(id, "已打开 ChatGPT 登录页…")

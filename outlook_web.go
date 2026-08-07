@@ -107,6 +107,27 @@ func (p *proxyServer) handleAPIOutlookAccountCredentials(w http.ResponseWriter, 
 }
 
 // handleAPIOutlookAccountUpdate 修改某行的邮箱 + 密码。
+
+func (p *proxyServer) handleAPIOutlookAccountTags(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad account id", http.StatusBadRequest)
+		return
+	}
+	var payload struct {
+		Tags string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if err := p.store.SetOutlookAccountTags(r.Context(), id, payload.Tags); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true}, nil)
+}
+
 func (p *proxyServer) handleAPIOutlookAccountUpdate(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
@@ -205,7 +226,7 @@ const outlookHTML = `
     button:hover:not(:disabled){background:#f3f6fc}button:active:not(:disabled){transform:translateY(1px) scale(.985);box-shadow:inset 0 2px 7px rgba(20,30,50,.16)}button:disabled{opacity:.6;cursor:not-allowed}
     button.busy::before{content:'';display:inline-block;width:11px;height:11px;margin-right:7px;vertical-align:-1px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.panel{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05);overflow-x:auto}
     .notice{margin-top:12px;color:var(--muted)}
-    table{width:100%;min-width:1080px;border-collapse:collapse}th,td{padding:15px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;white-space:nowrap}tbody tr:last-child td{border-bottom:0}th{font-size:12px;color:#606a7a;font-weight:600;background:#fbfcfe}
+    table{width:100%;min-width:1160px;border-collapse:collapse}th,td{padding:15px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;white-space:nowrap}tbody tr:last-child td{border-bottom:0}th{font-size:12px;color:#606a7a;font-weight:600;background:#fbfcfe}.tag-btn{height:auto;max-width:92px;padding:3px 9px;border-radius:6px;border:1px solid #d8e0eb;background:#f7f9fc;color:#526074;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:none;font-size:13px;font-weight:600}.tag-btn:hover{background:#eef2fa;border-color:#c7d3e4;color:#334155}
     tbody tr.row-link{cursor:pointer}tbody tr.row-link:hover{background:#fafcff}
     .email{font-weight:600}.sub{font-size:12px;color:var(--muted)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#526074}
     .pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:12px;font-weight:600}.st-ok{color:var(--green);background:#e9f7ef;border:1px solid #bfe6cf}.st-bad{color:var(--red);background:#fdecec;border:1px solid #f2c2c2}.st-none{color:var(--muted);background:#eef1f6;border:1px solid #e0e5ee}
@@ -260,7 +281,7 @@ const outlookHTML = `
         <div class="modal-actions"><button id="gpt-cancel" type="button">取消任务</button></div>
       </div>
       <table>
-        <thead><tr><th>账号</th><th>Codex</th><th>套餐/租户</th><th>Access Token 过期</th><th>Refresh Token 过期</th><th>Cookie</th><th>刷新状态</th><th>创建时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>账号</th><th>标签</th><th>Codex</th><th>套餐/租户</th><th>Access Token 过期</th><th>Refresh Token 过期</th><th>Cookie</th><th>刷新状态</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody id="account-rows"></tbody>
       </table>
       <div class="empty" id="empty">暂无已登录的 Outlook 账号。点右上角「+ 登录账号」开始。</div>
@@ -291,6 +312,7 @@ const appEl=document.querySelector('.app');
 if(localStorage.getItem('sidebarCollapsed')==='1')appEl.classList.add('sidebar-collapsed');
 document.getElementById('sidebar-toggle').addEventListener('click',()=>{appEl.classList.toggle('sidebar-collapsed');localStorage.setItem('sidebarCollapsed',appEl.classList.contains('sidebar-collapsed')?'1':'0')});
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const short=v=>{v=String(v||'');return v.length>22?v.slice(0,12)+'…'+v.slice(-6):v};
 const fmtTime=v=>v?new Date(v).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'';
 // tokenText 按过期时间着色:已过期红、1 小时内到期黄、其余绿;时间未知(零值/空)显示「未知」。
 function tokenText(v){
@@ -304,6 +326,16 @@ function tokenText(v){
 // needsLogin 判断这行是否还需要重新登录。重新登录只在静默刷新救不回来时才有意义,
 // 所以「有 token + 没过期 + 最近一次刷新没失败」的健康账号不显示「登录」按钮。
 // 刷新失败会写 last_refresh_error,所以刷失败的行会自动冒出登录按钮,正好接上。
+function tagCell(item){
+  return '<td><button class="tag-btn" title="'+esc(item.tags||'')+'" data-tag-id="'+item.id+'" data-tags="'+esc(item.tags||'')+'">'+esc(item.tags?short(item.tags,10):'+')+'</button></td>';
+}
+async function editTags(button){
+  const id=button.dataset.tagId||'';if(!id)return;
+  const next=prompt('标签',button.dataset.tags||'');if(next===null)return;
+  const rsp=await fetch('/api/outlook/accounts/'+encodeURIComponent(id)+'/tags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tags:next.trim()})});
+  if(!rsp.ok){alert('保存标签失败：'+await rsp.text());return}
+  await loadAccounts();
+}
 function needsLogin(item){
   if(item.last_refresh_error)return true;
   if(!item.access_token_len)return true;
@@ -323,6 +355,7 @@ async function loadAccounts(){
   rows.innerHTML=(items||[]).map(item=>
     '<tr class="row-link" data-href="/outlook/accounts/'+item.id+'">'+
     '<td><div class="email">'+esc(item.email||'-')+'</div>'+(item.display_name?'<div class="sub">'+esc(item.display_name)+'</div>':'')+'</td>'+
+    tagCell(item)+
     '<td>'+((item.has_codex_account||item.has_gpt_account)?'<span class="pill gpt-yes">是</span>':'<span class="pill gpt-no">否</span>')+'</td>'+
     '<td><div class="sub">'+esc(item.token_type||'-')+'</div><div class="sub mono" title="'+esc(item.tenant_id||'')+'">'+esc((item.tenant_id||'').slice(0,12)||'-')+'</div></td>'+
     '<td>'+tokenText(item.access_token_expires_at)+'</td>'+
@@ -390,6 +423,7 @@ refreshAllBtn.addEventListener('click',async()=>{
 fetch('/api/outlook/refresh-all',{cache:'no-store'}).then(r=>r.json()).then(st=>{
   if(st&&st.running){setRefreshAllLabel('刷新中 '+st.done+'/'+st.total+'…',true);refreshAllTimer=setTimeout(()=>pollRefreshAll(false),2000)}
 }).catch(()=>{});
+document.getElementById('account-rows').addEventListener('click',event=>{const button=event.target.closest('.tag-btn');if(button){event.preventDefault();editTags(button).catch(err=>alert('保存标签失败：'+err.message));}});
 // 整行点击跳转到该账号的邮件页(点到操作按钮时不跳转)。
 document.getElementById('account-rows').addEventListener('click',event=>{
   if(event.target.closest('button,a,input,select'))return;

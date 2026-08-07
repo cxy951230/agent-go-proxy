@@ -234,6 +234,27 @@ func (p *proxyServer) handleAPIOpenAIAccountModels(w http.ResponseWriter, r *htt
 }
 
 // handleAPIOpenAIAccountToggle 切换账号的启用状态。停用后该账号不再进入转发时的候选集。
+
+func (p *proxyServer) handleAPIOpenAIAccountTags(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad account id", http.StatusBadRequest)
+		return
+	}
+	var payload struct {
+		Tags string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if err := p.store.SetOpenAIAccountTags(r.Context(), id, payload.Tags); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true}, nil)
+}
+
 func (p *proxyServer) handleAPIOpenAIAccountToggle(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
@@ -350,7 +371,7 @@ const openAIHTML = `
     .nav-item{display:block;padding:10px 12px;border-radius:8px;color:var(--text);font-weight:500;margin-bottom:4px;text-decoration:none}.nav-item:hover{background:#eef2fa}.nav-item.active{background:#eaf1ff;color:var(--blue);font-weight:600}
     .page{flex:1;min-width:0;padding:22px 28px 56px}.top{display:flex;align-items:center;gap:16px}.top h1{font-size:18px;font-weight:600;margin:0;flex:1}button,input{height:42px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:0 14px;font:inherit;color:var(--text)}button{cursor:pointer;transition:transform .06s ease,box-shadow .12s ease,background .12s ease}button:active:not(:disabled){transform:translateY(1px) scale(.985);box-shadow:inset 0 2px 7px rgba(20,30,50,.16)}button:disabled{opacity:.6;cursor:not-allowed}button.busy::before{content:'';display:inline-block;width:11px;height:11px;margin-right:7px;vertical-align:-1px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.btn-primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}.btn-primary:hover{background:#265fd0}.panel{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 3px rgba(20,30,50,.05);overflow-x:auto}
     tbody tr.row-link{cursor:pointer}tbody tr.row-link:hover{background:#fafcff}
-    .login-box{display:none;padding:18px 22px;border-bottom:1px solid var(--line);background:#f8fbff}.login-box.show{display:block}.login-title{font-weight:600}.login-url{display:block;margin-top:8px;color:var(--blue);word-break:break-all}.small{font-size:12px;color:var(--muted)}table{width:100%;min-width:1180px;border-collapse:collapse}th,td{padding:16px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;white-space:nowrap}tbody tr:last-child td{border-bottom:0}th{font-size:12px;color:#606a7a;font-weight:600;background:#fbfcfe}.pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600}.plan{color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}.account-id{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#526074;line-height:1.7}.delete-btn{height:32px;color:var(--red);border-color:#f0b3b3;background:#fff6f6}.refresh-btn{height:32px;margin-right:6px}.usage{font-size:12px;line-height:1.5;color:#526074}.empty{padding:28px;color:var(--muted);text-align:center}.notice{margin-top:12px;color:var(--muted)}
+    .login-box{display:none;padding:18px 22px;border-bottom:1px solid var(--line);background:#f8fbff}.login-box.show{display:block}.login-title{font-weight:600}.login-url{display:block;margin-top:8px;color:var(--blue);word-break:break-all}.small{font-size:12px;color:var(--muted)}table{width:100%;min-width:1260px;border-collapse:collapse}th,td{padding:16px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;white-space:nowrap}tbody tr:last-child td{border-bottom:0}th{font-size:12px;color:#606a7a;font-weight:600;background:#fbfcfe}.pill{display:inline-block;border-radius:6px;padding:3px 9px;font-size:13px;font-weight:600}.plan{color:var(--purple);background:#f4f1ff;border:1px solid #ddd4ff}.account-id{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#526074;line-height:1.7}.delete-btn{height:32px;color:var(--red);border-color:#f0b3b3;background:#fff6f6}.refresh-btn{height:32px;margin-right:6px}.usage{font-size:12px;line-height:1.5;color:#526074}.tag-btn{height:auto;max-width:92px;padding:3px 9px;border-radius:6px;border:1px solid #d8e0eb;background:#f7f9fc;color:#526074;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:none;font-size:13px;font-weight:600}.tag-btn:hover{background:#eef2fa;border-color:#c7d3e4;color:#334155}.empty{padding:28px;color:var(--muted);text-align:center}.notice{margin-top:12px;color:var(--muted)}
     /* 操作列:4 个按钮排成 2×2 等宽网格,比一字排开窄得多,也不会参差换行 */
     td.actions{white-space:nowrap;width:140px;min-width:140px}
     .act-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;width:128px}
@@ -402,7 +423,7 @@ const openAIHTML = `
         <div class="small" id="login-status"></div>
       </div>
       <table>
-        <thead><tr><th>名称</th><th>邮箱</th><th>ChatGPT Account ID</th><th>套餐</th><th>额度使用</th><th>Token 过期</th><th>模型配置</th><th>创建时间</th><th>启用</th><th>操作</th></tr></thead>
+        <thead><tr><th>名称</th><th>邮箱</th><th>标签</th><th>ChatGPT Account ID</th><th>套餐</th><th>额度使用</th><th>Token 过期</th><th>模型配置</th><th>创建时间</th><th>启用</th><th>操作</th></tr></thead>
         <tbody id="account-rows"></tbody>
       </table>
       <div class="empty" id="empty">暂无 GPT 账号，点击右上角开始登录。</div>
@@ -419,7 +440,7 @@ const fmtTime=v=>v?new Date(v).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',
 async function loadAccounts(){
   const rsp=await fetch('/api/openai/accounts',{cache:'no-store'});if(!rsp.ok)throw new Error(await rsp.text());
   const items=await rsp.json();const rows=document.getElementById('account-rows');
-  rows.innerHTML=(items||[]).map(item=>'<tr class="row-link'+(item.enabled===false?' off':'')+'" data-href="/stats/tokens?dim=account&id='+item.id+'&name='+encodeURIComponent(item.name||'')+'"><td>'+esc(item.name||'-')+'</td><td>'+esc(item.email||'-')+'</td><td><span class="account-id" title="'+esc(item.account_id)+'">'+esc(short(item.account_id))+'</span></td><td><span class="pill plan">'+esc(item.plan_type||'unknown')+'</span></td><td class="usage">'+usageText(item)+'</td><td>'+tokenText(item)+'</td>'+settingsCells(item)+'<td class="small">'+esc(fmtTime(item.created_at))+'</td>'+enabledCell(item)+'<td class="actions"><div class="act-grid"><a class="detail-btn" href="/openai/accounts/'+item.id+'">详情</a><button class="refresh-btn" data-refresh-id="'+item.id+'" type="button" title="刷新额度与 Token">额度</button><button class="models-btn" data-models-id="'+item.id+'" type="button" title="重新拉取可用模型">模型</button><button class="delete-btn" data-id="'+item.id+'" type="button">删除</button></div></td></tr>').join('');
+  rows.innerHTML=(items||[]).map(item=>'<tr class="row-link'+(item.enabled===false?' off':'')+'" data-href="/stats/tokens?dim=account&id='+item.id+'&name='+encodeURIComponent(item.name||'')+'"><td>'+esc(item.name||'-')+'</td><td>'+esc(item.email||'-')+'</td>'+tagCell(item)+'<td><span class="account-id" title="'+esc(item.account_id)+'">'+esc(short(item.account_id))+'</span></td><td><span class="pill plan">'+esc(item.plan_type||'unknown')+'</span></td><td class="usage">'+usageText(item)+'</td><td>'+tokenText(item)+'</td>'+settingsCells(item)+'<td class="small">'+esc(fmtTime(item.created_at))+'</td>'+enabledCell(item)+'<td class="actions"><div class="act-grid"><a class="detail-btn" href="/openai/accounts/'+item.id+'">详情</a><button class="refresh-btn" data-refresh-id="'+item.id+'" type="button" title="刷新额度与 Token">额度</button><button class="models-btn" data-models-id="'+item.id+'" type="button" title="重新拉取可用模型">模型</button><button class="delete-btn" data-id="'+item.id+'" type="button">删除</button></div></td></tr>').join('');
   document.getElementById('empty').style.display=items&&items.length?'none':'block';
   const total=(items||[]).length;
   document.getElementById('account-count').textContent=total?'共 '+total+' 个账号':'';
@@ -427,6 +448,16 @@ async function loadAccounts(){
 }
 // syncMasterToggle 让顶部总开关跟随当前列表:全开显示「是」、全关显示「否」、
 // 混合显示「部分」。点击时全开就全关,否则一律全开——三态里只有这一种映射不会有歧义。
+function tagCell(item){
+  return '<td><button class="tag-btn" title="'+esc(item.tags||'')+'" data-tag-id="'+item.id+'" data-tags="'+esc(item.tags||'')+'">'+esc(item.tags?short(item.tags,10):'+')+'</button></td>';
+}
+async function editTags(button){
+  const id=button.dataset.tagId||'';if(!id)return;
+  const next=prompt('标签',button.dataset.tags||'');if(next===null)return;
+  const rsp=await fetch('/api/openai/accounts/'+encodeURIComponent(id)+'/tags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tags:next.trim()})});
+  if(!rsp.ok){alert('保存标签失败：'+await rsp.text());return}
+  await loadAccounts();
+}
 function syncMasterToggle(items){
   const button=document.getElementById('toggle-all');
   const total=items.length;
@@ -547,7 +578,7 @@ async function beginLogin(){
       if(loginTab&&!loginTab.closed)loginTab.location.href=task.auth_url;
       else window.open(task.auth_url,'_blank','noopener');
     }
-    const box=document.getElementById('login-box');const link=document.getElementById('login-url');box.classList.add('show');link.href=task.auth_url;link.textContent=task.auth_url;document.getElementById('login-status').textContent='请在新标签页完成 ChatGPT 登录…';
+    const box=document.getElementById('login-box');const link=document.getElementById('login-url');box.classList.add('show');link.href=task.auth_url||'#';link.textContent=task.auth_url||'';document.getElementById('login-title').textContent='等待浏览器登录';document.getElementById('login-status').textContent='请在新标签页完成 ChatGPT 登录…';
     pollLogin(task.id);
   }catch(err){if(loginTab&&!loginTab.closed)loginTab.close();alert('启动登录失败：'+err.message);button.disabled=false}
 }
@@ -615,6 +646,7 @@ document.getElementById('account-rows').addEventListener('click',async event=>{
   if(result.outlook_deleted)alert('已删除，同时清掉了 '+result.outlook_deleted+' 条同邮箱的 OUTLOOK 记录。');
   loadAccounts();
 });
+document.getElementById('account-rows').addEventListener('click',event=>{const button=event.target.closest('.tag-btn');if(button){event.preventDefault();editTags(button).catch(err=>alert('保存标签失败：'+err.message));}});
 // 整行点击跳转到该账号的 token 消耗统计页(点到按钮/链接/下拉等交互控件时不跳转)。
 document.getElementById('account-rows').addEventListener('click',event=>{if(event.target.closest('a,button,input,select'))return;const row=event.target.closest('tr[data-href]');if(row)location.href=row.dataset.href});
 // 顶部总开关:全开→全关要确认(会让所有请求都失败),其余方向直接全开。

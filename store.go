@@ -118,6 +118,7 @@ type OpenAIAccount struct {
 	Email       string `json:"email"`
 	AccountID   string `json:"account_id"`
 	PlanType    string `json:"plan_type"`
+	Tags        string `json:"tags"`
 	AuthJSON    string `json:"-"`
 	CodexCommit string `json:"codex_commit"`
 	// TokenExpiresAt 是 access_token(JWT)的 exp,登录与每次刷新后写入,
@@ -530,6 +531,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			email VARCHAR(320) NOT NULL DEFAULT '',
 			account_id VARCHAR(128) NOT NULL,
 			plan_type VARCHAR(64) NOT NULL DEFAULT '',
+			tags VARCHAR(255) NOT NULL DEFAULT '',
 			auth_json LONGTEXT NOT NULL,
 			codex_commit VARCHAR(64) NOT NULL DEFAULT '',
 			status_json LONGTEXT NOT NULL,
@@ -548,6 +550,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			email VARCHAR(320) NOT NULL,
 			password VARCHAR(512) NOT NULL DEFAULT '',
 			display_name VARCHAR(255) DEFAULT NULL,
+			tags VARCHAR(255) NOT NULL DEFAULT '',
 			client_id VARCHAR(80) NOT NULL,
 			tenant_id VARCHAR(80) DEFAULT NULL,
 			account_oid VARCHAR(80) DEFAULT NULL,
@@ -651,6 +654,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "openai_accounts", "refresh_error", "TEXT NULL AFTER token_expires_at"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "openai_accounts", "tags", "VARCHAR(255) NOT NULL DEFAULT '' AFTER plan_type"); err != nil {
+		return err
+	}
 	for _, col := range [][2]string{
 		{"models_json", "LONGTEXT NULL"},
 		{"models_at", "DATETIME(6) NULL"},
@@ -667,6 +673,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	// outlook_login_tokens 存明文登录密码(手动新增/编辑账号用,供后续自动登录复用)。
 	// skill 的 upsert 列表不含 password,登录时不会覆盖它。
 	if err := s.ensureColumn(ctx, "outlook_login_tokens", "password", "VARCHAR(512) NOT NULL DEFAULT '' AFTER email"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "outlook_login_tokens", "tags", "VARCHAR(255) NOT NULL DEFAULT '' AFTER display_name"); err != nil {
 		return err
 	}
 	// has_gpt_account 历史字段:缓存「该邮箱是否已登录 Codex/OPENAI 菜单存在账号」。
@@ -1021,9 +1030,9 @@ func (s *Store) GetOpenAIAccount(ctx context.Context, id int64) (OpenAIAccount, 
 	var refreshError sql.NullString
 	var modelsRaw sql.NullString
 	var modelsAt sql.NullTime
-	err := s.db.QueryRowContext(ctx, `SELECT id, name, email, account_id, plan_type, auth_json, codex_commit, status_json, status_error, status_at, token_expires_at, refresh_error,
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, email, account_id, plan_type, tags, auth_json, codex_commit, status_json, status_error, status_at, token_expires_at, refresh_error,
 		models_json, models_at, selected_model, selected_reasoning_effort, selected_service_tier, enabled, created_at, updated_at
-		FROM openai_accounts WHERE id=?`, id).Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.AuthJSON, &account.CodexCommit, &statusRaw, &account.StatusError, &statusAt, &expiresAt, &refreshError,
+		FROM openai_accounts WHERE id=?`, id).Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.Tags, &account.AuthJSON, &account.CodexCommit, &statusRaw, &account.StatusError, &statusAt, &expiresAt, &refreshError,
 		&modelsRaw, &modelsAt, &account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier, &account.Enabled, &account.CreatedAt, &account.UpdatedAt)
 	if err != nil {
 		return account, err
@@ -1060,7 +1069,7 @@ func (s *Store) UpdateOpenAIAccountStatus(ctx context.Context, id int64, statusJ
 }
 
 func (s *Store) ListOpenAIAccounts(ctx context.Context) ([]OpenAIAccount, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, email, account_id, plan_type, codex_commit, status_json, status_error, status_at, token_expires_at, refresh_error,
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, email, account_id, plan_type, tags, codex_commit, status_json, status_error, status_at, token_expires_at, refresh_error,
 		models_json, models_at, selected_model, selected_reasoning_effort, selected_service_tier, enabled, created_at, updated_at
 		FROM openai_accounts ORDER BY created_at DESC, id DESC`)
 	if err != nil {
@@ -1073,7 +1082,7 @@ func (s *Store) ListOpenAIAccounts(ctx context.Context) ([]OpenAIAccount, error)
 		var statusRaw string
 		var statusAt, expiresAt, modelsAt sql.NullTime
 		var refreshError, modelsRaw sql.NullString
-		if err := rows.Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.CodexCommit, &statusRaw, &account.StatusError, &statusAt, &expiresAt, &refreshError,
+		if err := rows.Scan(&account.ID, &account.Name, &account.Email, &account.AccountID, &account.PlanType, &account.Tags, &account.CodexCommit, &statusRaw, &account.StatusError, &statusAt, &expiresAt, &refreshError,
 			&modelsRaw, &modelsAt, &account.SelectedModel, &account.SelectedReasoningEffort, &account.SelectedServiceTier, &account.Enabled, &account.CreatedAt, &account.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -1765,6 +1774,24 @@ func (s *Store) SetConversationTags(ctx context.Context, id int64, tags string) 
 		tags = tags[:255]
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE conversations SET tags=? WHERE id=?`, tags, id)
+	return err
+}
+
+func (s *Store) SetOpenAIAccountTags(ctx context.Context, id int64, tags string) error {
+	tags = strings.TrimSpace(tags)
+	if len(tags) > 255 {
+		tags = tags[:255]
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE openai_accounts SET tags=?, updated_at=? WHERE id=?`, tags, time.Now(), id)
+	return err
+}
+
+func (s *Store) SetOutlookAccountTags(ctx context.Context, id int64, tags string) error {
+	tags = strings.TrimSpace(tags)
+	if len(tags) > 255 {
+		tags = tags[:255]
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE outlook_login_tokens SET tags=?, updated_at=? WHERE id=?`, tags, time.Now(), id)
 	return err
 }
 
@@ -2467,6 +2494,7 @@ type OutlookAccount struct {
 	ID                    int64     `json:"id"`
 	Email                 string    `json:"email"`
 	DisplayName           string    `json:"display_name"`
+	Tags                  string    `json:"tags"`
 	TenantID              string    `json:"tenant_id"`
 	Scope                 string    `json:"scope"`
 	TokenType             string    `json:"token_type"`
@@ -2498,7 +2526,7 @@ type OutlookAccount struct {
 // Codex 登录标记以历史列 has_gpt_account 为准;该列为 0 的行才按邮箱关联 openai_accounts
 // 复算一次。注册标记 registered_gpt_account 独立维护;Codex 已登录时会顺手视为已注册并回写。
 func (s *Store) ListOutlookAccounts(ctx context.Context) ([]OutlookAccount, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT t.id, t.email, COALESCE(t.display_name,''), COALESCE(t.tenant_id,''), COALESCE(t.scope,''),
+	rows, err := s.db.QueryContext(ctx, `SELECT t.id, t.email, COALESCE(t.display_name,''), COALESCE(t.tags,''), COALESCE(t.tenant_id,''), COALESCE(t.scope,''),
 		COALESCE(t.token_type,''), COALESCE(CHAR_LENGTH(t.access_token),0), COALESCE(CHAR_LENGTH(t.refresh_token),0),
 		COALESCE(t.expires_in,0), COALESCE(t.refresh_token_expires_in,0), COALESCE(t.cookie_count,0),
 		t.token_issued_at, t.access_token_expires_at, t.refresh_token_expires_at,
@@ -2519,7 +2547,7 @@ func (s *Store) ListOutlookAccounts(ctx context.Context) ([]OutlookAccount, erro
 		var a OutlookAccount
 		var issuedAt, accessExp, refreshExp sql.NullTime
 		var storedCodex, storedRegistered, hasCodex, hasPassword int64
-		if err := rows.Scan(&a.ID, &a.Email, &a.DisplayName, &a.TenantID, &a.Scope,
+		if err := rows.Scan(&a.ID, &a.Email, &a.DisplayName, &a.Tags, &a.TenantID, &a.Scope,
 			&a.TokenType, &a.AccessTokenLen, &a.RefreshTokenLen,
 			&a.ExpiresIn, &a.RefreshTokenExpiresIn, &a.CookieCount,
 			&issuedAt, &accessExp, &refreshExp,
@@ -2632,7 +2660,7 @@ func (s *Store) GetOutlookAccountEmail(ctx context.Context, id int64) (string, e
 
 // GetOutlookAccountByID 取单行元数据(刷新完成后回读返回给前端)。
 func (s *Store) GetOutlookAccountByID(ctx context.Context, id int64) (OutlookAccount, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, email, COALESCE(display_name,''), COALESCE(tenant_id,''), COALESCE(scope,''),
+	rows, err := s.db.QueryContext(ctx, `SELECT id, email, COALESCE(display_name,''), COALESCE(tags,''), COALESCE(tenant_id,''), COALESCE(scope,''),
 		COALESCE(token_type,''), COALESCE(CHAR_LENGTH(access_token),0), COALESCE(CHAR_LENGTH(refresh_token),0),
 		COALESCE(expires_in,0), COALESCE(refresh_token_expires_in,0), COALESCE(cookie_count,0),
 		token_issued_at, access_token_expires_at, refresh_token_expires_at,
@@ -2652,7 +2680,7 @@ func (s *Store) GetOutlookAccountByID(ctx context.Context, id int64) (OutlookAcc
 	var a OutlookAccount
 	var issuedAt, accessExp, refreshExp sql.NullTime
 	var hasCodex, registeredGPT, hasPassword int64
-	if err := rows.Scan(&a.ID, &a.Email, &a.DisplayName, &a.TenantID, &a.Scope,
+	if err := rows.Scan(&a.ID, &a.Email, &a.DisplayName, &a.Tags, &a.TenantID, &a.Scope,
 		&a.TokenType, &a.AccessTokenLen, &a.RefreshTokenLen,
 		&a.ExpiresIn, &a.RefreshTokenExpiresIn, &a.CookieCount,
 		&issuedAt, &accessExp, &refreshExp,

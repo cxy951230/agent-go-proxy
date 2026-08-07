@@ -52,8 +52,10 @@ func (s gptLoginStatus) done() bool {
 }
 
 type gptLoginProcess struct {
-	status gptLoginStatus
-	cancel context.CancelFunc
+	status   gptLoginStatus
+	cancel   context.CancelFunc
+	driver   *gptDriver
+	bridgeID string
 }
 
 type gptLoginManager struct {
@@ -70,6 +72,13 @@ func newGPTLoginManager(srv *proxyServer) *gptLoginManager {
 func (m *gptLoginManager) running() bool {
 	for _, p := range m.all {
 		if !p.status.done() {
+			if p.driver != nil && !p.driver.Alive() {
+				p.status.State = "cancelled"
+				p.status.Message = "Chrome 窗口已关闭"
+				p.status.CompletedAt = time.Now()
+				p.cancel()
+				continue
+			}
 			return true
 		}
 	}
@@ -117,11 +126,32 @@ func (m *gptLoginManager) hasRunning() bool {
 	return m.running()
 }
 
+func (m *gptLoginManager) attachDriver(id string, driver *gptDriver) {
+	m.mu.Lock()
+	proc := m.all[id]
+	if proc != nil {
+		proc.driver = driver
+	}
+	m.mu.Unlock()
+}
+
+func (m *gptLoginManager) attachBridge(id, bridgeID string) {
+	m.mu.Lock()
+	proc := m.all[id]
+	if proc != nil {
+		proc.bridgeID = bridgeID
+	}
+	m.mu.Unlock()
+}
+
 func (m *gptLoginManager) set(id, state, message, errMsg string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	proc := m.all[id]
 	if proc == nil {
+		return
+	}
+	if proc.status.done() && proc.status.State != state {
 		return
 	}
 	proc.status.State = state
@@ -140,20 +170,41 @@ func (m *gptLoginManager) note(id, message string) { m.set(id, "running", messag
 
 func (m *gptLoginManager) Status(id string) (gptLoginStatus, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	proc := m.all[id]
 	if proc == nil {
+		m.mu.Unlock()
 		return gptLoginStatus{}, false
 	}
-	return proc.status, true
+	if proc.status.State == "running" && proc.driver != nil && !proc.driver.Alive() {
+		proc.status.State = "cancelled"
+		proc.status.Message = "Chrome 窗口已关闭"
+		proc.status.CompletedAt = time.Now()
+		proc.cancel()
+	}
+	st := proc.status
+	m.mu.Unlock()
+	return st, true
 }
 
 func (m *gptLoginManager) Cancel(id string) {
+	var driver *gptDriver
+	var bridgeID string
 	m.mu.Lock()
 	proc := m.all[id]
-	m.mu.Unlock()
-	if proc != nil {
+	if proc != nil && !proc.status.done() {
+		proc.status.State = "cancelled"
+		proc.status.Message = "已取消"
+		proc.status.CompletedAt = time.Now()
 		proc.cancel()
+		driver = proc.driver
+		bridgeID = proc.bridgeID
+	}
+	m.mu.Unlock()
+	if driver != nil {
+		driver.Close()
+	}
+	if bridgeID != "" && m.srv != nil && m.srv.openaiLogins != nil {
+		_ = m.srv.openaiLogins.Cancel(bridgeID)
 	}
 }
 
@@ -181,7 +232,13 @@ func (m *gptLoginManager) run(ctx context.Context, id, email string) {
 		return
 	}
 	bridgeID := loginStart.ID
+	m.attachBridge(id, bridgeID)
 	authURL := loginStart.AuthURL
+	if ctx.Err() != nil {
+		m.set(id, "cancelled", "已取消", "")
+		_ = m.srv.openaiLogins.Cancel(bridgeID)
+		return
+	}
 	if authURL == "" {
 		m.set(id, "failed", "", "Bridge 没返回 auth_url")
 		return
@@ -194,6 +251,7 @@ func (m *gptLoginManager) run(ctx context.Context, id, email string) {
 		m.set(id, "failed", "", "启动浏览器失败: "+err.Error())
 		return
 	}
+	m.attachDriver(id, driver)
 	defer driver.Close() // 任务结束删临时 profile
 
 	// 3) 邮箱 + 验证码。
@@ -493,14 +551,22 @@ func resolveHeroSMSCountryID(v string, names map[string]string) string {
 	return v
 }
 
+// orderHeroSMSOffersByCountryLimit 只保留限定国家的行，并保持 herosmsOfferRows 给的
+// 全局价格升序(价格同则库存多的在前)。
+//
+// 早期实现是按配置里的国家顺序分组拼接的，限定多个国家时会变成「第一个国家的贵档排在
+// 第二个国家的便宜档前面」，跟“先买便宜的”相悖；这里改成原地过滤，天然沿用入参顺序。
+// 价格/库存是否达标已经在 herosmsOfferRows 里按 maxPrice/minCount 过滤过，这里不再重复判。
 func orderHeroSMSOffersByCountryLimit(offers []herosmsOfferRow, countries []string) []herosmsOfferRow {
-	byCountry := make(map[string][]herosmsOfferRow)
-	for _, row := range offers {
-		byCountry[row.CountryID] = append(byCountry[row.CountryID], row)
+	want := make(map[string]bool, len(countries))
+	for _, cid := range countries {
+		want[cid] = true
 	}
 	out := make([]herosmsOfferRow, 0, len(offers))
-	for _, cid := range countries {
-		out = append(out, byCountry[cid]...)
+	for _, row := range offers {
+		if want[row.CountryID] {
+			out = append(out, row)
+		}
 	}
 	return out
 }

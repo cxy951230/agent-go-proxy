@@ -299,6 +299,16 @@ func main() {
 	openaiLogins := newOpenAILoginManager(*bridgeLibrary, store, scopedLocalProxyURL)
 	defer openaiLogins.Close()
 
+	// Bridge(C 库)只能从进程环境变量读代理,ABI 没有按调用传参的入口(status/tokenRefresh/modelsList
+	// 只收 auth)。早期做法是每次 Bridge 调用前把 7899 写进 env、调用后还原,并用全局锁串行化,这会把
+	// 批量刷额度/拉取模型的并发彻底打回串行(每次都要独占进程 env)。
+	// 改为:启动时先固化主转发用的“系统代理”快照——http.ProxyFromEnvironment 首次读取后即全局缓存,
+	// 这里主动触发一次,把当前(未被覆盖的)env 快照下来;随后把 7899 永久写进 env 专供 Bridge。
+	// 主转发的代理已缓存、不再受 env 变化影响;拉起的 Chrome 子进程本就用 withoutProxyEnv 剥掉代理 env,
+	// 也不会误吃 7899。这样 Bridge 调用无需再改 env、无需全局锁,批量任务恢复真并发。
+	_, _ = http.ProxyFromEnvironment(&http.Request{URL: &url.URL{Scheme: "https", Host: "chatgpt.com"}})
+	setProcessProxyEnv(scopedLocalProxyURL)
+
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -404,6 +414,7 @@ func main() {
 	router.Get("/api/openai/models-all", srv.handleAPIOpenAIModelsAllStatus)
 	router.Post("/api/openai/accounts/{id}/models", srv.handleAPIOpenAIAccountModels)
 	router.Post("/api/openai/accounts/{id}/settings", srv.handleAPIOpenAIAccountSettings)
+	router.Post("/api/openai/accounts/{id}/tags", srv.handleAPIOpenAIAccountTags)
 	router.Post("/api/openai/accounts/{id}/toggle", srv.handleAPIOpenAIAccountToggle)
 	router.Post("/api/openai/accounts/toggle-all", srv.handleAPIOpenAIAccountsToggleAll)
 	router.Get("/api/openai/quota-auto-refresh", srv.handleAPIOpenAIQuotaAutoRefresh)
@@ -429,6 +440,7 @@ func main() {
 	router.Post("/api/outlook/accounts/{id}/send", srv.handleAPIOutlookAccountSend)
 	router.Post("/api/outlook/mail/send", srv.handleAPIOutlookMailSend)
 	router.Put("/api/outlook/accounts/{id}", srv.handleAPIOutlookAccountUpdate)
+	router.Post("/api/outlook/accounts/{id}/tags", srv.handleAPIOutlookAccountTags)
 	router.Post("/api/outlook/accounts/{id}/refresh", srv.handleAPIOutlookAccountRefresh)
 	router.Post("/api/outlook/accounts/{id}/login", srv.handleAPIOutlookAccountAutoLogin)
 	router.Post("/api/outlook/accounts/refresh-all", srv.handleAPIOutlookRefreshAll)
