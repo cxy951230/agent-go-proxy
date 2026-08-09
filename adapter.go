@@ -275,15 +275,39 @@ func openaiResponsesToChat(body []byte) ([]byte, *adapterState, error) {
 
 	var input []map[string]any
 	_ = json.Unmarshal(src.Input, &input)
-	// pendingReasoning 暂存上一条 reasoning item 的文本,挂到紧随其后的第一条
-	// assistant 消息上(DeepSeek 等思考模型要求原样回传 reasoning_content)。
+	// Responses 里一轮助手输出是若干平行 item(reasoning、message、多个 function_call),
+	// 但 Chat 协议要求它们归并成【一条】assistant 消息:content 与 tool_calls 共存,
+	// 且带 tool_calls 的 assistant 后面必须紧跟对应的 tool 消息。每个 item 各 append
+	// 一条 assistant 会把并行调用拆成 assistant(A) → assistant(B) → tool(A) → tool(B),
+	// DeepSeek 直接 400:结构上报 "assistant message with 'tool_calls' must be followed
+	// by tool messages",拆出来的第二条又挂不上 reasoning_content,思考模式还会报
+	// "reasoning_content in the thinking mode must be passed back"。
+	//
+	// 所以这里用 cur 累积同一轮的 item,遇到 tool 结果、user/system 消息或下一轮的
+	// reasoning 才收尾。pendingReasoning 暂存 reasoning 文本,挂到本轮那条 assistant 上。
 	pendingReasoning := ""
-	attachReasoning := func(msg map[string]any) map[string]any {
-		if pendingReasoning != "" {
-			msg["reasoning_content"] = pendingReasoning
-			pendingReasoning = ""
+	var cur map[string]any
+	flush := func() {
+		if cur != nil {
+			msgs = append(msgs, cur)
+			cur = nil
 		}
-		return msg
+	}
+	// assistantMsg 返回本轮正在累积的 assistant 消息,没有就新建并挂上 reasoning。
+	assistantMsg := func() map[string]any {
+		if cur == nil {
+			cur = map[string]any{"role": "assistant", "content": nil}
+			if pendingReasoning != "" {
+				cur["reasoning_content"] = pendingReasoning
+				pendingReasoning = ""
+			}
+		}
+		return cur
+	}
+	addToolCall := func(call map[string]any) {
+		msg := assistantMsg()
+		calls, _ := msg["tool_calls"].([]any)
+		msg["tool_calls"] = append(calls, call)
 	}
 	for _, item := range input {
 		switch item["type"] {
@@ -292,24 +316,22 @@ func openaiResponsesToChat(body []byte) ([]byte, *adapterState, error) {
 				toolDefs = append(toolDefs, responsesToolsToChat(raw, state)...)
 			}
 		case "reasoning":
+			// reasoning 总是一轮的第一个 item,先把上一轮收尾再暂存。
+			flush()
 			if text := responsesReasoningText(item); text != "" {
 				pendingReasoning = text
 			}
 		case "custom_tool_call":
 			name := asStr(item["name"])
-			msgs = append(msgs, attachReasoning(map[string]any{"role": "assistant", "content": nil,
-				"tool_calls": []any{map[string]any{"id": asStr(item["call_id"]), "type": "function",
-					"function": map[string]any{"name": chatToolName("", name), "arguments": mustJSON(map[string]any{"input": asStr(item["input"])})}}}}))
-		case "custom_tool_call_output":
-			msgs = append(msgs, map[string]any{"role": "tool",
-				"tool_call_id": asStr(item["call_id"]), "content": asStr(item["output"])})
+			addToolCall(map[string]any{"id": asStr(item["call_id"]), "type": "function",
+				"function": map[string]any{"name": chatToolName("", name), "arguments": mustJSON(map[string]any{"input": asStr(item["input"])})}})
 		case "function_call":
 			name := asStr(item["name"])
 			namespace := asStr(item["namespace"])
-			msgs = append(msgs, attachReasoning(map[string]any{"role": "assistant", "content": nil,
-				"tool_calls": []any{map[string]any{"id": asStr(item["call_id"]), "type": "function",
-					"function": map[string]any{"name": chatToolName(namespace, name), "arguments": asStr(item["arguments"])}}}}))
-		case "function_call_output":
+			addToolCall(map[string]any{"id": asStr(item["call_id"]), "type": "function",
+				"function": map[string]any{"name": chatToolName(namespace, name), "arguments": asStr(item["arguments"])}})
+		case "custom_tool_call_output", "function_call_output":
+			flush()
 			msgs = append(msgs, map[string]any{"role": "tool",
 				"tool_call_id": asStr(item["call_id"]), "content": asStr(item["output"])})
 		default: // message / 无 type
@@ -320,19 +342,31 @@ func openaiResponsesToChat(body []byte) ([]byte, *adapterState, error) {
 			if role == "" {
 				role = "user"
 			}
-			if text := responsesContentText(item["content"]); text != "" {
-				msg := map[string]any{"role": role, "content": text}
-				if role == "assistant" {
-					msg = attachReasoning(msg)
+			text := responsesContentText(item["content"])
+			if role == "assistant" {
+				if text == "" {
+					continue
 				}
-				msgs = append(msgs, msg)
+				// 一律并进本轮那条 assistant,不按 message/function_call 的先后做假设:
+				// 只要中间没被 tool 结果或 user/system 打断就还是同一轮,拆开就会违反
+				// 「带 tool_calls 的 assistant 必须紧跟 tool 消息」。
+				msg := assistantMsg()
+				if prev, ok := msg["content"].(string); ok && prev != "" {
+					msg["content"] = prev + "\n" + text
+				} else {
+					msg["content"] = text
+				}
+				continue
 			}
-			if role != "assistant" {
-				// 中间夹了 user/system,说明这段 reasoning 没有对应的 assistant 消息,丢弃避免错挂
-				pendingReasoning = ""
+			flush()
+			// 中间夹了 user/system,说明这段 reasoning 没有对应的 assistant 消息,丢弃避免错挂
+			pendingReasoning = ""
+			if text != "" {
+				msgs = append(msgs, map[string]any{"role": role, "content": text})
 			}
 		}
 	}
+	flush()
 	chat["messages"] = msgs
 	if len(toolDefs) > 0 {
 		chat["tools"] = toolDefs

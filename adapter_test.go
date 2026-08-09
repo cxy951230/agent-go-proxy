@@ -261,6 +261,92 @@ func TestNoReasoningItemWhenModelDoesNotThink(t *testing.T) {
 	}
 }
 
+// 一轮里的并行 tool_call 必须归并进同一条 assistant 消息。
+// 拆成多条会让 DeepSeek 报 "assistant message with 'tool_calls' must be followed by
+// tool messages",且第二条挂不上 reasoning_content 又报 "reasoning_content in the
+// thinking mode must be passed back"。形状取自真实失败请求(trace 7009)。
+func TestParallelToolCallsMergeIntoOneAssistantMessage(t *testing.T) {
+	req := []byte(`{
+		"model":"deepseek-v4-pro",
+		"input":[
+			{"role":"user","content":"执行十次"},
+			{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"先验证脚本路径"}]},
+			{"role":"assistant","content":[{"type":"output_text","text":"先验证脚本路径和参数:"}]},
+			{"type":"function_call","call_id":"call_00_a","name":"exec_command","arguments":"{\"cmd\":\"ls a\"}"},
+			{"type":"function_call","call_id":"call_01_b","name":"exec_command","arguments":"{\"cmd\":\"ls b\"}"},
+			{"type":"function_call_output","call_id":"call_00_a","output":"NOT FOUND"},
+			{"type":"function_call_output","call_id":"call_01_b","output":"NOT FOUND"}
+		]
+	}`)
+	chatBody, _, err := openaiResponsesToChat(req)
+	if err != nil {
+		t.Fatalf("openaiResponsesToChat() error = %v", err)
+	}
+	var chat struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatalf("chat body should be JSON: %v", err)
+	}
+	if len(chat.Messages) != 4 {
+		t.Fatalf("messages len = %d, want 4 (user, assistant, tool, tool): %s", len(chat.Messages), chatBody)
+	}
+	assistant := chat.Messages[1]
+	if assistant["role"] != "assistant" {
+		t.Fatalf("messages[1] should be the assistant turn: %s", chatBody)
+	}
+	calls, _ := assistant["tool_calls"].([]any)
+	if len(calls) != 2 {
+		t.Fatalf("tool_calls len = %d, want 2 merged into one message: %s", len(calls), chatBody)
+	}
+	// 同一条消息上正文与 tool_calls 共存,reasoning 也挂在这条上
+	if assistant["content"] != "先验证脚本路径和参数:" {
+		t.Fatalf("assistant content = %#v, want the text of the same turn: %s", assistant["content"], chatBody)
+	}
+	if assistant["reasoning_content"] != "先验证脚本路径" {
+		t.Fatalf("reasoning_content = %#v, want 先验证脚本路径: %s", assistant["reasoning_content"], chatBody)
+	}
+	// 带 tool_calls 的 assistant 后面必须紧跟它的 tool 消息
+	for i, want := range []string{"call_00_a", "call_01_b"} {
+		m := chat.Messages[2+i]
+		if m["role"] != "tool" || m["tool_call_id"] != want {
+			t.Fatalf("messages[%d] = %#v, want tool message for %s: %s", 2+i, m, want, chatBody)
+		}
+	}
+}
+
+// 顺序调用(call → output → call → output)仍然各自成一条 assistant 消息。
+func TestSequentialToolCallsStayInSeparateMessages(t *testing.T) {
+	req := []byte(`{
+		"model":"deepseek-v4-pro",
+		"input":[
+			{"role":"user","content":"跑两步"},
+			{"type":"function_call","call_id":"call_a","name":"shell","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"ok"},
+			{"type":"function_call","call_id":"call_b","name":"shell","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_b","output":"ok"}
+		]
+	}`)
+	chatBody, _, err := openaiResponsesToChat(req)
+	if err != nil {
+		t.Fatalf("openaiResponsesToChat() error = %v", err)
+	}
+	var chat struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatalf("chat body should be JSON: %v", err)
+	}
+	roles := []string{}
+	for _, m := range chat.Messages {
+		roles = append(roles, m["role"].(string))
+	}
+	want := []string{"user", "assistant", "tool", "assistant", "tool"}
+	if strings.Join(roles, ",") != strings.Join(want, ",") {
+		t.Fatalf("roles = %v, want %v: %s", roles, want, chatBody)
+	}
+}
+
 // reasoning 后面跟的不是 assistant 消息时要丢弃,不能错挂到 user 上。
 func TestOrphanReasoningIsDropped(t *testing.T) {
 	req := []byte(`{
@@ -277,5 +363,42 @@ func TestOrphanReasoningIsDropped(t *testing.T) {
 	}
 	if strings.Contains(string(chatBody), "reasoning_content") {
 		t.Fatalf("orphan reasoning should be dropped: %s", chatBody)
+	}
+}
+
+// message 排在 function_call 之后时也必须并进同一条 assistant,
+// 否则又会退化成 assistant(tool_calls) → assistant(text) → tool(...)。
+func TestAssistantTextAfterToolCallStaysInSameMessage(t *testing.T) {
+	req := []byte(`{
+		"model":"deepseek-v4-pro",
+		"input":[
+			{"role":"user","content":"跑一下"},
+			{"type":"function_call","call_id":"call_a","name":"shell","arguments":"{}"},
+			{"role":"assistant","content":[{"type":"output_text","text":"顺便说明一下"}]},
+			{"type":"function_call_output","call_id":"call_a","output":"ok"}
+		]
+	}`)
+	chatBody, _, err := openaiResponsesToChat(req)
+	if err != nil {
+		t.Fatalf("openaiResponsesToChat() error = %v", err)
+	}
+	var chat struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatalf("chat body should be JSON: %v", err)
+	}
+	if len(chat.Messages) != 3 {
+		t.Fatalf("messages len = %d, want 3 (user, assistant, tool): %s", len(chat.Messages), chatBody)
+	}
+	assistant := chat.Messages[1]
+	if assistant["content"] != "顺便说明一下" {
+		t.Fatalf("assistant content = %#v: %s", assistant["content"], chatBody)
+	}
+	if calls, _ := assistant["tool_calls"].([]any); len(calls) != 1 {
+		t.Fatalf("tool_calls should stay on the same message: %s", chatBody)
+	}
+	if chat.Messages[2]["role"] != "tool" {
+		t.Fatalf("tool message must directly follow the tool_calls message: %s", chatBody)
 	}
 }
