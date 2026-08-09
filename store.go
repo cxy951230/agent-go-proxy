@@ -889,7 +889,9 @@ func (s *Store) ListHeroSMSCountryBlacklist(ctx context.Context, service string)
 	where := ""
 	args := []any{}
 	if service = strings.TrimSpace(service); service != "" {
-		where = "WHERE l.service=?"
+		// 这张表的查询没有 join、也没起别名，早期从 ListHeroSMSAttemptLogs 抄过来的 l. 前缀
+		// 会直接报 Unknown column 'l.service'，导致「国家拉黑」页始终 500。
+		where = "WHERE service=?"
 		args = append(args, service)
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id, service, country_id, country_name, reason, created_at, updated_at FROM herosms_country_blacklist `+where+` ORDER BY service, country_name, country_id`, args...)

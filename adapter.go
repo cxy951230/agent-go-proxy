@@ -275,26 +275,40 @@ func openaiResponsesToChat(body []byte) ([]byte, *adapterState, error) {
 
 	var input []map[string]any
 	_ = json.Unmarshal(src.Input, &input)
+	// pendingReasoning 暂存上一条 reasoning item 的文本,挂到紧随其后的第一条
+	// assistant 消息上(DeepSeek 等思考模型要求原样回传 reasoning_content)。
+	pendingReasoning := ""
+	attachReasoning := func(msg map[string]any) map[string]any {
+		if pendingReasoning != "" {
+			msg["reasoning_content"] = pendingReasoning
+			pendingReasoning = ""
+		}
+		return msg
+	}
 	for _, item := range input {
 		switch item["type"] {
 		case "additional_tools":
 			if raw, err := json.Marshal(item["tools"]); err == nil {
 				toolDefs = append(toolDefs, responsesToolsToChat(raw, state)...)
 			}
+		case "reasoning":
+			if text := responsesReasoningText(item); text != "" {
+				pendingReasoning = text
+			}
 		case "custom_tool_call":
 			name := asStr(item["name"])
-			msgs = append(msgs, map[string]any{"role": "assistant", "content": nil,
+			msgs = append(msgs, attachReasoning(map[string]any{"role": "assistant", "content": nil,
 				"tool_calls": []any{map[string]any{"id": asStr(item["call_id"]), "type": "function",
-					"function": map[string]any{"name": chatToolName("", name), "arguments": mustJSON(map[string]any{"input": asStr(item["input"])})}}}})
+					"function": map[string]any{"name": chatToolName("", name), "arguments": mustJSON(map[string]any{"input": asStr(item["input"])})}}}}))
 		case "custom_tool_call_output":
 			msgs = append(msgs, map[string]any{"role": "tool",
 				"tool_call_id": asStr(item["call_id"]), "content": asStr(item["output"])})
 		case "function_call":
 			name := asStr(item["name"])
 			namespace := asStr(item["namespace"])
-			msgs = append(msgs, map[string]any{"role": "assistant", "content": nil,
+			msgs = append(msgs, attachReasoning(map[string]any{"role": "assistant", "content": nil,
 				"tool_calls": []any{map[string]any{"id": asStr(item["call_id"]), "type": "function",
-					"function": map[string]any{"name": chatToolName(namespace, name), "arguments": asStr(item["arguments"])}}}})
+					"function": map[string]any{"name": chatToolName(namespace, name), "arguments": asStr(item["arguments"])}}}}))
 		case "function_call_output":
 			msgs = append(msgs, map[string]any{"role": "tool",
 				"tool_call_id": asStr(item["call_id"]), "content": asStr(item["output"])})
@@ -307,7 +321,15 @@ func openaiResponsesToChat(body []byte) ([]byte, *adapterState, error) {
 				role = "user"
 			}
 			if text := responsesContentText(item["content"]); text != "" {
-				msgs = append(msgs, map[string]any{"role": role, "content": text})
+				msg := map[string]any{"role": role, "content": text}
+				if role == "assistant" {
+					msg = attachReasoning(msg)
+				}
+				msgs = append(msgs, msg)
+			}
+			if role != "assistant" {
+				// 中间夹了 user/system,说明这段 reasoning 没有对应的 assistant 消息,丢弃避免错挂
+				pendingReasoning = ""
 			}
 		}
 	}
@@ -422,6 +444,15 @@ func customToolDescription(name, original string) string {
 	return b.String()
 }
 
+// responsesReasoningText 从 reasoning item 里取出思考文本:
+// 优先 content[].reasoning_text(代理自己吐回去的那份),回落 summary[].summary_text。
+func responsesReasoningText(item map[string]any) string {
+	if text := responsesContentText(item["content"]); text != "" {
+		return text
+	}
+	return responsesContentText(item["summary"])
+}
+
 func responsesContentText(v any) string {
 	switch c := v.(type) {
 	case string:
@@ -464,7 +495,13 @@ func (u chatUsage) total() int {
 }
 
 type chatCompletion struct {
-	Text         string
+	Text string
+	// Reasoning 是思考模型(DeepSeek 等)返回的 reasoning_content。
+	// DeepSeek 思考模式要求下一轮把它随 assistant 消息原样回传,否则报
+	// "The `reasoning_content` in the thinking mode must be passed back to the API."。
+	// 代理不自己缓存,而是转成 Responses 的 reasoning item 交给 Codex CLI 带回来,
+	// 详见 responsesReasoningText / emitResponsesSSE。
+	Reasoning    string
 	ToolCalls    []chatToolCall
 	FinishReason string
 	Usage        chatUsage
@@ -513,8 +550,9 @@ func parseChatSSE(s string) chatCompletion {
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content   string `json:"content"`
-					ToolCalls []struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
 						Function struct {
@@ -552,6 +590,7 @@ func parseChatSSE(s string) chatCompletion {
 		}
 		for _, ch := range chunk.Choices {
 			c.Text += ch.Delta.Content
+			c.Reasoning += ch.Delta.ReasoningContent
 			if ch.FinishReason != "" {
 				c.FinishReason = ch.FinishReason
 			}
@@ -583,8 +622,9 @@ func parseChatJSON(body string) chatCompletion {
 	var r struct {
 		Choices []struct {
 			Message struct {
-				Content   string `json:"content"`
-				ToolCalls []struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
 					ID       string `json:"id"`
 					Function struct {
 						Name      string `json:"name"`
@@ -619,6 +659,7 @@ func parseChatJSON(body string) chatCompletion {
 	}
 	if len(r.Choices) > 0 {
 		c.Text = r.Choices[0].Message.Content
+		c.Reasoning = r.Choices[0].Message.ReasoningContent
 		c.FinishReason = r.Choices[0].FinishReason
 		for _, tc := range r.Choices[0].Message.ToolCalls {
 			c.ToolCalls = append(c.ToolCalls, chatToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
@@ -697,6 +738,18 @@ func emitResponsesSSE(c chatCompletion, model string, state *adapterState) strin
 	outIdx := 0
 	b.WriteString(sse("response.created", map[string]any{"type": "response.created",
 		"response": map[string]any{"id": respID, "object": "response", "status": "in_progress", "model": model, "output": []any{}}}))
+	// reasoning item 必须排在 message / function_call 之前(真实 OpenAI 也是 output_index=0),
+	// 下一轮 openaiResponsesToChat 才能按「reasoning 归属其后第一条 assistant 消息」还原。
+	if c.Reasoning != "" {
+		itemID := "rs_" + randID()
+		b.WriteString(sse("response.output_item.added", map[string]any{"type": "response.output_item.added",
+			"output_index": outIdx, "item": map[string]any{"id": itemID, "type": "reasoning", "summary": []any{}}}))
+		doneItem := responseReasoningItem(itemID, c.Reasoning)
+		b.WriteString(sse("response.output_item.done", map[string]any{"type": "response.output_item.done",
+			"output_index": outIdx, "item": doneItem}))
+		output = append(output, doneItem)
+		outIdx++
+	}
 	if c.Text != "" {
 		itemID := "msg_" + randID()
 		b.WriteString(sse("response.output_item.added", map[string]any{"type": "response.output_item.added",
@@ -758,6 +811,9 @@ func emitResponsesSSE(c chatCompletion, model string, state *adapterState) strin
 
 func emitResponsesJSON(c chatCompletion, model string, state *adapterState) string {
 	output := []any{}
+	if c.Reasoning != "" {
+		output = append(output, responseReasoningItem("rs_"+randID(), c.Reasoning))
+	}
 	if c.Text != "" {
 		output = append(output, map[string]any{"type": "message", "role": "assistant", "status": "completed",
 			"content": []any{map[string]any{"type": "output_text", "text": c.Text}}})
@@ -807,6 +863,17 @@ func responseSpecForTool(state *adapterState, chatName string) responseToolSpec 
 		return responseToolSpec{Type: "function", Name: name, Namespace: namespace}
 	}
 	return responseToolSpec{Type: "function", Name: chatName}
+}
+
+// responseReasoningItem 构造 Responses 的 reasoning item。
+// 用 content[].reasoning_text 承载明文思考内容:Codex CLI 的 ResponseItem::Reasoning
+// 对 content 的 skip_serializing_if 规则是「含 reasoning_text 就序列化」,所以这条会被
+// 原样带回下一轮请求;summary 留空,避免在 TUI 里重复展示。
+func responseReasoningItem(itemID, text string) map[string]any {
+	return map[string]any{
+		"id": itemID, "type": "reasoning", "summary": []any{},
+		"content": []any{map[string]any{"type": "reasoning_text", "text": text}},
+	}
 }
 
 func responseFunctionCallItem(itemID, callID, name, namespace, arguments, status string) map[string]any {

@@ -31,6 +31,17 @@ const (
 	gptLoginMaxAttemptsPerCountry = 3    // 同一个国家最多实际尝试几个号码，防止同国连续撞号/频控
 	gptLoginDefaultMinCount       = 2000 // 默认优惠库存下限，实际值可在 HeroSMS 页面配置
 	gptLoginDefaultMaxPrice       = 0.2  // 默认单号价格上限，实际值可在 HeroSMS 页面配置
+
+	// gptLoginBuyTryFactor 是买号的重试倍数:想买 batch 个,最多调 batch*该值 次 getNumber。
+	// 价格是 fixedPrice 传上去的,offers 里的价格/库存随时被抢,买失败很常见;不重试的话
+	// 「每国最多试 3 个」实际经常只试到 1 个。买失败不扣费,重试是安全的。
+	gptLoginBuyTryFactor = 2
+	// gptLoginAddPhoneBackTries 是 history.back() 回 add-phone 页的重试次数,用尽后改用
+	// 记住的 add-phone 地址直接 navigate。
+	gptLoginAddPhoneBackTries = 3
+	// gptLoginMaxPageRecoverFails 是「连续」几次都回不到 add-phone 页就判定浏览器失联、
+	// 终止整个任务。中间只要成功回去过一次就清零。
+	gptLoginMaxPageRecoverFails = 3
 )
 
 type gptLoginStatus struct {
@@ -367,6 +378,8 @@ func (m *gptLoginManager) phoneFlow(ctx context.Context, id string, d *gptDriver
 	// offers 可能同一国家按多个价格返回多行；不加这层会一行买 3 个、下一价格再买 3 个。
 	countryAttempts := map[string]int{}
 	bought := 0
+	// recoverFails 统计「连续」几次回不到 add-phone 页,成功一次即清零。
+	recoverFails := 0
 
 	for _, row := range offers {
 		if ctx.Err() != nil {
@@ -401,16 +414,34 @@ func (m *gptLoginManager) phoneFlow(ctx context.Context, id string, d *gptDriver
 		m.note(id, fmt.Sprintf("试国家 %s($%.4f，上限 $%.4f，库存>%d),买 %d 个号，本国已试 %d/%d…", chn, row.Price, maxPrice, minCount, batch, countryAttempts[cid], gptLoginMaxAttemptsPerCountry))
 
 		var nums []struct{ actID, phone string }
-		for i := 0; i < batch; i++ {
-			a, _, berr := m.srv.herosmsBuyNumber(ctx, key, herosmsService, cid, row.Price, "gpt_login")
+		// 买号失败原来是直接 continue 丢掉一个名额:既不重试也不落任何记录,页面上只看到
+		// 「买 3 个」却只试了 1 个,查不出原因。现在失败会记一条 buy_failed 明细并重试,
+		// 直到凑够 batch 个或试满 batch*gptLoginBuyTryFactor 次。
+		maxBuyTries := batch * gptLoginBuyTryFactor
+		buyTries := 0
+		for len(nums) < batch && buyTries < maxBuyTries {
+			if ctx.Err() != nil {
+				return context.Canceled
+			}
+			buyTries++
+			a, raw, berr := m.srv.herosmsBuyNumber(ctx, key, herosmsService, cid, row.Price, "gpt_login")
 			if berr != nil {
+				m.note(id, fmt.Sprintf("国家 %s($%.4f) 买号失败(%d/%d): %v", chn, row.Price, buyTries, maxBuyTries, berr))
+				m.logHeroSMSAttempt(ctx, "", "", herosmsService, cid, chn, "gpt_login", "buy_failed", truncate(berr.Error(), 120), truncate(raw, 1000))
+				if !sleepCtx(ctx, time.Second) {
+					return context.Canceled
+				}
 				continue
 			}
 			nums = append(nums, struct{ actID, phone string }{a.ID, a.Phone})
 			bought++
 		}
 		if len(nums) == 0 {
+			m.note(id, fmt.Sprintf("国家 %s($%.4f) 一个号都没买到,换下一档/下一个国家…", chn, row.Price))
 			continue
+		}
+		if len(nums) < batch {
+			m.note(id, fmt.Sprintf("国家 %s 只买到 %d/%d 个号,先用这些试…", chn, len(nums), batch))
 		}
 
 		countryBroken := false
@@ -419,8 +450,18 @@ func (m *gptLoginManager) phoneFlow(ctx context.Context, id string, d *gptDriver
 				return context.Canceled
 			}
 			if !m.ensureAddPhone(ctx, d) {
-				return errors.New("无法回到 OpenAI 手机号填写页,请重试整个登录")
+				// 以前这里直接 return,等于「上一个号把页面带偏 → 整个任务结束」,后面买好的
+				// 号和还没试的国家全部作废。现在只放弃这一批,换下一档/下一个国家继续;
+				// 只有连续 gptLoginMaxPageRecoverFails 次都拉不回来才认定浏览器失联。
+				recoverFails++
+				m.note(id, fmt.Sprintf("回不到手机号填写页(连续第 %d/%d 次),放弃国家 %s 这批号…", recoverFails, gptLoginMaxPageRecoverFails, chn))
+				m.logHeroSMSAttempt(ctx, n.actID, n.phone, herosmsService, cid, chn, "gpt_login", "page_lost", "无法回到手机号填写页", "")
+				if recoverFails >= gptLoginMaxPageRecoverFails {
+					return errors.New("连续多次无法回到 OpenAI 手机号填写页,请重试整个登录")
+				}
+				break
 			}
+			recoverFails = 0
 			m.note(id, fmt.Sprintf("试国家 %s 的第 %d/%d 个号…", chn, idx+1, len(nums)))
 			attemptStarted := false
 			startAttempt := func() {
@@ -738,12 +779,35 @@ func (m *gptLoginManager) fillPhoneCode(ctx context.Context, d *gptDriver, code 
 }
 
 // returnToAddPhone 回到 add-phone 页(换国家前)。移植 return_to_add_phone。
+//
+// 早期只 history.back() 一次、等 15 秒,拉不回来就等于整个任务作废(见 phoneFlow 里
+// ensureAddPhone 的处理)。现在退回失败会重试若干次,最后再用记下来的 add-phone 地址
+// 直接 navigate 兜底。
 func (m *gptLoginManager) returnToAddPhone(ctx context.Context, d *gptDriver) {
-	st, _ := d.state(ctx)
-	if strings.Contains(st.URL, "add-phone") {
+	for i := 0; i < gptLoginAddPhoneBackTries; i++ {
+		st, _ := d.state(ctx)
+		if strings.Contains(st.URL, "add-phone") {
+			d.addPhoneURL = st.URL
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		d.evalBool(ctx, `(()=>{history.back();return true;})()`)
+		st = d.waitUntil(ctx, func(s gptState) bool { return strings.Contains(s.URL, "add-phone") }, 10*time.Second, 500*time.Millisecond)
+		if strings.Contains(st.URL, "add-phone") {
+			d.addPhoneURL = st.URL
+			return
+		}
+	}
+	// history.back() 彻底不管用(例如停在 phone-verification 或错误页且没有可回退项),
+	// 用之前记下的 add-phone 地址硬跳一次。
+	if d.addPhoneURL == "" || ctx.Err() != nil {
 		return
 	}
-	d.evalBool(ctx, `(()=>{history.back();return true;})()`)
+	if err := d.navigate(ctx, d.addPhoneURL); err != nil {
+		return
+	}
 	d.waitUntil(ctx, func(s gptState) bool { return strings.Contains(s.URL, "add-phone") }, 15*time.Second, 500*time.Millisecond)
 }
 
@@ -752,11 +816,16 @@ func (m *gptLoginManager) returnToAddPhone(ctx context.Context, d *gptDriver) {
 func (m *gptLoginManager) ensureAddPhone(ctx context.Context, d *gptDriver) bool {
 	st, _ := d.state(ctx)
 	if strings.Contains(st.URL, "add-phone") {
+		d.addPhoneURL = st.URL
 		return true
 	}
 	m.returnToAddPhone(ctx, d)
 	st, _ = d.state(ctx)
-	return strings.Contains(st.URL, "add-phone")
+	if !strings.Contains(st.URL, "add-phone") {
+		return false
+	}
+	d.addPhoneURL = st.URL
+	return true
 }
 
 func phoneInvalidAuthStep(text string) bool {

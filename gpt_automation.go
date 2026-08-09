@@ -86,6 +86,9 @@ const gptStateJS = `(() => {
 // gptDriver 包一个端口模式的 gptChrome(直连页面 WS),提供 DOM 操作原语。
 type gptDriver struct {
 	chrome *gptChrome
+	// addPhoneURL 记住最近一次见到的 add-phone 页地址。history.back() 拉不回来时用它直接
+	// navigate 回去,避免一个号把页面带偏就让后面所有号码/国家全部空转。
+	addPhoneURL string
 }
 
 // newGPTDriver 启动隔离 Chrome(端口模式 + 直连页面 WS,与 skill 一致,不触发 AutomationControlled)

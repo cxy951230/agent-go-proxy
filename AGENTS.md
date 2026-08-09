@@ -404,6 +404,13 @@ CDP 侧为此在 `cdp.go` 增加了**页面级会话**：`Target.attachToTarget{
   - 缓存 token 兼容 OpenAI/MiMo 的 `usage.prompt_tokens_details.cached_tokens`，也兼容 DeepSeek 的 `usage.prompt_cache_hit_tokens`。
   - reasoning token 兼容 `usage.completion_tokens_details.reasoning_tokens`。
   - 还原 Responses 时会写入 `input_tokens_details.cached_tokens` 与 `output_tokens_details.reasoning_tokens`，这样 recorder 和看板能正常统计缓存/推理 token。
+- **思考模型的 `reasoning_content` 回传（DeepSeek 等）**：
+  - 背景：DeepSeek 思考模型（如 `deepseek-v4-pro`）要求多轮时把上一轮 assistant 的 `reasoning_content` 原样带回，否则第一次出现「历史里含 assistant tool_calls」的请求就会秒回 400 `The `reasoning_content` in the thinking mode must be passed back to the API.`。适配层原本两个方向都丢弃思考内容，所以必然踩。
+  - 做法：**不在代理侧缓存**，走 Codex CLI 的历史回传。`parseChatSSE/parseChatJSON` 取出 `delta.reasoning_content` / `message.reasoning_content` 累加到 `chatCompletion.Reasoning`；`emitResponsesSSE/JSON` 把它转成 Responses 的 `reasoning` item（`responseReasoningItem`，用 `content:[{type:"reasoning_text"}]` 承载明文，`summary` 留空）；下一轮 `openaiResponsesToChat` 遇到 `type:"reasoning"` 就暂存文本，挂到紧随其后的第一条 assistant 消息（`function_call` / `custom_tool_call` / assistant `message`）的 `reasoning_content` 字段上。
+  - **顺序是硬约束**：reasoning item 必须排在 message / function_call 之前（`output_index=0`，真实 OpenAI 也是如此），否则下一轮归属不到对应的 assistant 消息。
+  - 并行 tool call 时适配器是「一个 function_call 一条 assistant 消息」，`reasoning_content` 只挂第一条。reasoning 后面若跟的是 user/system 消息，则丢弃该段避免错挂。
+  - 依据（Codex CLI 源码 `codex-bridge/upstream/codex/codex-rs`）：`core/src/client.rs` 恒发 `include:["reasoning.encrypted_content"]` 且 `store=false`（每轮回传全量历史）；`context_manager/history.rs` 对 `ResponseItem::Reasoning` 原样保留；非 OpenAI 上游只清 `internal_chat_message_metadata_passthrough` 和 `encrypted_function_args`，不动 reasoning；`protocol/src/models.rs` 的 `should_serialize_reasoning_content` 保证含 `reasoning_text` 的 content 会被序列化回来。
+  - 非思考模型 `Reasoning` 为空，不产出 item，行为不变；Anthropic 侧暂不映射 thinking block。
 - **取舍**：响应是「读完上游再一次性转吐」，不是逐 token 增量流式；客户端拿到的仍是合法原生 SSE。输入 token 取三方返回的 `prompt_tokens`（三方不返回 usage 时为 0）。
 - 只在 2xx 且需适配时走转换;非 2xx 原样透传三方错误。
 
