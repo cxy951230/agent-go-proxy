@@ -72,6 +72,11 @@ type proxyServer struct {
 	// app_settings)。定时 goroutine 一直在跑,每次 tick 读这个标志决定是否真去刷,所以开关
 	// 一点就生效、无需重启。
 	quotaAutoRefresh atomic.Bool
+
+	// outlookAutoRefresh 控制「每 10 分钟定时刷新全部 Outlook token」是否开启(OUTLOOK 页开关,
+	// 持久化在 app_settings)。与 quotaAutoRefresh 同款:goroutine 常驻、每次 tick 读标志,
+	// 开关一点即生效、无需重启。
+	outlookAutoRefresh atomic.Bool
 }
 
 // scopedLocalProxyURL 只用于 OPENAI/OUTLOOK 菜单的后端请求,以及 API Key 命中 GPT 账号后的官方直连对话请求。
@@ -365,15 +370,25 @@ func main() {
 	defer stopHeroSMSCancel()
 	go srv.runHeroSMSCanceler(herosmsCancelCtx)
 
-	// 定时刷新额度的开关:默认开启,从 app_settings 读回上次的选择。
-	srv.quotaAutoRefresh.Store(true)
-	if v, err := store.GetSetting(context.Background(), settingQuotaAutoRefresh, "1"); err == nil {
-		srv.quotaAutoRefresh.Store(v != "0")
+	// 定时刷新额度的开关:默认关闭,从 app_settings 读回上次的选择。
+	srv.quotaAutoRefresh.Store(false)
+	if v, err := store.GetSetting(context.Background(), settingQuotaAutoRefresh, "0"); err == nil {
+		srv.quotaAutoRefresh.Store(v == "1")
 	}
 	// 每 5 分钟刷一次全部账号额度(开关开启时),让 100% 用满的账号能被及时标记、进而不被选中。
 	quotaCtx, stopQuota := context.WithCancel(context.Background())
 	defer stopQuota()
 	go srv.runQuotaAutoRefresh(quotaCtx)
+
+	// 定时刷新 Outlook token 的开关:默认关闭,从 app_settings 读回上次的选择。
+	srv.outlookAutoRefresh.Store(false)
+	if v, err := store.GetSetting(context.Background(), settingOutlookAutoRefresh, "0"); err == nil {
+		srv.outlookAutoRefresh.Store(v == "1")
+	}
+	// 每 10 分钟刷一次全部 Outlook 账号 token(开关开启时),让登录态在过期前被续上。
+	outlookCtx, stopOutlook := context.WithCancel(context.Background())
+	defer stopOutlook()
+	go srv.runOutlookAutoRefresh(outlookCtx)
 
 	router := chi.NewRouter()
 	router.Get("/", srv.handleIndex)
@@ -442,9 +457,12 @@ func main() {
 	router.Put("/api/outlook/accounts/{id}", srv.handleAPIOutlookAccountUpdate)
 	router.Post("/api/outlook/accounts/{id}/tags", srv.handleAPIOutlookAccountTags)
 	router.Post("/api/outlook/accounts/{id}/refresh", srv.handleAPIOutlookAccountRefresh)
+	router.Post("/api/outlook/accounts/{id}/logout", srv.handleAPIOutlookAccountLogout)
 	router.Post("/api/outlook/accounts/{id}/login", srv.handleAPIOutlookAccountAutoLogin)
 	router.Post("/api/outlook/accounts/refresh-all", srv.handleAPIOutlookRefreshAll)
 	router.Get("/api/outlook/refresh-all", srv.handleAPIOutlookRefreshAllStatus)
+	router.Get("/api/outlook/token-auto-refresh", srv.handleAPIOutlookAutoRefresh)
+	router.Post("/api/outlook/token-auto-refresh", srv.handleAPIOutlookAutoRefreshToggle)
 	router.Delete("/api/outlook/accounts/{id}", srv.handleAPIOutlookAccountDelete)
 	router.Get("/api/conversations", srv.handleAPIConversations)
 	router.Get("/api/conversations/{id}", srv.handleAPIConversationDetail)

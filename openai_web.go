@@ -390,6 +390,7 @@ const openAIHTML = `
     .cfg-select:hover{border-color:#b8c7dc}
     .token-ok{color:#137a4d}.token-warn{color:#b06d12;font-weight:600}.token-bad{color:var(--red);font-weight:600}
     .count-badge{margin-left:10px;font-size:13px;font-weight:600;color:var(--muted);background:#eef1f6;border-radius:999px;padding:3px 11px;vertical-align:2px}
+    .count-badge .cnt-ok{color:var(--green)}.count-badge .cnt-bad{color:var(--red)}.count-badge .cnt-sep{color:#c2c8d4;margin:0 7px}
     .master-toggle{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--muted)}
     .switch.mixed{background:#fff6e8;border-color:#f0cf9a;color:#a56b12}
     /* 启用开关,与路由/链式代理页同款 */
@@ -442,9 +443,13 @@ async function loadAccounts(){
   const items=await rsp.json();const rows=document.getElementById('account-rows');
   rows.innerHTML=(items||[]).map(item=>'<tr class="row-link'+(item.enabled===false?' off':'')+'" data-href="/stats/tokens?dim=account&id='+item.id+'&name='+encodeURIComponent(item.name||'')+'"><td>'+esc(item.name||'-')+'</td><td>'+esc(item.email||'-')+'</td>'+tagCell(item)+'<td><span class="account-id" title="'+esc(item.account_id)+'">'+esc(short(item.account_id))+'</span></td><td><span class="pill plan">'+esc(item.plan_type||'unknown')+'</span></td><td class="usage">'+usageText(item)+'</td><td>'+tokenText(item)+'</td>'+settingsCells(item)+'<td class="small">'+esc(fmtTime(item.created_at))+'</td>'+enabledCell(item)+'<td class="actions"><div class="act-grid"><a class="detail-btn" href="/openai/accounts/'+item.id+'">详情</a><button class="refresh-btn" data-refresh-id="'+item.id+'" type="button" title="刷新额度与 Token">额度</button><button class="models-btn" data-models-id="'+item.id+'" type="button" title="重新拉取可用模型">模型</button><button class="delete-btn" data-id="'+item.id+'" type="button">删除</button></div></td></tr>').join('');
   document.getElementById('empty').style.display=items&&items.length?'none':'block';
-  const total=(items||[]).length;
-  document.getElementById('account-count').textContent=total?'共 '+total+' 个账号':'';
-  syncMasterToggle(items||[]);
+  const list=items||[];
+  const total=list.length;
+  // 失效 = 登录状态失效(需重新登录):refresh_error 非空、或 access token 已过期。其余算有效。
+  const bad=list.filter(isInvalid).length;
+  const ok=total-bad;
+  document.getElementById('account-count').innerHTML=total?('有效：<span class="cnt-ok">'+ok+'</span><span class="cnt-sep">·</span>失效：<span class="cnt-bad">'+bad+'</span>'):'';
+  syncMasterToggle(list);
 }
 // syncMasterToggle 让顶部总开关跟随当前列表:全开显示「是」、全关显示「否」、
 // 混合显示「部分」。点击时全开就全关,否则一律全开——三态里只有这一种映射不会有歧义。
@@ -476,6 +481,14 @@ function enabledCell(item){
   const on=item.enabled!==false;
   const tip=on?'点击停用：停用后该账号不再被请求选中':'点击启用';
   return '<td class="switch-cell"><button class="switch'+(on?' on':'')+'" data-toggle-id="'+item.id+'" type="button" title="'+esc(tip)+'">'+(on?'是':'否')+'</button></td>';
+}
+// isInvalid 判断这个账号是否登录状态失效(需重新登录):刷新被上游永久拒绝(refresh_error),
+// 或 access token 已过期。过期时间未知(零值)时不算失效,和 tokenText 的「未知」口径一致。
+function isInvalid(item){
+  if(item.refresh_error)return true;
+  const at=item.token_expires_at?new Date(item.token_expires_at):null;
+  if(!at||isNaN(at.getTime())||at.getFullYear()<2000)return false;
+  return at.getTime()<=Date.now();
 }
 // tokenText 展示 access_token 过期时间:已过期/即将过期(1小时内)标红或标黄;
 // refresh_error 非空说明刷新被上游永久拒绝,必须重新登录。

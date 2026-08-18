@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -35,6 +36,61 @@ func (p *proxyServer) startRefreshAllOutlookTokens(ctx context.Context) (int, bo
 			return nil
 		})
 	return total, started, nil
+}
+
+// outlookAutoRefreshInterval 是定时刷新全部 Outlook token 的间隔。
+const outlookAutoRefreshInterval = 10 * time.Minute
+
+// settingOutlookAutoRefresh 是「定时刷新 Outlook token 是否开启」的 app_settings 键("1"/"0")。
+const settingOutlookAutoRefresh = "outlook_token_auto_refresh"
+
+// runOutlookAutoRefresh 后台每 outlookAutoRefreshInterval 刷新一次全部账号的 token,直到 ctx 取消。
+// goroutine 常驻,每次 tick 先看开关(p.outlookAutoRefresh):关着就跳过本次、只保留心跳,
+// 这样开关一点就生效、不用重启。与手动「刷新全部 Token」共用一个任务实例(p.outlookJob),
+// 撞上手动任务在跑就跳过本次(started=false)。
+func (p *proxyServer) runOutlookAutoRefresh(ctx context.Context) {
+	ticker := time.NewTicker(outlookAutoRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if p.outlookAutoRefresh.Load() {
+			if _, started, err := p.startRefreshAllOutlookTokens(ctx); err != nil {
+				log.Printf("定时刷新 Outlook token 失败: %v", err)
+			} else if !started {
+				log.Printf("定时刷新 Outlook token: 已有刷新任务在进行中，跳过本次")
+			}
+		}
+	}
+}
+
+// handleAPIOutlookAutoRefresh 返回定时刷新 token 开关的当前状态。
+func (p *proxyServer) handleAPIOutlookAutoRefresh(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{"enabled": p.outlookAutoRefresh.Load()}, nil)
+}
+
+// handleAPIOutlookAutoRefreshToggle 设置定时刷新 token 开关(body {enabled:bool}),持久化到 app_settings。
+func (p *proxyServer) handleAPIOutlookAutoRefreshToggle(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "invalid json body", http.StatusBadRequest)
+		return
+	}
+	p.outlookAutoRefresh.Store(in.Enabled)
+	val := "0"
+	if in.Enabled {
+		val = "1"
+	}
+	if err := p.store.SetSetting(r.Context(), settingOutlookAutoRefresh, val); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "enabled": in.Enabled}, nil)
 }
 
 // Outlook Web(consumer)静默刷新用到的常量,与 outlook-login-automation skill 保持一致。

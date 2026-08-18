@@ -2721,6 +2721,26 @@ func (s *Store) DeleteOutlookAccount(ctx context.Context, id int64) error {
 	return nil
 }
 
+// ClearOutlookTokens 登出:清掉这行的 token 与会话相关字段,让账号回到「需重新登录」状态。
+// 保留 email/密码/标签等静态信息,这样清完后 access_token_len=0,页面上「登录」按钮会重新出现。
+// cookies 一并清掉,避免登出后还能用旧会话静默刷回来。
+func (s *Store) ClearOutlookTokens(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE outlook_login_tokens SET
+			access_token=NULL, refresh_token=NULL, id_token=NULL,
+			expires_in=NULL, ext_expires_in=NULL, refresh_token_expires_in=NULL,
+			access_token_expires_at=NULL, refresh_token_expires_at=NULL,
+			cookies_json=NULL, cookie_count=0,
+			last_refresh_status='logged_out', last_refresh_error=NULL
+		WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // GetOutlookRefreshInput 取免登录刷新所需的输入:邮箱、已保存的 cookie(JSON)、User-Agent、scope。
 func (s *Store) GetOutlookRefreshInput(ctx context.Context, id int64) (email, cookiesJSON, userAgent, scope string, err error) {
 	err = s.db.QueryRowContext(ctx, `SELECT email, COALESCE(cookies_json,''), COALESCE(user_agent,''), COALESCE(scope,'')
@@ -2767,8 +2787,10 @@ func (s *Store) UpdateOutlookTokens(ctx context.Context, id int64, u outlookToke
 func updateOutlookTokenRow(ctx context.Context, ex sqlExecer, id int64, u outlookTokenUpdate, status string) error {
 	res, err := ex.ExecContext(ctx, `UPDATE outlook_login_tokens SET
 			token_type=?, scope=?, access_token=?, refresh_token=?, id_token=?, client_info=?,
-			expires_in=?, ext_expires_in=?, refresh_token_expires_in=?,
-			token_issued_at=?, access_token_expires_at=?, refresh_token_expires_at=?,
+			expires_in=?, ext_expires_in=?,
+			refresh_token_expires_in=COALESCE(?, refresh_token_expires_in),
+			token_issued_at=?, access_token_expires_at=?,
+			refresh_token_expires_at=COALESCE(?, refresh_token_expires_at),
 			cookies_json=?, cookie_count=?, user_agent=?,
 			display_name=IF(?='', display_name, ?),
 			tenant_id=IF(?='', tenant_id, ?),

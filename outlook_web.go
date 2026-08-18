@@ -167,6 +167,25 @@ func (p *proxyServer) handleAPIOutlookAccountDelete(w http.ResponseWriter, r *ht
 	writeJSON(w, map[string]any{"ok": true}, nil)
 }
 
+// handleAPIOutlookAccountLogout 登出单个 Outlook 账号:清掉 token 与会话 cookie,
+// 账号回到「需重新登录」状态(access_token_len=0),页面上「登录」按钮随即重新出现。
+func (p *proxyServer) handleAPIOutlookAccountLogout(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad account id", http.StatusBadRequest)
+		return
+	}
+	if err := p.store.ClearOutlookTokens(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "account not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true}, nil)
+}
+
 // handleAPIOutlookAccountRefresh 同步刷新单个 Outlook 账号的 access_token + refresh_token:
 // 用库里保存的登录会话 cookie 走 authorize?prompt=none 的 PKCE 静默授权换取新 token,
 // 并把续期后的 cookie 一并写回 outlook_login_tokens,完成后回读该行返回给前端。
@@ -237,6 +256,7 @@ const outlookHTML = `
     .act-grid>button{display:inline-flex;align-items:center;justify-content:center;width:100%;height:32px;margin:0;padding:0 8px;font-size:13px;white-space:nowrap}
     .login-btn{color:var(--green);border-color:#bfe6cf;background:#f1fbf5}.login-btn:hover:not(:disabled){background:#e6f7ee}
     .refresh-btn{color:var(--blue);border-color:#b9ccf5;background:#f4f8ff}.refresh-btn:hover{background:#e9f1ff}.edit-btn{color:#5a4bc4;border-color:#cfc7f2;background:#f6f4ff}.edit-btn:hover{background:#efeaff}.delete-btn{color:var(--red);border-color:#f0b3b3;background:#fff6f6}.delete-btn:hover{background:#fff1f1}
+    .logout-btn{color:#a5650f;border-color:#e6cfa0;background:#fff9ef}.logout-btn:hover{background:#fdf1dc}
     .send-btn{color:#b06d12;border-color:#f0d9ab;background:#fffaf0}.send-btn:hover:not(:disabled){background:#fff4e2}
     .signup-btn{color:#0f8548;border-color:#bfe6cf;background:#f1fbf5}.signup-btn:hover:not(:disabled){background:#e6f7ee}
     .gptlogin-btn{color:#5a4bc4;border-color:#cfc7f2;background:#f6f4ff}.gptlogin-btn:hover:not(:disabled){background:#efeaff}
@@ -249,6 +269,10 @@ const outlookHTML = `
     .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:6px}
     .login-box{display:none;padding:16px 20px;border-bottom:1px solid var(--line);background:#f8fbff}.login-box.show{display:block}
     .count-badge{margin-left:10px;font-size:13px;font-weight:600;color:var(--muted);background:#eef1f6;border-radius:999px;padding:3px 11px;vertical-align:2px}
+    .count-badge .cnt-ok{color:var(--green)}.count-badge .cnt-bad{color:var(--red)}.count-badge .cnt-sep{color:#c2c8d4;margin:0 7px}
+    .master-toggle{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--muted)}
+    .switch{display:inline-flex;align-items:center;justify-content:center;min-width:52px;height:30px;padding:0 14px;border-radius:16px;border:1px solid var(--line);background:#fff;color:var(--muted);font-weight:700;font-size:12px;cursor:pointer}
+    .switch:hover{border-color:#b8c7dc}.switch.on{background:var(--green);border-color:var(--green);color:#fff}.switch.on:hover{background:#0f8548}
     .login-title{font-weight:600}.login-detail{margin-top:4px}.login-box .modal-actions{justify-content:flex-start;margin-top:10px}.login-box button{height:32px;padding:0 12px;font-size:13px}
   </style>
 </head>
@@ -267,7 +291,7 @@ const outlookHTML = `
     </nav>
   </aside>
   <main class="page">
-    <div class="top"><h1>OUTLOOK · 已登录账号<span class="count-badge" id="account-count"></span></h1><button class="btn-primary" id="login-btn" type="button">+ 登录账号</button><button id="add-btn" type="button">+ 新增账号</button><button id="refresh-all-btn" type="button" title="逐个刷新所有有 token 的账号(后台异步执行)">刷新全部 Token</button></div>
+    <div class="top"><h1>OUTLOOK · 已登录账号<span class="count-badge" id="account-count"></span></h1><span class="master-toggle" title="每 10 分钟自动刷新一次全部账号的 token,让登录态在过期前被续上">定时刷新<button class="switch" id="auto-refresh-toggle" type="button" disabled>-</button></span><button class="btn-primary" id="login-btn" type="button">+ 登录账号</button><button id="add-btn" type="button">+ 新增账号</button><button id="refresh-all-btn" type="button" title="逐个刷新所有有 token 的账号(后台异步执行)">刷新全部 Token</button></div>
     <div class="notice">点「+ 登录账号」会弹出一个独立 profile 的 Chrome 窗口，你手动登录完成后自动抓取 cookie 与 token 入库（不会用你日常的 Chrome，也不会碰它的 cookie）。数据存在 <span class="mono">outlook_login_tokens</span> 表，与 outlook-login-automation skill 共用。点「刷新 Token」用库里 cookie 走 authorize?prompt=none 静默流程同时刷新 access / refresh token，无需重新登录。</div>
     <section class="panel">
       <div class="login-box" id="login-box">
@@ -281,7 +305,7 @@ const outlookHTML = `
         <div class="modal-actions"><button id="gpt-cancel" type="button">取消任务</button></div>
       </div>
       <table>
-        <thead><tr><th>账号</th><th>标签</th><th>Codex</th><th>套餐/租户</th><th>Access Token 过期</th><th>Refresh Token 过期</th><th>Cookie</th><th>刷新状态</th><th>创建时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>账号</th><th>标签</th><th>Codex</th><th>套餐/租户</th><th>Access Token 过期</th><th>Cookie</th><th>刷新状态</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody id="account-rows"></tbody>
       </table>
       <div class="empty" id="empty">暂无已登录的 Outlook 账号。点右上角「+ 登录账号」开始。</div>
@@ -359,7 +383,6 @@ async function loadAccounts(){
     '<td>'+((item.has_codex_account||item.has_gpt_account)?'<span class="pill gpt-yes">是</span>':'<span class="pill gpt-no">否</span>')+'</td>'+
     '<td><div class="sub">'+esc(item.token_type||'-')+'</div><div class="sub mono" title="'+esc(item.tenant_id||'')+'">'+esc((item.tenant_id||'').slice(0,12)||'-')+'</div></td>'+
     '<td>'+tokenText(item.access_token_expires_at)+'</td>'+
-    '<td>'+tokenText(item.refresh_token_expires_at)+'</td>'+
     '<td class="sub">'+esc(item.cookie_count||0)+'</td>'+
     '<td>'+statusPill(item)+'</td>'+
     '<td class="sub">'+esc(fmtTime(item.created_at))+'</td>'+
@@ -369,13 +392,18 @@ async function loadAccounts(){
       ((item.registered_gpt_account||item.has_codex_account||item.has_gpt_account)?'':'<button class="signup-btn" data-signup-id="'+item.id+'" type="button" title="用这个邮箱自动注册 ChatGPT 账号(CDP 自动化)">注册GPT</button>')+
       '<button class="gptlogin-btn" data-gptlogin-id="'+item.id+'" type="button" title="把这个邮箱的 GPT 账号登进 Codex(含手机验证)">登录Codex</button>'+
       '<button class="refresh-btn" data-refresh-id="'+item.id+'" type="button" title="刷新 access + refresh token">刷新 Token</button>'+
+      ((item.access_token_len||item.cookie_count)?'<button class="logout-btn" data-logout-id="'+item.id+'" type="button" title="登出：清掉 token 与会话 cookie，之后可重新点「登录」">登出</button>':'')+
       '<button class="edit-btn" data-edit-id="'+item.id+'" type="button" title="修改邮箱/密码">修改</button>'+
       '<button class="delete-btn" data-id="'+item.id+'" type="button">删除</button>'+
     '</div></td>'+
     '</tr>').join('');
   document.getElementById('empty').style.display=items&&items.length?'none':'block';
-  const total=(items||[]).length;
-  document.getElementById('account-count').textContent=total?'共 '+total+' 个账号':'';
+  const list=items||[];
+  const total=list.length;
+  // 失效 = 登录状态失效(需重新登录):没 token / token 过期 / 上次刷新报错。其余算有效。
+  const bad=list.filter(needsLogin).length;
+  const ok=total-bad;
+  document.getElementById('account-count').innerHTML=total?('有效：<span class="cnt-ok">'+ok+'</span><span class="cnt-sep">·</span>失效：<span class="cnt-bad">'+bad+'</span>'):'';
 }
 // ===== 刷新全部 Token(后台异步 + 轮询进度,页面不卡住)=====
 const refreshAllBtn=document.getElementById('refresh-all-btn');
@@ -419,6 +447,24 @@ refreshAllBtn.addEventListener('click',async()=>{
   }catch(err){setRefreshAllLabel('刷新全部 Token',false);alert('发起刷新失败：'+err.message);return}
   pollRefreshAll(true);
 });
+// 定时刷新 token 开关:读当前状态渲染,点一下即切并持久化。
+const autoRefreshBtn=document.getElementById('auto-refresh-toggle');
+function renderAutoRefresh(on){
+  autoRefreshBtn.disabled=false;
+  autoRefreshBtn.textContent=on?'开':'关';
+  autoRefreshBtn.classList.toggle('on',on);
+  autoRefreshBtn.dataset.next=on?'0':'1';
+}
+fetch('/api/outlook/token-auto-refresh',{cache:'no-store'}).then(r=>r.json()).then(s=>renderAutoRefresh(!!s.enabled)).catch(()=>{});
+autoRefreshBtn.addEventListener('click',async()=>{
+  const enable=autoRefreshBtn.dataset.next==='1';
+  autoRefreshBtn.disabled=true;
+  try{
+    const rsp=await fetch('/api/outlook/token-auto-refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enable})});
+    if(!rsp.ok)throw new Error(await rsp.text());
+    const s=await rsp.json();renderAutoRefresh(!!s.enabled);
+  }catch(err){alert('切换定时刷新失败：'+err.message);autoRefreshBtn.disabled=false}
+});
 // 页面打开时若已有任务在跑(比如刚刷新过页面),接上进度继续轮询。
 fetch('/api/outlook/refresh-all',{cache:'no-store'}).then(r=>r.json()).then(st=>{
   if(st&&st.running){setRefreshAllLabel('刷新中 '+st.done+'/'+st.total+'…',true);refreshAllTimer=setTimeout(()=>pollRefreshAll(false),2000)}
@@ -449,6 +495,14 @@ document.getElementById('account-rows').addEventListener('click',async event=>{
   const button=event.target.closest('.delete-btn');if(!button||!confirm('确认删除这条 Outlook 登录记录（含 token 与 cookie）吗？'))return;
   const rsp=await fetch('/api/outlook/accounts/'+button.dataset.id,{method:'DELETE'});
   if(!rsp.ok){alert('删除失败：'+await rsp.text());return}
+  loadAccounts().catch(()=>{});
+});
+// 登出:清掉 token 与会话 cookie(保留邮箱/密码/标签),之后「登录」按钮会重新出现。
+document.getElementById('account-rows').addEventListener('click',async event=>{
+  const button=event.target.closest('.logout-btn');if(!button||!confirm('确认登出这个账号吗？\n\n会清掉 access / refresh token 与会话 cookie（邮箱、密码、标签保留）。登出后需重新「登录」或「刷新 Token」才能再用。'))return;
+  button.disabled=true;
+  const rsp=await fetch('/api/outlook/accounts/'+button.dataset.logoutId+'/logout',{method:'POST'});
+  if(!rsp.ok){alert('登出失败：'+await rsp.text());button.disabled=false;return}
   loadAccounts().catch(()=>{});
 });
 // ===== 发邮件弹窗(用该行账号的 token 发,后端遇 401 会自动刷一次)=====

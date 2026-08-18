@@ -361,8 +361,15 @@ func openaiResponsesToChat(body []byte) ([]byte, *adapterState, error) {
 			flush()
 			// 中间夹了 user/system,说明这段 reasoning 没有对应的 assistant 消息,丢弃避免错挂
 			pendingReasoning = ""
-			if text != "" {
-				msgs = append(msgs, map[string]any{"role": role, "content": text})
+			// user/system 消息里可能带 input_image,不能只抽文字(否则多模态上游收不到图),
+			// 转成 Chat 的多模态 content 数组;纯文本时仍退回字符串保持对普通上游的兼容。
+			content := responsesContentToChat(item["content"])
+			if s, ok := content.(string); ok {
+				if s != "" {
+					msgs = append(msgs, map[string]any{"role": role, "content": s})
+				}
+			} else {
+				msgs = append(msgs, map[string]any{"role": role, "content": content})
 			}
 		}
 	}
@@ -501,6 +508,55 @@ func responsesContentText(v any) string {
 			}
 		}
 		return strings.Join(parts, "")
+	}
+	return ""
+}
+
+// responsesContentToChat 把 Responses 的 content 转成 Chat Completions 的 content。
+// 只有文本时返回 string(兼容不支持多模态数组的普通上游);一旦含 input_image
+// 就返回 []any 多模态数组([{type:text}, {type:image_url}]),避免图片被丢。
+func responsesContentToChat(v any) any {
+	arr, ok := v.([]any)
+	if !ok {
+		return responsesContentText(v)
+	}
+	var parts []any
+	var textOnly strings.Builder
+	hasImage := false
+	for _, p := range arr {
+		m, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, ok := m["text"].(string); ok {
+			parts = append(parts, map[string]any{"type": "text", "text": t})
+			textOnly.WriteString(t)
+			continue
+		}
+		if url := responsesImageURL(m); url != "" {
+			img := map[string]any{"url": url}
+			if d, ok := m["detail"].(string); ok && d != "" {
+				img["detail"] = d
+			}
+			parts = append(parts, map[string]any{"type": "image_url", "image_url": img})
+			hasImage = true
+		}
+	}
+	if !hasImage {
+		return textOnly.String()
+	}
+	return parts
+}
+
+// responsesImageURL 从 Responses 的 input_image part 取图片 URL。Codex 发的形态是
+// {"type":"input_image","image_url":"data:image/...;base64,...","detail":"high"},
+// image_url 是字符串;也兼容 {"image_url":{"url":...}} 的嵌套写法。
+func responsesImageURL(m map[string]any) string {
+	switch iu := m["image_url"].(type) {
+	case string:
+		return iu
+	case map[string]any:
+		return asStr(iu["url"])
 	}
 	return ""
 }
