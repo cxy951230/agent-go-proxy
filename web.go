@@ -2054,6 +2054,11 @@ const routesHTML = `
     </div>
     <div class="field"><label>Model</label><input id="f-model" placeholder="gpt-4o / claude-sonnet-... 可留空"></div>
     <div class="field"><label>API Key</label><input id="f-api-key" placeholder="sk-..." autocomplete="off"></div>
+    <div class="field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="f-multimodal" style="width:auto;margin:0">
+      <span>多模态（转发图片给上游）</span>
+    </label>
+    <div class="muted" style="font-size:12px;margin-top:4px">仅目标模型支持图片时开启；关闭则识别到图片只转文字，避免非多模态模型报错。</div></div>
     <div class="err" id="modal-err"></div>
     <div class="modal-actions">
       <button id="cancel-btn">取消</button>
@@ -2148,6 +2153,7 @@ function openModal(route){
   document.getElementById('f-base-url').value = route ? (route.base_url || '') : '';
   document.getElementById('f-model').value = route ? (route.model || '') : '';
   document.getElementById('f-api-key').value = route ? (route.api_key || '') : '';
+  document.getElementById('f-multimodal').checked = route ? !!route.multimodal : false;
   const styleSelect = document.getElementById('f-api-style');
   fillSelect(styleSelect, STYLES);
   styleSelect.value = (route && route.api_style) || 'openai';
@@ -2165,7 +2171,8 @@ async function saveRoute(){
     api_style: document.getElementById('f-api-style').value,
     protocol: document.getElementById('f-protocol').value,
     model: document.getElementById('f-model').value.trim(),
-    api_key: document.getElementById('f-api-key').value.trim()
+    api_key: document.getElementById('f-api-key').value.trim(),
+    multimodal: document.getElementById('f-multimodal').checked
   };
   if (!payload.base_url){ errBox.textContent = 'Base URL 不能为空'; return; }
   const url = editingId ? '/api/routes/' + editingId : '/api/routes';

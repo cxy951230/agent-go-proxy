@@ -203,8 +203,11 @@ type APIRoute struct {
 	Protocol  string    `json:"protocol"`
 	APIKey    string    `json:"api_key"`
 	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	// Multimodal 标记这条路由的目标模型是否支持图片。仅在 Responses→Chat 转换时生效:
+	// true 才把 input_image 转成 image_url 转发;false(默认)则只留文字,避免非多模态上游 400。
+	Multimodal bool      `json:"multimodal"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // APIKey 是「API Key」页管理的密钥配置,只保存名称与 Key 两个字段。
@@ -451,6 +454,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			protocol VARCHAR(64) NOT NULL DEFAULT '',
 			api_key VARCHAR(512) NOT NULL DEFAULT '',
 			enabled TINYINT(1) NOT NULL DEFAULT 0,
+			multimodal TINYINT(1) NOT NULL DEFAULT 0,
 			created_at DATETIME(6) NOT NULL,
 			updated_at DATETIME(6) NOT NULL
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
@@ -637,6 +641,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "api_routes", "enabled", "TINYINT(1) NOT NULL DEFAULT 0 AFTER api_key"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "api_routes", "multimodal", "TINYINT(1) NOT NULL DEFAULT 0 AFTER enabled"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "openai_accounts", "status_json", "LONGTEXT NOT NULL AFTER codex_commit"); err != nil {
@@ -1882,7 +1889,7 @@ func (s *Store) Stats(ctx context.Context, f ConversationFilter) (conversationCo
 }
 
 func (s *Store) ListAPIRoutes(ctx context.Context) ([]APIRoute, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, base_url, model, api_style, protocol, api_key, enabled, created_at, updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, base_url, model, api_style, protocol, api_key, enabled, multimodal, created_at, updated_at
 		FROM api_routes ORDER BY updated_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
@@ -1891,7 +1898,7 @@ func (s *Store) ListAPIRoutes(ctx context.Context) ([]APIRoute, error) {
 	out := make([]APIRoute, 0)
 	for rows.Next() {
 		var r APIRoute
-		if err := rows.Scan(&r.ID, &r.Name, &r.BaseURL, &r.Model, &r.APIStyle, &r.Protocol, &r.APIKey, &r.Enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.BaseURL, &r.Model, &r.APIStyle, &r.Protocol, &r.APIKey, &r.Enabled, &r.Multimodal, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -1903,9 +1910,9 @@ func (s *Store) ListAPIRoutes(ctx context.Context) ([]APIRoute, error) {
 // 无启用项时 ok=false。转发时按请求所属风格(codex→openai / claude→anthropic)选取。
 func (s *Store) EnabledAPIRouteForStyle(ctx context.Context, style string) (APIRoute, bool, error) {
 	var r APIRoute
-	err := s.db.QueryRowContext(ctx, `SELECT id, name, base_url, model, api_style, protocol, api_key, enabled, created_at, updated_at
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, base_url, model, api_style, protocol, api_key, enabled, multimodal, created_at, updated_at
 		FROM api_routes WHERE enabled=1 AND api_style=? ORDER BY id LIMIT 1`, style).
-		Scan(&r.ID, &r.Name, &r.BaseURL, &r.Model, &r.APIStyle, &r.Protocol, &r.APIKey, &r.Enabled, &r.CreatedAt, &r.UpdatedAt)
+		Scan(&r.ID, &r.Name, &r.BaseURL, &r.Model, &r.APIStyle, &r.Protocol, &r.APIKey, &r.Enabled, &r.Multimodal, &r.CreatedAt, &r.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return r, false, nil
 	}
@@ -1920,8 +1927,8 @@ func (s *Store) CreateAPIRoute(ctx context.Context, in APIRoute) (int64, error) 
 		return 0, err
 	}
 	now := time.Now()
-	res, err := s.db.ExecContext(ctx, `INSERT INTO api_routes (name, base_url, model, api_style, protocol, api_key, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, in.Name, in.BaseURL, in.Model, in.APIStyle, in.Protocol, in.APIKey, now, now)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO api_routes (name, base_url, model, api_style, protocol, api_key, multimodal, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, in.Name, in.BaseURL, in.Model, in.APIStyle, in.Protocol, in.APIKey, in.Multimodal, now, now)
 	if err != nil {
 		return 0, err
 	}
@@ -1932,8 +1939,8 @@ func (s *Store) UpdateAPIRoute(ctx context.Context, id int64, in APIRoute) error
 	if err := validateAPIRoute(&in); err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE api_routes SET name=?, base_url=?, model=?, api_style=?, protocol=?, api_key=?, updated_at=? WHERE id=?`,
-		in.Name, in.BaseURL, in.Model, in.APIStyle, in.Protocol, in.APIKey, time.Now(), id)
+	res, err := s.db.ExecContext(ctx, `UPDATE api_routes SET name=?, base_url=?, model=?, api_style=?, protocol=?, api_key=?, multimodal=?, updated_at=? WHERE id=?`,
+		in.Name, in.BaseURL, in.Model, in.APIStyle, in.Protocol, in.APIKey, in.Multimodal, time.Now(), id)
 	if err != nil {
 		return err
 	}

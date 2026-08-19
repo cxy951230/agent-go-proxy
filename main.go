@@ -1058,7 +1058,7 @@ func buildRoutePlan(route APIRoute, chainID int64, reqProtocol string, requestUR
 		plan.forwardBody = rewriteModel(reqBody, route.Model)
 		plan.effectiveModel = effectiveRequestModel(plan.forwardBody, route.Model, logModel)
 	case route.Protocol == "chat_completions" && (reqProtocol == "messages" || reqProtocol == "responses"):
-		chatBody, state, err := adaptRequestToChat(reqProtocol, reqBody)
+		chatBody, state, err := adaptRequestToChat(reqProtocol, reqBody, route.Multimodal)
 		if err != nil {
 			plan.mismatch = "请求转换为 Chat 失败: " + err.Error()
 		} else {

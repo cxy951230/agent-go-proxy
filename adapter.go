@@ -29,13 +29,15 @@ type responseToolSpec struct {
 }
 
 // adaptRequestToChat 把 messages / responses 请求体转换成 Chat Completions 请求体。
-func adaptRequestToChat(reqProtocol string, body []byte) ([]byte, *adapterState, error) {
+// multimodal 标记目标路由的模型是否支持图片:仅 Responses→Chat 路径消费它,
+// false 时丢掉 input_image 只留文字,避免非多模态上游收到 image_url 报错。
+func adaptRequestToChat(reqProtocol string, body []byte, multimodal bool) ([]byte, *adapterState, error) {
 	switch reqProtocol {
 	case "messages":
 		out, err := anthropicMessagesToChat(body)
 		return out, nil, err
 	case "responses":
-		return openaiResponsesToChat(body)
+		return openaiResponsesToChat(body, multimodal)
 	}
 	return body, nil, nil
 }
@@ -243,7 +245,7 @@ func anthropicToolChoiceToChat(raw json.RawMessage) any {
 	return nil
 }
 
-func openaiResponsesToChat(body []byte) ([]byte, *adapterState, error) {
+func openaiResponsesToChat(body []byte, multimodal bool) ([]byte, *adapterState, error) {
 	var src struct {
 		Model           string          `json:"model"`
 		Stream          bool            `json:"stream"`
@@ -361,9 +363,9 @@ func openaiResponsesToChat(body []byte) ([]byte, *adapterState, error) {
 			flush()
 			// 中间夹了 user/system,说明这段 reasoning 没有对应的 assistant 消息,丢弃避免错挂
 			pendingReasoning = ""
-			// user/system 消息里可能带 input_image,不能只抽文字(否则多模态上游收不到图),
-			// 转成 Chat 的多模态 content 数组;纯文本时仍退回字符串保持对普通上游的兼容。
-			content := responsesContentToChat(item["content"])
+			// user/system 消息里可能带 input_image:multimodal 路由才转成 Chat 多模态
+			// content 数组转发;否则(默认)只留文字,避免非多模态上游收到 image_url 报错。
+			content := responsesContentToChat(item["content"], multimodal)
 			if s, ok := content.(string); ok {
 				if s != "" {
 					msgs = append(msgs, map[string]any{"role": role, "content": s})
@@ -513,11 +515,16 @@ func responsesContentText(v any) string {
 }
 
 // responsesContentToChat 把 Responses 的 content 转成 Chat Completions 的 content。
-// 只有文本时返回 string(兼容不支持多模态数组的普通上游);一旦含 input_image
-// 就返回 []any 多模态数组([{type:text}, {type:image_url}]),避免图片被丢。
-func responsesContentToChat(v any) any {
+// multimodal=false(默认)时只抽文字、丢掉 input_image,退回字符串,避免非多模态上游
+// 收到 image_url 报错。multimodal=true 时:只有文本仍返回 string;一旦含 input_image
+// 就返回 []any 多模态数组([{type:text}, {type:image_url}]),把图片转发给上游。
+func responsesContentToChat(v any, multimodal bool) any {
 	arr, ok := v.([]any)
 	if !ok {
+		return responsesContentText(v)
+	}
+	// 非多模态路由:等价于旧行为,只把文字拼起来,图片直接丢弃。
+	if !multimodal {
 		return responsesContentText(v)
 	}
 	var parts []any

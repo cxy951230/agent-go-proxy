@@ -18,7 +18,7 @@ func TestResponsesCustomExecToolSchemaAndRestore(t *testing.T) {
 		]
 	}`)
 
-	chatBody, state, err := openaiResponsesToChat(req)
+	chatBody, state, err := openaiResponsesToChat(req, true)
 	if err != nil {
 		t.Fatalf("openaiResponsesToChat() error = %v", err)
 	}
@@ -79,7 +79,7 @@ func TestResponsesNamespacedToolRestoresNamespace(t *testing.T) {
 		]
 	}`)
 
-	_, state, err := openaiResponsesToChat(req)
+	_, state, err := openaiResponsesToChat(req, true)
 	if err != nil {
 		t.Fatalf("openaiResponsesToChat() error = %v", err)
 	}
@@ -134,7 +134,7 @@ func TestResponsesChatRequestIncludesUsageForStreaming(t *testing.T) {
 		"input":[{"role":"user","content":"hello"}]
 	}`)
 
-	chatBody, _, err := openaiResponsesToChat(req)
+	chatBody, _, err := openaiResponsesToChat(req, true)
 	if err != nil {
 		t.Fatalf("openaiResponsesToChat() error = %v", err)
 	}
@@ -221,7 +221,7 @@ func TestReasoningContentRoundTripsThroughResponsesItem(t *testing.T) {
 			{"type":"function_call_output","call_id":"call_1","output":"3781"}
 		]
 	}`)
-	chatBody, _, err := openaiResponsesToChat(req)
+	chatBody, _, err := openaiResponsesToChat(req, true)
 	if err != nil {
 		t.Fatalf("openaiResponsesToChat() error = %v", err)
 	}
@@ -278,7 +278,7 @@ func TestParallelToolCallsMergeIntoOneAssistantMessage(t *testing.T) {
 			{"type":"function_call_output","call_id":"call_01_b","output":"NOT FOUND"}
 		]
 	}`)
-	chatBody, _, err := openaiResponsesToChat(req)
+	chatBody, _, err := openaiResponsesToChat(req, true)
 	if err != nil {
 		t.Fatalf("openaiResponsesToChat() error = %v", err)
 	}
@@ -327,7 +327,7 @@ func TestSequentialToolCallsStayInSeparateMessages(t *testing.T) {
 			{"type":"function_call_output","call_id":"call_b","output":"ok"}
 		]
 	}`)
-	chatBody, _, err := openaiResponsesToChat(req)
+	chatBody, _, err := openaiResponsesToChat(req, true)
 	if err != nil {
 		t.Fatalf("openaiResponsesToChat() error = %v", err)
 	}
@@ -357,7 +357,7 @@ func TestOrphanReasoningIsDropped(t *testing.T) {
 			{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}
 		]
 	}`)
-	chatBody, _, err := openaiResponsesToChat(req)
+	chatBody, _, err := openaiResponsesToChat(req, true)
 	if err != nil {
 		t.Fatalf("openaiResponsesToChat() error = %v", err)
 	}
@@ -378,7 +378,7 @@ func TestAssistantTextAfterToolCallStaysInSameMessage(t *testing.T) {
 			{"type":"function_call_output","call_id":"call_a","output":"ok"}
 		]
 	}`)
-	chatBody, _, err := openaiResponsesToChat(req)
+	chatBody, _, err := openaiResponsesToChat(req, true)
 	if err != nil {
 		t.Fatalf("openaiResponsesToChat() error = %v", err)
 	}
