@@ -376,6 +376,21 @@ func openaiResponsesToChat(body []byte, multimodal bool) ([]byte, *adapterState,
 		}
 	}
 	flush()
+	// 混合思考模型(DeepSeek/Qwen3/GLM 等经 vLLM/SGLang/opencode 网关)在某轮动态进入
+	// 思考模式时,会硬校验历史里 assistant 消息必须带 reasoning_content,否则 400
+	// "The `reasoning_content` in the thinking mode must be passed back to the API."。
+	// Codex 是 Responses 协议编排器,根本不认这个非标字段,且非思考轮压根没 reasoning
+	// 可挂,导致间歇性 400。这里给所有缺 reasoning_content 的 assistant 消息补一个占位串:
+	// 真实 reasoning(已由上面 pendingReasoning 挂上的)不覆盖;占位只为满足网关的结构校验,
+	// 而历史 reasoning 本就被这些模型在入模时丢弃,不影响当轮思考质量。
+	for _, m := range msgs {
+		if m["role"] != "assistant" {
+			continue
+		}
+		if _, ok := m["reasoning_content"]; !ok {
+			m["reasoning_content"] = placeholderReasoning
+		}
+	}
 	chat["messages"] = msgs
 	if len(toolDefs) > 0 {
 		chat["tools"] = toolDefs
@@ -486,6 +501,11 @@ func customToolDescription(name, original string) string {
 	}
 	return b.String()
 }
+
+// placeholderReasoning 是给缺失 reasoning_content 的 assistant 消息补的占位串,
+// 仅用于通过思考模型网关的结构校验。取最短的中性内容,尽量不污染生成;若发现被网关
+// 喂进模板影响质量,可改成空串或其它值。
+const placeholderReasoning = "..."
 
 // responsesReasoningText 从 reasoning item 里取出思考文本:
 // 优先 content[].reasoning_text(代理自己吐回去的那份),回落 summary[].summary_text。
