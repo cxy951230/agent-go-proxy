@@ -274,6 +274,17 @@ const outlookHTML = `
     .switch{display:inline-flex;align-items:center;justify-content:center;min-width:52px;height:30px;padding:0 14px;border-radius:16px;border:1px solid var(--line);background:#fff;color:var(--muted);font-weight:700;font-size:12px;cursor:pointer}
     .switch:hover{border-color:#b8c7dc}.switch.on{background:var(--green);border-color:var(--green);color:#fff}.switch.on:hover{background:#0f8548}
     .login-title{font-weight:600}.login-detail{margin-top:4px}.login-box .modal-actions{justify-content:flex-start;margin-top:10px}.login-box button{height:32px;padding:0 12px;font-size:13px}
+    /* 勾选列 + 批量按钮 + 分页条 */
+    th.col-sel,td.col-sel{width:34px;text-align:center;padding-left:12px;padding-right:6px}
+    .row-check,#select-all-page{width:16px;height:16px;cursor:pointer;margin:0;vertical-align:middle}
+    .batch-signup-btn{color:#0f8548;border-color:#bfe6cf;background:#f1fbf5;font-weight:600}.batch-signup-btn:hover:not(:disabled){background:#e6f7ee}
+    .batch-login-btn{color:#5a4bc4;border-color:#cfc7f2;background:#f6f4ff;font-weight:600}.batch-login-btn:hover:not(:disabled){background:#efeaff}
+    .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-top:1px solid var(--line);flex-wrap:wrap}
+    .pager-info{font-size:13px;color:var(--muted)}
+    .pager-nav{display:flex;align-items:center;gap:6px}
+    .pager-nav button{height:30px;padding:0 10px;font-size:13px}
+    .pager-cur{font-size:13px;color:#4b5563;font-weight:600;padding:0 6px}
+    .pager-nav select{height:30px}
   </style>
 </head>
 <body>
@@ -291,7 +302,7 @@ const outlookHTML = `
     </nav>
   </aside>
   <main class="page">
-    <div class="top"><h1>OUTLOOK · 已登录账号<span class="count-badge" id="account-count"></span></h1><span class="master-toggle" title="每 10 分钟自动刷新一次全部账号的 token,让登录态在过期前被续上">定时刷新<button class="switch" id="auto-refresh-toggle" type="button" disabled>-</button></span><button class="btn-primary" id="login-btn" type="button">+ 登录账号</button><button id="add-btn" type="button">+ 新增账号</button><button id="refresh-all-btn" type="button" title="逐个刷新所有有 token 的账号(后台异步执行)">刷新全部 Token</button></div>
+    <div class="top"><h1>OUTLOOK · 已登录账号<span class="count-badge" id="account-count"></span></h1><span class="master-toggle" title="每 10 分钟自动刷新一次全部账号的 token,让登录态在过期前被续上">定时刷新<button class="switch" id="auto-refresh-toggle" type="button" disabled>-</button></span><button class="btn-primary" id="login-btn" type="button">+ 登录账号</button><button id="add-btn" type="button">+ 新增账号</button><button id="refresh-all-btn" type="button" title="逐个刷新所有有 token 的账号(后台异步执行)">刷新全部 Token</button><button class="batch-signup-btn" id="batch-signup-btn" type="button" title="对下方勾选的账号,按顺序逐个自动注册 GPT" disabled>注册GPT</button><button class="batch-login-btn" id="batch-login-btn" type="button" title="对下方勾选的账号,按顺序逐个登录 Codex" disabled>登录Codex</button></div>
     <div class="notice">点「+ 登录账号」会弹出一个独立 profile 的 Chrome 窗口，你手动登录完成后自动抓取 cookie 与 token 入库（不会用你日常的 Chrome，也不会碰它的 cookie）。数据存在 <span class="mono">outlook_login_tokens</span> 表，与 outlook-login-automation skill 共用。点「刷新 Token」用库里 cookie 走 authorize?prompt=none 静默流程同时刷新 access / refresh token，无需重新登录。</div>
     <section class="panel">
       <div class="login-box" id="login-box">
@@ -305,9 +316,10 @@ const outlookHTML = `
         <div class="modal-actions"><button id="gpt-cancel" type="button">取消任务</button></div>
       </div>
       <table>
-        <thead><tr><th>账号</th><th>标签</th><th>Codex</th><th>套餐/租户</th><th>Access Token 过期</th><th>Cookie</th><th>刷新状态</th><th>创建时间</th><th>操作</th></tr></thead>
+        <thead><tr><th class="col-sel"><input type="checkbox" id="select-all-page" title="全选/取消本页"></th><th>账号</th><th>标签</th><th>Codex</th><th>套餐/租户</th><th>Access Token 过期</th><th>Cookie</th><th>刷新状态</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody id="account-rows"></tbody>
       </table>
+      <div class="pager" id="pager"></div>
       <div class="empty" id="empty">暂无已登录的 Outlook 账号。点右上角「+ 登录账号」开始。</div>
     </section>
   </main>
@@ -373,11 +385,33 @@ function statusPill(item){
   if(!s)return '<span class="pill st-none">-</span>';
   return '<span class="pill st-ok">'+esc(s)+'</span>';
 }
+// ===== 分页 + 勾选状态(排序沿用后端返回顺序,不改)=====
+let allAccounts=[];            // 当前完整列表(后端顺序)
+let currentPage=1;            // 1 基页码
+let pageSize=20;             // 每页条数
+let batchRunning=false;       // 批量任务进行中(禁用单账号/批量按钮,避免并发)
+const selectedIds=new Set();  // 已勾选账号 id(字符串),跨页/重载保持
+function selectedInOrder(){return allAccounts.filter(a=>selectedIds.has(String(a.id))).map(a=>String(a.id))}
+function emailOf(id){const a=allAccounts.find(x=>String(x.id)===String(id));return a?(a.email||('#'+id)):('#'+id)}
+function currentPageIds(){const start=(currentPage-1)*pageSize;return allAccounts.slice(start,start+pageSize).map(a=>String(a.id))}
+function updateBatchButtons(){
+  const n=selectedInOrder().length,running=batchRunning||!!gptId;
+  const su=document.getElementById('batch-signup-btn'),lg=document.getElementById('batch-login-btn');
+  if(su){su.textContent='注册GPT'+(n?'（'+n+'）':'');su.disabled=running||!n}
+  if(lg){lg.textContent='登录Codex'+(n?'（'+n+'）':'');lg.disabled=running||!n}
+}
 async function loadAccounts(){
   const rsp=await fetch('/api/outlook/accounts',{cache:'no-store'});if(!rsp.ok)throw new Error(await rsp.text());
-  const items=await rsp.json();const rows=document.getElementById('account-rows');
-  rows.innerHTML=(items||[]).map(item=>
-    '<tr class="row-link" data-href="/outlook/accounts/'+item.id+'">'+
+  allAccounts=(await rsp.json())||[];
+  // 账号可能被删除:清掉已不存在的勾选,避免批量误跑
+  const live=new Set(allAccounts.map(a=>String(a.id)));
+  for(const id of Array.from(selectedIds))if(!live.has(id))selectedIds.delete(id);
+  renderPage();
+}
+function rowHtml(item){
+  const sel=selectedIds.has(String(item.id));
+  return '<tr class="row-link" data-href="/outlook/accounts/'+item.id+'">'+
+    '<td class="col-sel"><input type="checkbox" class="row-check" data-select-id="'+item.id+'"'+(sel?' checked':'')+'></td>'+
     '<td><div class="email">'+esc(item.email||'-')+'</div>'+(item.display_name?'<div class="sub">'+esc(item.display_name)+'</div>':'')+'</td>'+
     tagCell(item)+
     '<td>'+((item.has_codex_account||item.has_gpt_account)?'<span class="pill gpt-yes">是</span>':'<span class="pill gpt-no">否</span>')+'</td>'+
@@ -396,14 +430,45 @@ async function loadAccounts(){
       '<button class="edit-btn" data-edit-id="'+item.id+'" type="button" title="修改邮箱/密码">修改</button>'+
       '<button class="delete-btn" data-id="'+item.id+'" type="button">删除</button>'+
     '</div></td>'+
-    '</tr>').join('');
-  document.getElementById('empty').style.display=items&&items.length?'none':'block';
-  const list=items||[];
-  const total=list.length;
-  // 失效 = 登录状态失效(需重新登录):没 token / token 过期 / 上次刷新报错。其余算有效。
-  const bad=list.filter(needsLogin).length;
-  const ok=total-bad;
+    '</tr>';
+}
+function renderPage(){
+  const total=allAccounts.length;
+  const maxPage=Math.max(1,Math.ceil(total/pageSize));
+  if(currentPage<1)currentPage=1;if(currentPage>maxPage)currentPage=maxPage;
+  const start=(currentPage-1)*pageSize;
+  const pageItems=allAccounts.slice(start,start+pageSize);
+  document.getElementById('account-rows').innerHTML=pageItems.map(rowHtml).join('');
+  document.getElementById('empty').style.display=total?'none':'block';
+  renderPager(total,maxPage,start,pageItems.length);
+  updateSelectAll();
+  const bad=allAccounts.filter(needsLogin).length,ok=total-bad;
   document.getElementById('account-count').innerHTML=total?('有效：<span class="cnt-ok">'+ok+'</span><span class="cnt-sep">·</span>失效：<span class="cnt-bad">'+bad+'</span>'):'';
+  updateBatchButtons();
+}
+function renderPager(total,maxPage,start,pageCount){
+  const p=document.getElementById('pager');if(!p)return;
+  if(!total){p.innerHTML='';return}
+  const from=start+1,to=start+pageCount;
+  p.innerHTML=
+    '<span class="pager-info">共 '+total+' 条，第 '+from+'–'+to+' 条 · 已选 '+selectedInOrder().length+'</span>'+
+    '<span class="pager-nav">'+
+      '<button id="page-first" type="button"'+(currentPage<=1?' disabled':'')+'>« 首页</button>'+
+      '<button id="page-prev" type="button"'+(currentPage<=1?' disabled':'')+'>‹ 上一页</button>'+
+      '<span class="pager-cur">'+currentPage+' / '+maxPage+'</span>'+
+      '<button id="page-next" type="button"'+(currentPage>=maxPage?' disabled':'')+'>下一页 ›</button>'+
+      '<button id="page-last" type="button"'+(currentPage>=maxPage?' disabled':'')+'>末页 »</button>'+
+      '<select id="page-size">'+[20,50,100].map(n=>'<option value="'+n+'"'+(n===pageSize?' selected':'')+'>'+n+'/页</option>').join('')+'</select>'+
+    '</span>';
+}
+// 更新本页全选框(勾满=选中、部分=半选)与分页条「已选」计数,不重排行
+function updateSelectAll(){
+  const pageIds=currentPageIds();
+  const selAll=document.getElementById('select-all-page');
+  if(selAll){const c=pageIds.filter(id=>selectedIds.has(id)).length;selAll.checked=pageIds.length>0&&c===pageIds.length;selAll.indeterminate=c>0&&c<pageIds.length}
+  const info=document.querySelector('#pager .pager-info');
+  if(info){const total=allAccounts.length,start=(currentPage-1)*pageSize,to=Math.min(start+pageSize,total);info.textContent='共 '+total+' 条，第 '+(total?start+1:0)+'–'+to+' 条 · 已选 '+selectedInOrder().length}
+  updateBatchButtons();
 }
 // ===== 刷新全部 Token(后台异步 + 轮询进度,页面不卡住)=====
 const refreshAllBtn=document.getElementById('refresh-all-btn');
@@ -702,7 +767,7 @@ function pollGpt(){
 document.getElementById('account-rows').addEventListener('click',async event=>{
   const s=event.target.closest('.signup-btn'),l=event.target.closest('.gptlogin-btn');
   const btn=s||l;if(!btn||btn.disabled)return;
-  if(gptId){alert('已有一个 GPT 任务在进行中，先等它结束。');return}
+  if(gptId||batchRunning){alert('已有一个 GPT 任务在进行中，先等它结束。');return}
   const label=btn.textContent;btn.disabled=true;btn.classList.add('busy');btn.textContent='启动中…';
   try{await startGptTask(s?'signup':'login',btn.dataset.signupId||btn.dataset.gptloginId)}
   catch(err){alert((s?'注册':'登录')+'启动失败：'+err.message)}
@@ -713,6 +778,81 @@ document.getElementById('gpt-cancel').addEventListener('click',async()=>{
   if(id)await fetch('/api/'+(kind==='signup'?'gpt-signup':'gpt-login')+'/'+id+'/cancel',{method:'POST'}).catch(()=>{});
   hideGptBox();
 });
+// ===== 勾选 / 全选 / 分页 交互 =====
+// 行内复选框(委托):勾选态存进 selectedIds,跨页/重载保持
+document.getElementById('account-rows').addEventListener('change',event=>{
+  const cb=event.target.closest('.row-check');if(!cb)return;
+  const id=String(cb.dataset.selectId);
+  if(cb.checked)selectedIds.add(id);else selectedIds.delete(id);
+  updateSelectAll();
+});
+// 本页全选/取消
+document.getElementById('select-all-page').addEventListener('change',event=>{
+  const on=event.target.checked;
+  for(const id of currentPageIds()){if(on)selectedIds.add(id);else selectedIds.delete(id)}
+  document.querySelectorAll('.row-check').forEach(cb=>{cb.checked=selectedIds.has(String(cb.dataset.selectId))});
+  updateSelectAll();
+});
+// 分页按钮(委托,分页条每次重绘)
+document.getElementById('pager').addEventListener('click',event=>{
+  const b=event.target.closest('button');if(!b)return;
+  const maxPage=Math.max(1,Math.ceil(allAccounts.length/pageSize));
+  if(b.id==='page-first')currentPage=1;
+  else if(b.id==='page-prev')currentPage=Math.max(1,currentPage-1);
+  else if(b.id==='page-next')currentPage=Math.min(maxPage,currentPage+1);
+  else if(b.id==='page-last')currentPage=maxPage;
+  else return;
+  renderPage();
+});
+document.getElementById('pager').addEventListener('change',event=>{
+  const sel=event.target.closest('#page-size');if(!sel)return;
+  pageSize=parseInt(sel.value,10)||20;currentPage=1;renderPage();
+});
+// ===== 批量注册GPT / 登录Codex:对勾选账号按顺序逐个跑,复用单账号接口 =====
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+let batchTitle='';
+// awaitGptTask 起一个任务并轮询到终态返回(自带 taskId,不占用交互态 gptId)
+async function awaitGptTask(kind,id){
+  const url=kind==='signup'?('/api/outlook/accounts/'+id+'/gpt-signup'):('/api/outlook/accounts/'+id+'/gpt-login');
+  const rsp=await fetch(url,{method:'POST'});
+  if(!rsp.ok)throw new Error(await rsp.text());
+  const taskId=(await rsp.json()).id;
+  while(true){
+    await sleep(1500);
+    const r=await fetch('/api/'+(kind==='signup'?'gpt-signup':'gpt-login')+'/'+taskId,{cache:'no-store'});
+    if(!r.ok)throw new Error(await r.text());
+    const st=await r.json();
+    if(st.state==='running'){showGptBox(batchTitle,st.message||'');continue}
+    return st;
+  }
+}
+async function runGptBatch(kind){
+  if(batchRunning||gptId){alert('已有 GPT 任务在进行中，先等它结束。');return}
+  const ids=selectedInOrder();
+  if(!ids.length){alert('请先在左侧勾选要处理的账号。');return}
+  const label=GPT_LABEL[kind];
+  if(!confirm('将对勾选的 '+ids.length+' 个账号按顺序逐个「'+label+'」。\n遇到需人工(人机验证)或失败的账号会记录并继续下一个。\n确认开始？'))return;
+  batchRunning=true;updateBatchButtons();
+  const results=[];
+  for(let i=0;i<ids.length;i++){
+    const id=ids[i];batchTitle='批量'+label+' '+(i+1)+'/'+ids.length+'：'+emailOf(id);
+    showGptBox(batchTitle,'启动中…');
+    try{const st=await awaitGptTask(kind,id);results.push({email:emailOf(id),state:st.state,error:st.error||st.message||''})}
+    catch(err){results.push({email:emailOf(id),state:'error',error:(err&&err.message)||String(err)})}
+    await loadAccounts().catch(()=>{}); // 刷新「是/否」等状态,勾选保留
+  }
+  batchRunning=false;updateBatchButtons();
+  const ok=results.filter(r=>r.state==='completed').length;
+  const hv=results.filter(r=>r.state==='human_verification');
+  const bad=results.filter(r=>r.state!=='completed'&&r.state!=='human_verification');
+  showGptBox('批量'+label+'完成','成功 '+ok+' · 需人工 '+hv.length+' · 失败 '+bad.length);
+  let msg='批量'+label+'完成：\n成功 '+ok+' 个，需人工 '+hv.length+' 个，失败 '+bad.length+' 个。';
+  const probs=[...hv,...bad];
+  if(probs.length)msg+='\n\n未完成：\n'+probs.map(r=>'· '+r.email+'：'+(GPT_DONE[r.state]||r.state)+(r.error?'（'+r.error+'）':'')).join('\n');
+  alert(msg);
+}
+document.getElementById('batch-signup-btn').addEventListener('click',()=>runGptBatch('signup'));
+document.getElementById('batch-login-btn').addEventListener('click',()=>runGptBatch('login'));
 loadAccounts().catch(err=>alert('加载账号失败：'+err.message));
 </script>
 </body>

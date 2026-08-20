@@ -1890,7 +1890,7 @@ func (s *Store) Stats(ctx context.Context, f ConversationFilter) (conversationCo
 
 func (s *Store) ListAPIRoutes(ctx context.Context) ([]APIRoute, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, base_url, model, api_style, protocol, api_key, enabled, multimodal, created_at, updated_at
-		FROM api_routes ORDER BY updated_at DESC, id DESC`)
+		FROM api_routes ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
 	}
