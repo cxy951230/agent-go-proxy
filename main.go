@@ -702,6 +702,28 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}()
 			}
 		}
+		// 账号直连:上游可能用 HTTP 200 的 SSE 流内 response.failed 返回失败(如
+		// "Selected model is at capacity" / 额度耗尽)。这类失败状态码仍是 200,会
+		// 逃过下面「按状态码容错」的判断,被当成功、还把会话粘死在坏账号上,导致明明
+		// 有额度的账号永远轮不上。所以在往客户端吐正文前先偷看流头识别它:命中就熔断
+		// 当前账号(上冷却)、解绑会话粘性,并在还有候选时于同一请求内 failover。
+		streamFailed := false
+		if accountMode && plan.accountCandidate != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			failed, failMsg, rebuilt := peekResponsesStreamFailure(resp)
+			resp.Body = rebuilt
+			if failed {
+				streamFailed = true
+				p.accounts.MarkFailure(meta.SessionID, plan.effectiveModel, plan.accountCandidate.ID, accountCooldown)
+				if i < len(plans)-1 {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+					fmt.Printf("!! account stream failed current id=%d msg=%q next id=%d\n", plan.accountCandidate.ID, failMsg, accountNextID(plans, i))
+					continue
+				}
+				// 最后一个候选:把失败流原样回给客户端(别吞),但下面不再 MarkSuccess。
+				fmt.Printf("!! account stream failed id=%d msg=%q (无更多候选,原样回传客户端)\n", plan.accountCandidate.ID, failMsg)
+			}
+		}
 		if failoverMode && resp.StatusCode >= 400 {
 			p.markAttemptFailure(chainMode, accountMode, plan, meta.SessionID, accountFailureCooldown(resp))
 			if i < len(plans)-1 {
@@ -755,7 +777,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if chainMode && plan.route != nil {
 				p.chains.MarkSuccess(plan.chainID, meta.SessionID, plan.route.ID)
 			}
-			if accountMode && plan.accountAuth != nil {
+			if accountMode && plan.accountAuth != nil && !streamFailed {
 				p.accounts.MarkSuccess(meta.SessionID, plan.effectiveModel, plan.accountAuth.AccountDBID)
 			}
 		}
@@ -1233,6 +1255,129 @@ func accountFailureCooldown(resp *http.Response) time.Duration {
 		return clamp(time.Until(deadline))
 	}
 	return accountRateLimitCooldownMin
+}
+
+// streamFailurePeekCap 限制「偷看流头」最多缓冲多少字节:超过还没定论就认定为正常
+// 响应、放行透传,避免把长回答整个缓冲进内存、破坏账号直连的增量输出。
+const streamFailurePeekCap = 512 * 1024
+
+// multiReadCloser 把「已读走的缓冲 + 剩余流」拼成一个 io.ReadCloser,Close 仍关原始流。
+type multiReadCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (m *multiReadCloser) Read(p []byte) (int, error) { return m.r.Read(p) }
+func (m *multiReadCloser) Close() error               { return m.c.Close() }
+
+// peekResponsesStreamFailure 在账号直连(Codex Responses SSE)路径上,于「还没往客户端
+// 吐正文」之前偷看上游流,判断这次是不是流内失败(response.failed,如 "at capacity"/额度
+// 耗尽——上游用 HTTP 200 的事件流返回,状态码骗不出问题)。
+// 返回:failed 是否命中;message 失败信息(日志用);body 重新拼好的响应体(已读走的字节
+// + 剩余流),无论成败都能让下游把完整内容透传给客户端。
+func peekResponsesStreamFailure(resp *http.Response) (failed bool, message string, body io.ReadCloser) {
+	orig := resp.Body
+	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	// 压缩流没法增量解析:整体读完、解码判断,再把原始字节拼回去(此响应失去增量,但
+	// event-stream 基本不压缩,属极少数情况)。
+	if enc != "" && enc != "identity" {
+		raw, _ := io.ReadAll(orig)
+		_ = orig.Close()
+		f, m := sseDecisionFromEvents(parseSSEEvents(decodeResponseBody(raw, enc)))
+		return f == streamDecisionFailed, m, io.NopCloser(bytes.NewReader(raw))
+	}
+	// 未压缩:逐块读、边读边判,命中失败或出现正文/结束事件即停,最多缓冲 streamFailurePeekCap。
+	var buf bytes.Buffer
+	tmp := make([]byte, 16*1024)
+	for buf.Len() < streamFailurePeekCap {
+		n, readErr := orig.Read(tmp)
+		if n > 0 {
+			buf.Write(tmp[:n])
+			if decision, m := sseDecisionFromEvents(parseSSEEvents(buf.String())); decision != streamDecisionPending {
+				failed = decision == streamDecisionFailed
+				message = m
+				break
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	return failed, message, &multiReadCloser{r: io.MultiReader(bytes.NewReader(buf.Bytes()), orig), c: orig}
+}
+
+type streamDecision int
+
+const (
+	streamDecisionPending streamDecision = iota // 还没定论,继续读
+	streamDecisionFailed                        // 命中 response.failed
+	streamDecisionOK                            // 出现正文/结束事件,判为正常
+)
+
+// sseDecisionFromEvents 扫描已解析出的 Responses 事件,给出判定:
+//   - 命中 response.failed → Failed(顺带取出 error.message);
+//   - 出现正文(response.output* / reasoning)或结束(response.completed)→ OK;
+//   - 只看到 response.created / in_progress 这类前置事件 → Pending,继续读。
+func sseDecisionFromEvents(events []sseEvent) (streamDecision, string) {
+	for _, ev := range events {
+		name := ev.Event
+		if name == "" || name == "message" {
+			// 有些实现不带 event: 行,退回按 data 里的 type 判定。
+			if t := sseEventType(ev.Data); t != "" {
+				name = t
+			}
+		}
+		switch {
+		case name == "response.failed":
+			return streamDecisionFailed, sseFailureMessage(ev.Data)
+		case name == "response.completed",
+			name == "response.output_text.delta",
+			strings.HasPrefix(name, "response.output_"),
+			strings.HasPrefix(name, "response.reasoning"),
+			strings.HasPrefix(name, "response.content"):
+			return streamDecisionOK, ""
+		}
+	}
+	return streamDecisionPending, ""
+}
+
+func sseEventType(data json.RawMessage) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return ""
+	}
+	return probe.Type
+}
+
+func sseFailureMessage(data json.RawMessage) string {
+	if len(data) == 0 {
+		return "response.failed"
+	}
+	var probe struct {
+		Response struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"response"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &probe); err == nil {
+		if probe.Response.Error.Message != "" {
+			return probe.Response.Error.Message
+		}
+		if probe.Error.Message != "" {
+			return probe.Error.Message
+		}
+	}
+	return "response.failed"
 }
 
 // accountNextID 返回下一个待尝试候选账号的 id,仅用于日志。
